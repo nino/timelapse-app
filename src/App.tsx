@@ -1,8 +1,8 @@
+import { useVirtualizer } from "@tanstack/react-virtual";
 import { invoke } from "@tauri-apps/api/core";
 import { BaseDirectory, homeDir, join } from "@tauri-apps/api/path";
 import { readDir } from "@tauri-apps/plugin-fs";
-import { ReactNode, useState } from "react";
-import { FixedSizeList } from "react-window";
+import React, { ReactNode, useState } from "react";
 
 import "./App.css";
 import { useFiles, useFolders } from "./hooks/useFolders";
@@ -45,6 +45,15 @@ export function App(): ReactNode {
   //     console.error("Failed to load images:", error);
   //   }
   // }
+
+  const filesListRef = React.useRef(null);
+  const rowVirtualiser = useVirtualizer({
+    count: files.length,
+    getScrollElement: () => filesListRef.current,
+    estimateSize: () => 35,
+    overscan: 100,
+  });
+
   return (
     <main className="grid grid-cols-3 gap-2 m-2">
       <div className="rounded bg-gray-300 p-2">
@@ -55,15 +64,31 @@ export function App(): ReactNode {
         ))}
       </div>
       <div className="rounded bg-gray-300 p-2">
-        <FixedSizeList
-          height={300}
-          width={200}
-          itemSize={20}
-          itemCount={files.length}
-          overscanCount={300}
-        >
-          {({ index, style }) => <div style={style}>{files[index]}</div>}
-        </FixedSizeList>
+        <div ref={filesListRef} className="overflow-auto h-[200px]">
+          <div
+            style={{
+              height: `${rowVirtualiser.getTotalSize()}px`,
+              width: "100%",
+              position: "relative",
+            }}
+          >
+            {rowVirtualiser.getVirtualItems().map((row) => (
+              <div
+                key={row.index}
+                style={{
+                  position: "absolute",
+                  top: 0,
+                  left: 0,
+                  width: "100%",
+                  height: `${row.size}px`,
+                  transform: `translateY(${row.start}px)`,
+                }}
+              >
+                {files[row.index]}
+              </div>
+            ))}
+          </div>
+        </div>
       </div>
       <div className="rounded bg-gray-300 p-2">3</div>
     </main>

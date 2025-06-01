@@ -57,7 +57,9 @@ export function useFiles(folder: string | null): {
       });
       const fileList = Iterator.from(entries)
         .filter((entry) => entry.isFile)
-        .map((entry) => entry.name).toArray();
+        .map((entry) => entry.name)
+        .toArray()
+        .sort();
       setFiles(fileList);
     } catch (error) {
       setFilesError(ensureError(error));
