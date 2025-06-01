@@ -1,51 +1,71 @@
 import { invoke } from "@tauri-apps/api/core";
+import { BaseDirectory, homeDir, join } from "@tauri-apps/api/path";
+import { readDir } from "@tauri-apps/plugin-fs";
 import { ReactNode, useState } from "react";
+import { FixedSizeList } from "react-window";
 
-import reactLogo from "./assets/react.svg";
 import "./App.css";
+import { useFiles, useFolders } from "./hooks/useFolders";
+
+function ensureError(val: unknown): Error {
+  if (val instanceof Error) {
+    return val;
+  }
+  return new Error(String(val));
+}
 
 export function App(): ReactNode {
-  const [greetMsg, setGreetMsg] = useState("");
-  const [name, setName] = useState("");
+  const { folders, foldersError } = useFolders();
+  const [selectedFolder, setSelectedFolder] = useState<string | null>(null);
+  const { files, filesError } = useFiles(selectedFolder);
+  // async function loadImages(folder: string) {
+  //   try {
+  //     const entries = await readDir(folder.path, {
+  //       baseDir: BaseDirectory.Home,
+  //     });
 
-  async function greet(): Promise<void> {
-    // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-    setGreetMsg(await invoke("greet", { name }));
-  }
+  //     const imageList = entries
+  //       .filter(
+  //         (entry) =>
+  //           entry.name.toLowerCase().endsWith(".jpg") ||
+  //           entry.name.toLowerCase().endsWith(".jpeg") ||
+  //           entry.name.toLowerCase().endsWith(".png"),
+  //       )
+  //       .map((entry) => {
+  //         return {
+  //           name: entry.name,
+  //           path: "",
+  //         };
+  //       });
 
+  //     console.log(imageList);
+
+  //     setFiles(imageList);
+  //   } catch (error) {
+  //     console.error("Failed to load images:", error);
+  //   }
+  // }
   return (
-    <main className="container">
-      <h1>Welcome to Tauri + React</h1>
-
-      <div className="row">
-        <a href="https://vitejs.dev" target="_blank">
-          <img src="/vite.svg" className="logo vite" alt="Vite logo" />
-        </a>
-        <a href="https://tauri.app" target="_blank">
-          <img src="/tauri.svg" className="logo tauri" alt="Tauri logo" />
-        </a>
-        <a href="https://reactjs.org" target="_blank">
-          <img src={reactLogo} className="logo react" alt="React logo" />
-        </a>
+    <main className="grid grid-cols-3 gap-2 m-2">
+      <div className="rounded bg-gray-300 p-2">
+        {folders.map((folder) => (
+          <div key={folder}>
+            <button onClick={() => setSelectedFolder(folder)}>{folder}</button>
+          </div>
+        ))}
       </div>
-      <p>Click on the Tauri, Vite, and React logos to learn more.</p>
-
-      <form
-        className="row"
-        onSubmit={(e) => {
-          e.preventDefault();
-          greet();
-        }}
-      >
-        <input
-          id="greet-input"
-          onChange={(e) => setName(e.currentTarget.value)}
-          placeholder="Enter a name…"
-          className="border-2 border-[green] rounded-md p-2 text-green-500"
-        />
-        <button type="submit">Greet</button>
-      </form>
-      <p>{greetMsg}</p>
+      <div className="rounded bg-gray-300 p-2">
+        <FixedSizeList
+          height={300}
+          width={200}
+          itemSize={20}
+          itemCount={files.length}
+          overscanCount={300}
+        >
+          {({ index, style }) => <div style={style}>{files[index]}</div>}
+        </FixedSizeList>
+      </div>
+      <div className="rounded bg-gray-300 p-2">3</div>
     </main>
   );
 }
