@@ -22,7 +22,7 @@ export function App(): ReactNode {
   React.useEffect(() => {
     if (folders.length > 0 && !selectedFolder) {
       const todayFolder = folders.find(
-        (folder) => folder === currentDateFolder
+        (folder) => folder === currentDateFolder,
       );
       if (todayFolder) {
         setSelectedFolder(todayFolder);
@@ -86,7 +86,7 @@ export function App(): ReactNode {
       const newIndex = parseInt(e.target.value, 10);
       setCurrentImageIndex(newIndex);
     },
-    []
+    [],
   );
 
   const refreshFiles = useCallback(() => {
@@ -148,7 +148,7 @@ export function App(): ReactNode {
               ))}
           </select>
           {selectedFolder && (
-            <span className="text-gray-300 text-sm">
+            <span className="text-gray-300 text-sm backdrop-blur-xl">
               {files.length} screenshots
             </span>
           )}
@@ -187,8 +187,8 @@ export function App(): ReactNode {
 
         {/* Image counter overlay */}
         {files.length > 0 && (
-          <div className="absolute top-4 left-4 bg-black bg-opacity-50 px-3 py-1 rounded">
-            <span className="text-sm">
+          <div className="absolute top-4 left-4 bg-black/10 bg-opacity-50 px-3 py-1 rounded-xl text-shadow-md backdrop-blur-md">
+            <span className="text-sm backdrop-blur-xl">
               {currentImageIndex + 1} / {files.length}
             </span>
           </div>
@@ -221,7 +221,7 @@ export function App(): ReactNode {
           </div>
 
           {/* Current time display */}
-          <div className="text-sm text-gray-300 min-w-[60px] text-center">
+          <div className="text-sm text-gray-300 min-w-[60px] text-center backdrop-blur-xl">
             {files.length > 0 ? formatTime(currentImageIndex) : "--:--"}
           </div>
 
