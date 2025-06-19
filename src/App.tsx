@@ -39,6 +39,32 @@ export function App(): ReactNode {
     setCurrentImageIndex(0);
   }, [selectedFolder]);
 
+  // Keyboard navigation
+  React.useEffect(() => {
+    const handleKeydown = (e: KeyboardEvent): void => {
+      if (!selectedFolder || files.length === 0) return;
+
+      let step = 1;
+      if (e.shiftKey) step = 10;
+      if (e.altKey) step = 100; // Option key on Mac is altKey
+
+      let newIndex = currentImageIndex;
+
+      if (e.key === "ArrowLeft") {
+        e.preventDefault();
+        newIndex = Math.max(0, currentImageIndex - step);
+        setCurrentImageIndex(newIndex);
+      } else if (e.key === "ArrowRight") {
+        e.preventDefault();
+        newIndex = Math.min(files.length - 1, currentImageIndex + step);
+        setCurrentImageIndex(newIndex);
+      }
+    };
+
+    window.addEventListener("keydown", handleKeydown);
+    return (): void => window.removeEventListener("keydown", handleKeydown);
+  }, [selectedFolder, files.length, currentImageIndex]);
+
   // Load current image when folder or index changes
   React.useEffect(() => {
     async function loadImage(): Promise<void> {
@@ -127,9 +153,9 @@ export function App(): ReactNode {
   }
 
   return (
-    <main className="h-screen flex flex-col bg-gray-900 text-white">
+    <main className="h-screen overflow-hidden grid grid-rows-[min-content_1fr_56px] bg-gray-100 text-black">
       {/* Header with folder selection */}
-      <header className="bg-gray-800 p-3 border-b border-gray-700">
+      <header className="bg-gray-100 p-3 border-b border-gray-200">
         <div className="flex items-center gap-4">
           <h1 className="text-lg font-semibold">Timelapse Viewer</h1>
           <select
@@ -137,7 +163,7 @@ export function App(): ReactNode {
             onChange={(e) => setSelectedFolder(e.target.value || null)}
             className="bg-gray-700 text-white px-3 py-1 rounded border border-gray-600 focus:outline-none focus:ring-2 focus:ring-blue-500"
           >
-            <option value="">Select a date...</option>
+            <option value="">Select a date…</option>
             {[...folders]
               .sort()
               .reverse()
@@ -148,20 +174,32 @@ export function App(): ReactNode {
               ))}
           </select>
           {selectedFolder && (
-            <span className="text-gray-300 text-sm backdrop-blur-xl">
+            <span className="text-gray-300 text-sm">
               {files.length} screenshots
+            </span>
+          )}
+          {/* Frame counter */}
+          {files.length > 0 && (
+            <span className="text-gray-300 text-sm">
+              Frame {currentImageIndex + 1} / {files.length}
+            </span>
+          )}
+          {/* Time estimate */}
+          {files.length > 0 && (
+            <span className="text-gray-300 text-sm">
+              ~{formatTime(currentImageIndex)}
             </span>
           )}
         </div>
       </header>
 
       {/* Main image preview area */}
-      <div className="flex-1 flex items-center justify-center bg-black relative">
+      <div className="relative overflow-hidden">
         {currentImageSrc ? (
           <img
             src={currentImageSrc}
             alt={`Screenshot ${currentImageIndex + 1}`}
-            className="max-w-full max-h-full object-contain"
+            className="max-w-full object-contain absolute top-0 left-0 bottom-0 right-0"
             onError={() => {
               console.error("Failed to load image:", currentImageSrc);
               setCurrentImageSrc(null);
@@ -170,9 +208,7 @@ export function App(): ReactNode {
         ) : (
           <div className="text-gray-500 text-center">
             <p className="text-xl mb-2">
-              {files.length > 0
-                ? "Loading image..."
-                : "No screenshots available"}
+              {files.length > 0 ? "Loading image…" : "No screenshots available"}
             </p>
             {files.length === 0 && (
               <p>Select a date folder with screenshots to begin</p>
@@ -184,26 +220,10 @@ export function App(): ReactNode {
             )}
           </div>
         )}
-
-        {/* Image counter overlay */}
-        {files.length > 0 && (
-          <div className="absolute top-4 left-4 bg-black/10 bg-opacity-50 px-3 py-1 rounded-xl text-shadow-md backdrop-blur-md">
-            <span className="text-sm backdrop-blur-xl">
-              {currentImageIndex + 1} / {files.length}
-            </span>
-          </div>
-        )}
-
-        {/* Estimated time overlay */}
-        {files.length > 0 && (
-          <div className="absolute top-4 right-4 bg-black bg-opacity-50 px-3 py-1 rounded">
-            <span className="text-sm">~{formatTime(currentImageIndex)}</span>
-          </div>
-        )}
       </div>
 
       {/* Bottom controls */}
-      <div className="bg-gray-800 p-4 border-t border-gray-700">
+      <div className="bg-gray-100 p-4">
         <div className="flex items-center gap-4">
           {/* Scrubber */}
           <div className="flex-1">
@@ -229,8 +249,7 @@ export function App(): ReactNode {
           <button
             onClick={refreshFiles}
             disabled={!selectedFolder}
-            className="bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 
-                       px-4 py-2 rounded text-sm font-medium transition-colors"
+            className="bg-gradient-to-b from-fuchsia-50 to-amber-50 hover:bg-blue-700 disabled:bg-gray-600 px-3 py-1 rounded-xl text-sm font-medium text-amber-800 transition-colors border-2 border-yellow-500 shadow-md shadow-amber-400/20"
             title="Refresh screenshots"
           >
             ↻ Refresh
