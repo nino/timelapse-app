@@ -146,8 +146,15 @@ async fn capture_screenshot(screenshot_path: &str) -> Result<(), Error> {
 }
 
 async fn resize_screenshot(file_path: &str) -> Result<(), Error> {
-    let output = tokio::process::Command::new("convert")
-        .args(&["-scale", "1800x1124!", file_path, file_path])
+    let output = tokio::process::Command::new("magick")
+        .args(&[
+            file_path,
+            "-resize", "1800x1124",
+            "-background", "black",
+            "-gravity", "center",
+            "-extent", "1800x1124",
+            file_path
+        ])
         .output()
         .await?;
 
@@ -165,8 +172,8 @@ async fn resize_screenshot(file_path: &str) -> Result<(), Error> {
 async fn is_image_all_black(file_path: &str) -> Result<bool, Error> {
     // Use ImageMagick's identify command to get mean pixel value
     // For a completely black image, the mean should be 0
-    let output = tokio::process::Command::new("identify")
-        .args(&["-format", "%[mean]", file_path])
+    let output = tokio::process::Command::new("magick")
+        .args(&["identify", "-format", "%[mean]", file_path])
         .output()
         .await?;
 
