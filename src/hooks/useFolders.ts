@@ -56,10 +56,9 @@ export function useFiles(folder: string | null): {
       const entries = await readDir(`Timelapse/${folder}`, {
         baseDir: BaseDirectory.Home,
       });
-      const fileList = Iterator.from(entries)
+      const fileList = (entries)
         .filter((entry) => entry.isFile)
         .map((entry) => entry.name)
-        .toArray()
         .sort();
       setFiles(fileList);
     } catch (error) {
