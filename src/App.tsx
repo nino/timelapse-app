@@ -1,26 +1,38 @@
 import { BaseDirectory } from "@tauri-apps/api/path";
 import { readFile } from "@tauri-apps/plugin-fs";
-import React, { ReactNode, useState, useCallback, useMemo } from "react";
+import React from "react";
 
 import "./App.css";
-import { useFiles, useFolders } from "./hooks/useFolders";
+import { useFiles, useFolders, useVideos } from "./hooks/useFolders";
 
-export function App(): ReactNode {
-  const { folders, foldersError } = useFolders();
-  const [selectedFolder, setSelectedFolder] = useState<string | null>(null);
+type ViewMode = "images" | "videos";
+
+export function App(): React.ReactNode {
+  const { folders, foldersError, refreshFolders } = useFolders();
+  const { videos, videosError, refreshVideos } = useVideos();
+  const [viewMode, setViewMode] = React.useState<ViewMode>("images");
+  const [selectedFolder, setSelectedFolder] = React.useState<string | null>(
+    null,
+  );
+  const [selectedVideo, setSelectedVideo] = React.useState<string | null>(null);
   const { files, filesError } = useFiles(selectedFolder);
-  const [currentImageIndex, setCurrentImageIndex] = useState(0);
-  const [currentImageSrc, setCurrentImageSrc] = useState<string | null>(null);
+  const [currentImageIndex, setCurrentImageIndex] = React.useState(0);
+  const [currentImageSrc, setCurrentImageSrc] = React.useState<string | null>(
+    null,
+  );
+  const [currentVideoSrc, setCurrentVideoSrc] = React.useState<string | null>(
+    null,
+  );
 
   // Get current date folder name (YYYY-MM-DD format)
-  const currentDateFolder = useMemo(() => {
+  const currentDateFolder = React.useMemo(() => {
     const today = new Date();
     return today.toISOString().split("T")[0];
   }, []);
 
-  // Auto-select today's folder if it exists
+  // Auto-select today's folder if it exists (for images mode)
   React.useEffect(() => {
-    if (folders.length > 0 && !selectedFolder) {
+    if (viewMode === "images" && folders.length > 0 && !selectedFolder) {
       const todayFolder = folders.find(
         (folder) => folder === currentDateFolder,
       );
@@ -32,38 +44,105 @@ export function App(): ReactNode {
         setSelectedFolder(sortedFolders[0]);
       }
     }
-  }, [folders, selectedFolder, currentDateFolder]);
+  }, [folders, selectedFolder, currentDateFolder, viewMode]);
+
+  // Auto-select most recent video (for videos mode)
+  React.useEffect(() => {
+    if (viewMode === "videos" && videos.length > 0 && !selectedVideo) {
+      setSelectedVideo(videos[0]); // Already sorted with most recent first
+    }
+  }, [videos, selectedVideo, viewMode]);
 
   // Reset image index when folder changes
   React.useEffect(() => {
-    setCurrentImageIndex(0);
-  }, [selectedFolder]);
+    if (viewMode === "images") {
+      setCurrentImageIndex(Math.max(files.length - 1, 0));
+    }
+  }, [selectedFolder, files.length, viewMode]);
+
+  // Load current video when video is selected
+  React.useEffect(() => {
+    async function loadVideo(): Promise<void> {
+      if (viewMode !== "videos" || !selectedVideo) {
+        setCurrentVideoSrc(null);
+        return;
+      }
+
+      try {
+        const videoPath = `Timelapse/${selectedVideo}`;
+        console.log("Loading video from path:", videoPath);
+
+        const videoData = await readFile(videoPath, {
+          baseDir: BaseDirectory.Home,
+        });
+
+        console.log("Video data loaded, size:", videoData.length);
+
+        // Create a blob URL from the binary data
+        const blob = new Blob([videoData], { type: "video/quicktime" });
+        const blobUrl = URL.createObjectURL(blob);
+
+        console.log("Created video blob URL:", blobUrl);
+        setCurrentVideoSrc(blobUrl);
+      } catch (error) {
+        console.error("Error loading video:", error);
+        setCurrentVideoSrc(null);
+      }
+    }
+
+    loadVideo();
+  }, [selectedVideo, viewMode]);
 
   // Keyboard navigation
   React.useEffect(() => {
     const handleKeydown = (e: KeyboardEvent): void => {
-      if (!selectedFolder || files.length === 0) return;
+      if (viewMode === "images" && (!selectedFolder || files.length === 0))
+        return;
+      if (viewMode === "videos" && videos.length === 0) return;
 
-      let step = 1;
-      if (e.shiftKey) step = 10;
-      if (e.altKey) step = 100; // Option key on Mac is altKey
+      if (viewMode === "images") {
+        let step = 1;
+        if (e.shiftKey) step = 10;
+        if (e.altKey) step = 100; // Option key on Mac is altKey
 
-      let newIndex = currentImageIndex;
+        let newIndex = currentImageIndex;
 
-      if (e.key === "ArrowLeft") {
-        e.preventDefault();
-        newIndex = Math.max(0, currentImageIndex - step);
-        setCurrentImageIndex(newIndex);
-      } else if (e.key === "ArrowRight") {
-        e.preventDefault();
-        newIndex = Math.min(files.length - 1, currentImageIndex + step);
-        setCurrentImageIndex(newIndex);
+        if (e.key === "ArrowLeft") {
+          e.preventDefault();
+          newIndex = Math.max(0, currentImageIndex - step);
+          setCurrentImageIndex(newIndex);
+        } else if (e.key === "ArrowRight") {
+          e.preventDefault();
+          newIndex = Math.min(files.length - 1, currentImageIndex + step);
+          setCurrentImageIndex(newIndex);
+        }
+      } else if (viewMode === "videos") {
+        if (e.key === "ArrowLeft") {
+          e.preventDefault();
+          const currentIndex = videos.indexOf(selectedVideo || "");
+          if (currentIndex > 0) {
+            setSelectedVideo(videos[currentIndex - 1]);
+          }
+        } else if (e.key === "ArrowRight") {
+          e.preventDefault();
+          const currentIndex = videos.indexOf(selectedVideo || "");
+          if (currentIndex < videos.length - 1) {
+            setSelectedVideo(videos[currentIndex + 1]);
+          }
+        }
       }
     };
 
     window.addEventListener("keydown", handleKeydown);
     return (): void => window.removeEventListener("keydown", handleKeydown);
-  }, [selectedFolder, files.length, currentImageIndex]);
+  }, [
+    selectedFolder,
+    files.length,
+    currentImageIndex,
+    viewMode,
+    videos,
+    selectedVideo,
+  ]);
 
   // Load current image when folder or index changes
   React.useEffect(() => {
@@ -107,7 +186,16 @@ export function App(): ReactNode {
     };
   }, [currentImageSrc]);
 
-  const handleScrubberChange = useCallback(
+  // Clean up video blob URLs when component unmounts or video changes
+  React.useEffect(() => {
+    return (): void => {
+      if (currentVideoSrc && currentVideoSrc.startsWith("blob:")) {
+        URL.revokeObjectURL(currentVideoSrc);
+      }
+    };
+  }, [currentVideoSrc]);
+
+  const handleScrubberChange = React.useCallback(
     (e: React.ChangeEvent<HTMLInputElement>) => {
       const newIndex = parseInt(e.target.value, 10);
       setCurrentImageIndex(newIndex);
@@ -115,16 +203,25 @@ export function App(): ReactNode {
     [],
   );
 
-  const refreshFiles = useCallback(() => {
-    // Force refresh by changing the selected folder
-    const currentFolder = selectedFolder;
-    setSelectedFolder(null);
-    setTimeout(() => setSelectedFolder(currentFolder), 10);
-  }, [selectedFolder]);
+  const refreshContent = React.useCallback(() => {
+    if (viewMode === "images") {
+      refreshFolders();
+      // Force refresh by changing the selected folder
+      const currentFolder = selectedFolder;
+      setSelectedFolder(null);
+      setTimeout(() => setSelectedFolder(currentFolder), 10);
+    } else {
+      refreshVideos();
+      // Force refresh by changing the selected video
+      const currentVideo = selectedVideo;
+      setSelectedVideo(null);
+      setTimeout(() => setSelectedVideo(currentVideo), 10);
+    }
+  }, [refreshFolders, refreshVideos, selectedFolder, selectedVideo, viewMode]);
 
-  const formatTime = useCallback((index: number) => {
+  const formatTime = React.useCallback((index: number) => {
     // Assume screenshots are taken every few seconds, estimate time
-    const totalMinutes = Math.floor((index * 30) / 60); // Assuming 30 seconds between screenshots
+    const totalMinutes = Math.floor((index * 1) / 60); // Assuming 1 second between screenshots
     const hours = Math.floor(totalMinutes / 60);
     const minutes = totalMinutes % 60;
     return `${hours.toString().padStart(2, "0")}:${minutes
@@ -152,72 +249,166 @@ export function App(): ReactNode {
     );
   }
 
+  if (videosError) {
+    return (
+      <main className="flex items-center justify-center h-screen">
+        <div className="text-red-500">
+          <p>Error loading videos: {videosError.message}</p>
+        </div>
+      </main>
+    );
+  }
+
   return (
     <main className="h-screen overflow-hidden grid grid-rows-[min-content_1fr_56px] bg-gray-100 text-black">
-      {/* Header with folder selection */}
+      {/* Header with mode toggle and content selection */}
       <header className="bg-gray-100 p-3 border-b border-gray-200">
         <div className="flex items-center gap-4">
           <h1 className="text-lg font-semibold">Timelapse Viewer</h1>
-          <select
-            value={selectedFolder || ""}
-            onChange={(e) => setSelectedFolder(e.target.value || null)}
-            className="bg-gray-700 text-white px-3 py-1 rounded border border-gray-600 focus:outline-none focus:ring-2 focus:ring-blue-500"
-          >
-            <option value="">Select a date…</option>
-            {[...folders]
-              .sort()
-              .reverse()
-              .map((folder) => (
-                <option key={folder} value={folder}>
-                  {folder} {folder === currentDateFolder ? "(Today)" : ""}
-                </option>
-              ))}
-          </select>
-          {selectedFolder && (
-            <span className="text-gray-300 text-sm">
-              {files.length} screenshots
-            </span>
+
+          {/* Mode toggle */}
+          <div className="flex bg-gray-200 rounded-lg p-1">
+            <button
+              onClick={() => setViewMode("images")}
+              className={`px-3 py-1 rounded text-sm font-medium transition-colors ${
+                viewMode === "images"
+                  ? "bg-white text-gray-900 shadow-sm"
+                  : "text-gray-600 hover:text-gray-900"
+              }`}
+            >
+              Images
+            </button>
+            <button
+              onClick={() => setViewMode("videos")}
+              className={`px-3 py-1 rounded text-sm font-medium transition-colors ${
+                viewMode === "videos"
+                  ? "bg-white text-gray-900 shadow-sm"
+                  : "text-gray-600 hover:text-gray-900"
+              }`}
+            >
+              Videos
+            </button>
+          </div>
+
+          {/* Images mode selectors */}
+          {viewMode === "images" && (
+            <>
+              <select
+                value={selectedFolder || ""}
+                onChange={(e) => setSelectedFolder(e.target.value || null)}
+                className="bg-gray-700 text-white px-3 py-1 rounded border border-gray-600 focus:outline-none focus:ring-2 focus:ring-blue-500"
+              >
+                <option value="">Select a date…</option>
+                {[...folders]
+                  .sort()
+                  .reverse()
+                  .map((folder) => (
+                    <option key={folder} value={folder}>
+                      {folder} {folder === currentDateFolder ? "(Today)" : ""}
+                    </option>
+                  ))}
+              </select>
+              {selectedFolder && files.length > 0 && (
+                <>
+                  <span className="text-gray-600 text-sm">
+                    {files.length} screenshots
+                  </span>
+                  <span className="text-gray-600 text-sm tabular-nums">
+                    Frame {currentImageIndex + 1} / {files.length}
+                  </span>
+                  <span className="text-gray-600 text-sm tabular-nums">
+                    ~{formatTime(currentImageIndex)}
+                  </span>
+                </>
+              )}
+            </>
           )}
-          {/* Frame counter */}
-          {files.length > 0 && (
-            <span className="text-gray-300 text-sm">
-              Frame {currentImageIndex + 1} / {files.length}
-            </span>
-          )}
-          {/* Time estimate */}
-          {files.length > 0 && (
-            <span className="text-gray-300 text-sm">
-              ~{formatTime(currentImageIndex)}
-            </span>
+
+          {/* Videos mode selectors */}
+          {viewMode === "videos" && (
+            <>
+              <select
+                value={selectedVideo || ""}
+                onChange={(e) => setSelectedVideo(e.target.value || null)}
+                className="bg-gray-700 text-white px-3 py-1 rounded border border-gray-600 focus:outline-none focus:ring-2 focus:ring-blue-500"
+              >
+                <option value="">Select a video…</option>
+                {videos.map((video) => (
+                  <option key={video} value={video}>
+                    {video}
+                  </option>
+                ))}
+              </select>
+              {videos.length > 0 && (
+                <span className="text-gray-600 text-sm">
+                  {videos.length} videos
+                </span>
+              )}
+            </>
           )}
         </div>
       </header>
 
-      {/* Main image preview area */}
-      <div className="relative overflow-hidden">
-        {currentImageSrc ? (
-          <img
-            src={currentImageSrc}
-            alt={`Screenshot ${currentImageIndex + 1}`}
-            className="max-w-full object-contain absolute top-0 left-0 bottom-0 right-0"
+      {/* Main content area */}
+      <div className="relative overflow-hidden object-contain">
+        {viewMode === "images" ? (
+          // Images view
+          currentImageSrc ? (
+            <img
+              src={currentImageSrc}
+              alt={`Screenshot ${currentImageIndex + 1}`}
+              className="w-full h-full object-contain absolute top-0 left-0 bottom-0 right-0"
+              onError={() => {
+                console.error("Failed to load image:", currentImageSrc);
+                setCurrentImageSrc(null);
+              }}
+            />
+          ) : (
+            <div className="flex items-center justify-center h-full text-gray-500 text-center">
+              <div>
+                <p className="text-xl mb-2">
+                  {files.length > 0
+                    ? "Loading image…"
+                    : "No screenshots available"}
+                </p>
+                {files.length === 0 && (
+                  <p>Select a date folder with screenshots to begin</p>
+                )}
+                {files.length > 0 && (
+                  <p className="text-sm mt-2">
+                    Trying to load: {files[currentImageIndex]}
+                  </p>
+                )}
+              </div>
+            </div>
+          )
+        ) : // Videos view
+        currentVideoSrc ? (
+          <video
+            src={currentVideoSrc}
+            controls
+            className="w-full h-full object-contain absolute top-0 left-0 bottom-0 right-0"
             onError={() => {
-              console.error("Failed to load image:", currentImageSrc);
-              setCurrentImageSrc(null);
+              console.error("Failed to load video:", currentVideoSrc);
+              setCurrentVideoSrc(null);
             }}
           />
         ) : (
-          <div className="text-gray-500 text-center">
-            <p className="text-xl mb-2">
-              {files.length > 0 ? "Loading image…" : "No screenshots available"}
-            </p>
-            {files.length === 0 && (
-              <p>Select a date folder with screenshots to begin</p>
-            )}
-            {files.length > 0 && (
-              <p className="text-sm mt-2">
-                Trying to load: {files[currentImageIndex]}
+          <div className="flex items-center justify-center h-full text-gray-500 text-center">
+            <div>
+              <p className="text-xl mb-2">
+                {selectedVideo ? "Loading video…" : "No video selected"}
               </p>
-            )}
+              {!selectedVideo && videos.length > 0 && (
+                <p>Select a video to begin playback</p>
+              )}
+              {!selectedVideo && videos.length === 0 && (
+                <p>No videos found in the Timelapse directory</p>
+              )}
+              {selectedVideo && (
+                <p className="text-sm mt-2">Loading: {selectedVideo}</p>
+              )}
+            </div>
           </div>
         )}
       </div>
@@ -225,32 +416,77 @@ export function App(): ReactNode {
       {/* Bottom controls */}
       <div className="bg-gray-100 p-4">
         <div className="flex items-center gap-4">
-          {/* Scrubber */}
-          <div className="flex-1">
-            <input
-              type="range"
-              min={0}
-              max={Math.max(0, files.length - 1)}
-              value={currentImageIndex}
-              onChange={handleScrubberChange}
-              disabled={files.length === 0}
-              className="w-full h-2 bg-gray-600 rounded-lg appearance-none cursor-pointer 
-                         slider:bg-blue-500 slider:rounded-lg slider:cursor-pointer
-                         disabled:opacity-50 disabled:cursor-not-allowed"
-            />
-          </div>
+          {viewMode === "images" ? (
+            <>
+              {/* Image scrubber */}
+              <div className="flex-1 bg-gray-200 p-1 pt-0 rounded-full">
+                <input
+                  type="range"
+                  min={0}
+                  max={Math.max(0, files.length - 1)}
+                  value={currentImageIndex}
+                  onChange={handleScrubberChange}
+                  disabled={files.length === 0}
+                  className="w-full h-2 bg-gray-300 rounded-lg appearance-none cursor-pointer 
+                             disabled:opacity-50 disabled:cursor-not-allowed"
+                />
+              </div>
 
-          {/* Current time display */}
-          <div className="text-sm text-gray-300 min-w-[60px] text-center backdrop-blur-xl">
-            {files.length > 0 ? formatTime(currentImageIndex) : "--:--"}
-          </div>
+              {/* Current time display */}
+              <div className="text-sm text-gray-600 min-w-[60px] text-center">
+                {files.length > 0 ? formatTime(currentImageIndex) : "--:--"}
+              </div>
+            </>
+          ) : (
+            <>
+              {/* Video navigation */}
+              <div className="flex-1 flex items-center justify-center gap-4">
+                <button
+                  onClick={() => {
+                    const currentIndex = videos.indexOf(selectedVideo || "");
+                    if (currentIndex > 0) {
+                      setSelectedVideo(videos[currentIndex - 1]);
+                    }
+                  }}
+                  disabled={
+                    !selectedVideo || videos.indexOf(selectedVideo) === 0
+                  }
+                  className="bg-white hover:bg-gray-50 disabled:bg-gray-200 disabled:text-gray-400 px-4 py-2 rounded-lg text-sm font-medium transition-colors border border-gray-300"
+                >
+                  ← Previous Video
+                </button>
+                <span className="text-sm text-gray-600">
+                  {selectedVideo
+                    ? `${videos.indexOf(selectedVideo) + 1} / ${videos.length}`
+                    : "--"}
+                </span>
+                <button
+                  onClick={() => {
+                    const currentIndex = videos.indexOf(selectedVideo || "");
+                    if (currentIndex < videos.length - 1) {
+                      setSelectedVideo(videos[currentIndex + 1]);
+                    }
+                  }}
+                  disabled={
+                    !selectedVideo ||
+                    videos.indexOf(selectedVideo) === videos.length - 1
+                  }
+                  className="bg-white hover:bg-gray-50 disabled:bg-gray-200 disabled:text-gray-400 px-4 py-2 rounded-lg text-sm font-medium transition-colors border border-gray-300"
+                >
+                  Next Video →
+                </button>
+              </div>
+            </>
+          )}
 
           {/* Refresh button */}
           <button
-            onClick={refreshFiles}
-            disabled={!selectedFolder}
+            onClick={refreshContent}
+            disabled={viewMode === "images" ? !selectedFolder : !selectedVideo}
             className="bg-gradient-to-b from-fuchsia-50 to-amber-50 hover:bg-blue-700 disabled:bg-gray-600 px-3 py-1 rounded-xl text-sm font-medium text-amber-800 transition-colors border-2 border-yellow-500 shadow-md shadow-amber-400/20"
-            title="Refresh screenshots"
+            title={
+              viewMode === "images" ? "Refresh screenshots" : "Refresh videos"
+            }
           >
             ↻ Refresh
           </button>

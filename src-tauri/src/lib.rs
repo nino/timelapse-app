@@ -45,6 +45,31 @@ async fn is_timelapse_running(state: State<'_, PhotographerState>) -> Result<boo
     Ok(photographer_guard.is_some())
 }
 
+#[tauri::command]
+async fn get_error_logs(
+    state: State<'_, PhotographerState>,
+) -> Result<Vec<timelapse::ErrorLogEntry>, String> {
+    let photographer_guard = state.lock().map_err(|e| e.to_string())?;
+
+    if let Some(photographer) = &*photographer_guard {
+        Ok(photographer.get_error_logs())
+    } else {
+        Ok(Vec::new())
+    }
+}
+
+#[tauri::command]
+async fn clear_error_logs(state: State<'_, PhotographerState>) -> Result<String, String> {
+    let photographer_guard = state.lock().map_err(|e| e.to_string())?;
+
+    if let Some(photographer) = &*photographer_guard {
+        photographer.clear_error_logs();
+        Ok("Error logs cleared successfully".to_string())
+    } else {
+        Err("Timelapse is not running".to_string())
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let photographer_state: PhotographerState = Arc::new(Mutex::new(None));
@@ -80,7 +105,9 @@ pub fn run() {
             greet,
             start_timelapse,
             stop_timelapse,
-            is_timelapse_running
+            is_timelapse_running,
+            get_error_logs,
+            clear_error_logs
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
