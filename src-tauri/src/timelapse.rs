@@ -32,8 +32,8 @@ pub enum Error {
     #[error("Unable to find home dir")]
     UnableToFindHomeDir,
 
-    #[error("Unable to create screenshot")]
-    UnableToCreateScreenshot,
+    #[error("Unable to create screenshot because: {reason}")]
+    UnableToCreateScreenshot { reason: String },
 
     #[error("Unable to resize screenshot {path} because: {reason}")]
     UnableToResizeScreenshot { path: String, reason: String },
@@ -150,8 +150,8 @@ impl Photographer {
                 .ok_or(Error::UnableToConvertScreenshotPathToString)?,
         );
 
-        capture_screenshot(&screenshot_path).await?;
-        resize_screenshot(&screenshot_path).await?;
+        let image_data = capture_screenshot().await?;
+        resize_screenshot(&image_data, &screenshot_path).await?;
 
         // Check if the image is all black
         if is_image_all_black(&screenshot_path).await? {
@@ -190,30 +190,36 @@ fn next_filename(day_dir: &PathBuf) -> Result<String, Error> {
     Ok(format!("{:05}.png", max + 1))
 }
 
-async fn capture_screenshot(screenshot_path: &str) -> Result<(), Error> {
+async fn capture_screenshot() -> Result<Vec<u8>, Error> {
     // Get the focused screen by finding which screen contains the active window
     let focused_screen = get_focused_screen().await?;
 
     // Capture screenshot using system API
     let image = focused_screen
         .capture()
-        .map_err(|_| Error::UnableToCreateScreenshot)?;
+        .map_err(|err| Error::UnableToCreateScreenshot {
+            reason: err.to_string(),
+        })?;
 
     // The Image struct contains PNG data in its buffer
     // We need to save it as a file
     let buffer = image.buffer();
-    std::fs::write(screenshot_path, buffer).map_err(|_| Error::UnableToCreateScreenshot)?;
+    // std::fs::write(screenshot_path, buffer).map_err(|_| Error::UnableToCreateScreenshot)?;
 
-    println!("Screenshot saved to {}", screenshot_path);
-    Ok(())
+    // println!("Screenshot saved to {}", screenshot_path);
+    Ok(buffer.clone())
 }
 
 async fn get_focused_screen() -> Result<Screen, Error> {
     // Get the active window to determine which screen is focused
-    let active_window = get_active_window().map_err(|_| Error::UnableToCreateScreenshot)?;
+    let active_window = get_active_window().map_err(|_| Error::UnableToCreateScreenshot {
+        reason: "Can't get active window".to_owned(),
+    })?;
 
     // Get all available screens
-    let screens = Screen::all().map_err(|_| Error::UnableToCreateScreenshot)?;
+    let screens = Screen::all().map_err(|err| Error::UnableToCreateScreenshot {
+        reason: err.to_string(),
+    })?;
 
     // Find the screen that contains the active window
     for screen in screens {
@@ -238,7 +244,9 @@ async fn get_focused_screen() -> Result<Screen, Error> {
     }
 
     // Fallback to primary screen if no overlap found
-    Screen::from_point(0, 0).map_err(|_| Error::UnableToCreateScreenshot)
+    Screen::from_point(0, 0).map_err(|err| Error::UnableToCreateScreenshot {
+        reason: err.to_string(),
+    })
 }
 
 fn window_overlaps_screen(window: (i32, i32, i32, i32), screen: (i32, i32, u32, u32)) -> bool {
@@ -255,11 +263,11 @@ fn window_overlaps_screen(window: (i32, i32, i32, i32), screen: (i32, i32, u32, 
         && window_center_y < sy + sh as i32
 }
 
-async fn resize_screenshot(file_path: &str) -> Result<(), Error> {
+async fn resize_screenshot(data: &[u8], file_path: &str) -> Result<(), Error> {
     let wand = MagickWand::new();
 
     // Read the image
-    wand.read_image(file_path)
+    wand.read_image_blob(data)
         .map_err(|e| Error::UnableToResizeScreenshot {
             path: file_path.to_string(),
             reason: format!("Failed to read image: {:?}", e),
@@ -283,7 +291,7 @@ async fn resize_screenshot(file_path: &str) -> Result<(), Error> {
     let new_height = (orig_height * scale) as usize;
 
     // Resize the image maintaining aspect ratio
-    wand.resize_image(new_width, new_height, magick_rust::FilterType::Lanczos)
+    wand.resize_image(new_width, new_height, magick_rust::FilterType::Box)
         .map_err(|e| Error::UnableToResizeScreenshot {
             path: file_path.to_string(),
             reason: format!("Failed to resize image: {:?}", e),
@@ -320,7 +328,7 @@ async fn resize_screenshot(file_path: &str) -> Result<(), Error> {
             reason: format!("Failed to composite image: {:?}", e),
         })?;
 
-    // Write the final image back
+    // Write the final image
     canvas
         .write_image(file_path)
         .map_err(|e| Error::UnableToResizeScreenshot {
