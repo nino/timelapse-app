@@ -73,6 +73,9 @@ export function App(): React.ReactNode {
         return;
       }
 
+      // Clear the current video immediately so user sees loading state
+      setCurrentVideoSrc(null);
+
       try {
         setIsTranscoding(true);
         console.log("Transcoding video:", selectedVideo);
