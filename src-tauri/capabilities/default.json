@@ -7,12 +7,22 @@
     "core:default",
     "opener:default",
     "fs:default",
+    "core:path:default",
+    "core:event:default",
     {
       "identifier": "fs:scope",
       "allow": [
         { "path": "$HOME/Timelapse" },
         { "path": "$HOME/Timelapse/*" },
-        { "path": "$HOME/Timelapse/*/*" }
+        { "path": "$HOME/Timelapse/*/*" },
+        { "path": "$HOME/Timelapse/.cache" },
+        { "path": "$HOME/Timelapse/.cache/*" }
+      ]
+    },
+    {
+      "identifier": "core:asset:default",
+      "allow": [
+        { "path": "$HOME/Timelapse/.cache/*" }
       ]
     }
   ]

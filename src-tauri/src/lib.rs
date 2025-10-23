@@ -72,7 +72,7 @@ async fn clear_error_logs(state: State<'_, PhotographerState>) -> Result<String,
 }
 
 #[tauri::command]
-async fn transcode_video(video_filename: String) -> Result<Vec<u8>, String> {
+async fn transcode_video(video_filename: String) -> Result<String, String> {
     let home_dir = dirs::home_dir().ok_or("Unable to find home directory")?;
     let source_path = home_dir.join("Timelapse").join(&video_filename);
 
@@ -87,9 +87,7 @@ async fn transcode_video(video_filename: String) -> Result<Vec<u8>, String> {
     // Check if transcoded version already exists
     if cache_path.exists() {
         println!("Using cached transcoded video: {:?}", cache_path);
-        let video_data = std::fs::read(&cache_path)
-            .map_err(|e| format!("Failed to read cached video: {}", e))?;
-        return Ok(video_data);
+        return Ok(cache_path.to_string_lossy().to_string());
     }
 
     println!("Transcoding video: {:?} -> {:?}", source_path, cache_path);
@@ -123,11 +121,7 @@ async fn transcode_video(video_filename: String) -> Result<Vec<u8>, String> {
 
     println!("Transcoding complete: {:?}", cache_path);
 
-    // Read the transcoded video file and return as bytes
-    let video_data = std::fs::read(&cache_path)
-        .map_err(|e| format!("Failed to read transcoded video: {}", e))?;
-
-    Ok(video_data)
+    Ok(cache_path.to_string_lossy().to_string())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
