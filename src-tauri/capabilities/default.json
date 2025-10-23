@@ -18,12 +18,6 @@
         { "path": "$HOME/Timelapse/.cache" },
         { "path": "$HOME/Timelapse/.cache/*" }
       ]
-    },
-    {
-      "identifier": "core:asset:default",
-      "allow": [
-        { "path": "$HOME/Timelapse/.cache/*" }
-      ]
     }
   ]
 }
