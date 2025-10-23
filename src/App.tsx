@@ -51,7 +51,7 @@ export function App(): React.ReactNode {
   // Auto-select most recent video (for videos mode)
   React.useEffect(() => {
     if (viewMode === "videos" && videos.length > 0 && !selectedVideo) {
-      setSelectedVideo(videos[0]); // Already sorted with most recent first
+      setSelectedVideo(videos[videos.length - 1]); // Videos are in chronological order, so last is most recent
     }
   }, [videos, selectedVideo, viewMode]);
 
