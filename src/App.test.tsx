@@ -308,6 +308,279 @@ describe('App', () => {
     });
   });
 
+  describe('Video Loading', () => {
+    it('should load video and create blob URL', async () => {
+      const mockVideoData = new Uint8Array([10, 20, 30, 40, 50]);
+      const mockBlobUrl = 'blob:mock-video-url';
+
+      vi.mocked(URL.createObjectURL).mockReturnValue(mockBlobUrl);
+      vi.mocked(useFolders).mockReturnValue({
+        folders: [],
+        foldersError: null,
+        refreshFolders: vi.fn(),
+      });
+      vi.mocked(useVideos).mockReturnValue({
+        videos: ['test-video.mov'],
+        videosError: null,
+        refreshVideos: vi.fn(),
+      });
+      vi.mocked(useFiles).mockReturnValue({
+        files: [],
+        filesError: null,
+      });
+      vi.mocked(readFile).mockResolvedValue(mockVideoData);
+
+      render(<App />);
+
+      // Switch to videos mode
+      const videosButton = screen.getAllByText(/Videos/i).find(el => el.tagName === 'BUTTON');
+      if (videosButton) {
+        fireEvent.click(videosButton);
+      }
+
+      // Wait for video to load
+      await waitFor(() => {
+        expect(readFile).toHaveBeenCalledWith(
+          'Timelapse/test-video.mov',
+          expect.any(Object)
+        );
+      });
+
+      // Verify blob URL was created
+      expect(URL.createObjectURL).toHaveBeenCalled();
+
+      // Verify video element is rendered with correct src
+      await waitFor(() => {
+        const videoElement = document.querySelector('video');
+        expect(videoElement).toBeTruthy();
+        expect(videoElement?.src).toBe(mockBlobUrl);
+      });
+    });
+
+    it('should show loading state while video is loading', async () => {
+      vi.mocked(useFolders).mockReturnValue({
+        folders: [],
+        foldersError: null,
+        refreshFolders: vi.fn(),
+      });
+      vi.mocked(useVideos).mockReturnValue({
+        videos: ['slow-video.mov'],
+        videosError: null,
+        refreshVideos: vi.fn(),
+      });
+      vi.mocked(useFiles).mockReturnValue({
+        files: [],
+        filesError: null,
+      });
+
+      // Make readFile take a long time so we can see the loading state
+      let resolveRead: (value: Uint8Array) => void;
+      const readPromise = new Promise<Uint8Array>(resolve => {
+        resolveRead = resolve;
+      });
+      vi.mocked(readFile).mockReturnValue(readPromise);
+
+      render(<App />);
+
+      // Switch to videos mode
+      const videosButton = screen.getAllByText(/Videos/i).find(el => el.tagName === 'BUTTON');
+      if (videosButton) {
+        fireEvent.click(videosButton);
+      }
+
+      // Should show loading message immediately
+      await waitFor(() => {
+        expect(screen.getByText(/Loading video/i)).toBeInTheDocument();
+      });
+      // Video name appears in both the select dropdown and the loading message
+      const videoTexts = screen.getAllByText(/slow-video.mov/i);
+      expect(videoTexts.length).toBeGreaterThan(0);
+
+      // Resolve the read to clean up
+      resolveRead!(new Uint8Array([1, 2, 3]));
+    });
+
+    it('should handle video loading errors', async () => {
+      const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+      vi.mocked(useFolders).mockReturnValue({
+        folders: [],
+        foldersError: null,
+        refreshFolders: vi.fn(),
+      });
+      vi.mocked(useVideos).mockReturnValue({
+        videos: ['broken-video.mov'],
+        videosError: null,
+        refreshVideos: vi.fn(),
+      });
+      vi.mocked(useFiles).mockReturnValue({
+        files: [],
+        filesError: null,
+      });
+      vi.mocked(readFile).mockRejectedValue(new Error('Video file not found'));
+
+      render(<App />);
+
+      // Switch to videos mode
+      const videosButton = screen.getAllByText(/Videos/i).find(el => el.tagName === 'BUTTON');
+      if (videosButton) {
+        fireEvent.click(videosButton);
+      }
+
+      await waitFor(() => {
+        expect(consoleSpy).toHaveBeenCalledWith(
+          'Error loading video:',
+          expect.any(Error)
+        );
+      });
+
+      // Should show loading state (video failed to load)
+      expect(screen.getByText(/Loading video/i)).toBeInTheDocument();
+
+      consoleSpy.mockRestore();
+    });
+
+    it('should clean up blob URL when switching videos', async () => {
+      const mockVideoData1 = new Uint8Array([1, 2, 3]);
+      const mockVideoData2 = new Uint8Array([4, 5, 6]);
+      const mockBlobUrl1 = 'blob:video-1';
+      const mockBlobUrl2 = 'blob:video-2';
+
+      let callCount = 0;
+      vi.mocked(URL.createObjectURL).mockImplementation(() => {
+        callCount++;
+        return callCount === 1 ? mockBlobUrl1 : mockBlobUrl2;
+      });
+
+      vi.mocked(useFolders).mockReturnValue({
+        folders: [],
+        foldersError: null,
+        refreshFolders: vi.fn(),
+      });
+      vi.mocked(useVideos).mockReturnValue({
+        videos: ['video1.mov', 'video2.mov'],
+        videosError: null,
+        refreshVideos: vi.fn(),
+      });
+      vi.mocked(useFiles).mockReturnValue({
+        files: [],
+        filesError: null,
+      });
+
+      let readFileCallCount = 0;
+      vi.mocked(readFile).mockImplementation(() => {
+        readFileCallCount++;
+        return Promise.resolve(readFileCallCount === 1 ? mockVideoData1 : mockVideoData2);
+      });
+
+      render(<App />);
+
+      // Switch to videos mode
+      const videosButton = screen.getAllByText(/Videos/i).find(el => el.tagName === 'BUTTON');
+      if (videosButton) {
+        fireEvent.click(videosButton);
+      }
+
+      // Wait for first video to load
+      await waitFor(() => {
+        expect(readFile).toHaveBeenCalledWith('Timelapse/video1.mov', expect.any(Object));
+      });
+
+      // Switch to second video
+      const videoSelect = screen.getByRole('combobox', { name: '' });
+      fireEvent.change(videoSelect, { target: { value: 'video2.mov' } });
+
+      // Wait for second video to load
+      await waitFor(() => {
+        expect(readFile).toHaveBeenCalledWith('Timelapse/video2.mov', expect.any(Object));
+      });
+
+      // First blob URL should have been revoked when switching videos
+      expect(URL.revokeObjectURL).toHaveBeenCalledWith(mockBlobUrl1);
+    });
+
+    it('should clean up blob URL when switching away from video mode', async () => {
+      const mockVideoData = new Uint8Array([1, 2, 3]);
+      const mockBlobUrl = 'blob:video-url';
+
+      vi.mocked(URL.createObjectURL).mockReturnValue(mockBlobUrl);
+      vi.mocked(useFolders).mockReturnValue({
+        folders: ['2025-01-15'],
+        foldersError: null,
+        refreshFolders: vi.fn(),
+      });
+      vi.mocked(useVideos).mockReturnValue({
+        videos: ['test-video.mov'],
+        videosError: null,
+        refreshVideos: vi.fn(),
+      });
+      vi.mocked(useFiles).mockReturnValue({
+        files: ['image1.jpg'],
+        filesError: null,
+      });
+      vi.mocked(readFile).mockResolvedValue(mockVideoData);
+
+      render(<App />);
+
+      // Switch to videos mode
+      const videosButton = screen.getAllByText(/Videos/i).find(el => el.tagName === 'BUTTON');
+      if (videosButton) {
+        fireEvent.click(videosButton);
+      }
+
+      // Wait for video to load
+      await waitFor(() => {
+        expect(URL.createObjectURL).toHaveBeenCalled();
+      });
+
+      // Switch back to images mode
+      const imagesButton = screen.getByText(/Images/i).closest('button');
+      if (imagesButton) {
+        fireEvent.click(imagesButton);
+      }
+
+      // Blob URL should be revoked when switching away from videos
+      await waitFor(() => {
+        expect(URL.revokeObjectURL).toHaveBeenCalledWith(mockBlobUrl);
+      });
+    });
+
+    it('should show video controls', async () => {
+      const mockVideoData = new Uint8Array([1, 2, 3]);
+
+      vi.mocked(useFolders).mockReturnValue({
+        folders: [],
+        foldersError: null,
+        refreshFolders: vi.fn(),
+      });
+      vi.mocked(useVideos).mockReturnValue({
+        videos: ['test-video.mov'],
+        videosError: null,
+        refreshVideos: vi.fn(),
+      });
+      vi.mocked(useFiles).mockReturnValue({
+        files: [],
+        filesError: null,
+      });
+      vi.mocked(readFile).mockResolvedValue(mockVideoData);
+
+      render(<App />);
+
+      // Switch to videos mode
+      const videosButton = screen.getAllByText(/Videos/i).find(el => el.tagName === 'BUTTON');
+      if (videosButton) {
+        fireEvent.click(videosButton);
+      }
+
+      // Wait for video element
+      await waitFor(() => {
+        const videoElement = document.querySelector('video');
+        expect(videoElement).toBeTruthy();
+        expect(videoElement?.hasAttribute('controls')).toBe(true);
+      });
+    });
+  });
+
   describe('Blob URL Cleanup', () => {
     it('should revoke blob URLs on cleanup', async () => {
       const mockImageData = new Uint8Array([1, 2, 3]);

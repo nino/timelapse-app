@@ -62,6 +62,8 @@ export function App(): React.ReactNode {
 
   // Load current video when video is selected
   React.useEffect(() => {
+    let blobUrl: string | null = null;
+
     async function loadVideo(): Promise<void> {
       if (viewMode !== "videos" || !selectedVideo) {
         setCurrentVideoSrc(null);
@@ -80,7 +82,7 @@ export function App(): React.ReactNode {
 
         // Create a blob URL from the binary data
         const blob = new Blob([videoData], { type: "video/quicktime" });
-        const blobUrl = URL.createObjectURL(blob);
+        blobUrl = URL.createObjectURL(blob);
 
         console.log("Created video blob URL:", blobUrl);
         setCurrentVideoSrc(blobUrl);
@@ -91,6 +93,13 @@ export function App(): React.ReactNode {
     }
 
     loadVideo();
+
+    // Clean up blob URL when effect re-runs or component unmounts
+    return () => {
+      if (blobUrl) {
+        URL.revokeObjectURL(blobUrl);
+      }
+    };
   }, [selectedVideo, viewMode]);
 
   // Keyboard navigation
@@ -186,14 +195,7 @@ export function App(): React.ReactNode {
     };
   }, [currentImageSrc]);
 
-  // Clean up video blob URLs when component unmounts or video changes
-  React.useEffect(() => {
-    return (): void => {
-      if (currentVideoSrc && currentVideoSrc.startsWith("blob:")) {
-        URL.revokeObjectURL(currentVideoSrc);
-      }
-    };
-  }, [currentVideoSrc]);
+  // Note: Video blob URL cleanup is now handled in the loadVideo effect above
 
   const handleScrubberChange = React.useCallback(
     (e: React.ChangeEvent<HTMLInputElement>) => {
