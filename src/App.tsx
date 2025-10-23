@@ -399,7 +399,6 @@ export function App(): React.ReactNode {
             key={currentVideoSrc}
             src={currentVideoSrc}
             controls
-            autoPlay
             className="w-full h-full object-contain absolute top-0 left-0 bottom-0 right-0"
             onError={(e) => {
               const videoElement = e.currentTarget;
