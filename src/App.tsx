@@ -78,14 +78,14 @@ export function App(): React.ReactNode {
 
       try {
         setIsTranscoding(true);
-        console.log("Transcoding video:", selectedVideo);
+        console.log("Loading video:", selectedVideo);
 
-        // Call Tauri command to transcode the video
+        // Call Tauri command to transcode the video (uses cache if available)
         const videoData = await invoke<number[]>("transcode_video", {
           videoFilename: selectedVideo,
         });
 
-        console.log("Transcoded video data received, size:", videoData.length);
+        console.log("Video data received, size:", videoData.length);
 
         // Create a blob URL from the video data
         const blob = new Blob([new Uint8Array(videoData)], {
@@ -97,7 +97,7 @@ export function App(): React.ReactNode {
         setCurrentVideoSrc(blobUrl);
         setIsTranscoding(false);
       } catch (error) {
-        console.error("Error transcoding video:", error);
+        console.error("Error loading video:", error);
         setCurrentVideoSrc(null);
         setIsTranscoding(false);
       }
@@ -419,7 +419,7 @@ export function App(): React.ReactNode {
             <div>
               <p className="text-xl mb-2">
                 {isTranscoding
-                  ? "Transcoding video…"
+                  ? "Loading video…"
                   : selectedVideo
                     ? "Loading video…"
                     : "No video selected"}
@@ -431,15 +431,7 @@ export function App(): React.ReactNode {
                 <p>No videos found in the Timelapse directory</p>
               )}
               {selectedVideo && (
-                <p className="text-sm mt-2">
-                  {isTranscoding ? "Transcoding: " : "Loading: "}
-                  {selectedVideo}
-                </p>
-              )}
-              {isTranscoding && (
-                <p className="text-xs mt-2 text-gray-400">
-                  This may take a moment for the first playback…
-                </p>
+                <p className="text-sm mt-2">Loading: {selectedVideo}</p>
               )}
             </div>
           </div>
