@@ -1,3 +1,4 @@
+import { invoke } from "@tauri-apps/api/core";
 import { BaseDirectory } from "@tauri-apps/api/path";
 import { readFile } from "@tauri-apps/plugin-fs";
 import React from "react";
@@ -23,6 +24,7 @@ export function App(): React.ReactNode {
   const [currentVideoSrc, setCurrentVideoSrc] = React.useState<string | null>(
     null,
   );
+  const [isTranscoding, setIsTranscoding] = React.useState(false);
 
   // Get current date folder name (YYYY-MM-DD format)
   const currentDateFolder = React.useMemo(() => {
@@ -67,28 +69,34 @@ export function App(): React.ReactNode {
     async function loadVideo(): Promise<void> {
       if (viewMode !== "videos" || !selectedVideo) {
         setCurrentVideoSrc(null);
+        setIsTranscoding(false);
         return;
       }
 
       try {
-        const videoPath = `Timelapse/${selectedVideo}`;
-        console.log("Loading video from path:", videoPath);
+        setIsTranscoding(true);
+        console.log("Transcoding video:", selectedVideo);
 
-        const videoData = await readFile(videoPath, {
-          baseDir: BaseDirectory.Home,
+        // Call Tauri command to transcode the video
+        const videoData = await invoke<number[]>("transcode_video", {
+          videoFilename: selectedVideo,
         });
 
-        console.log("Video data loaded, size:", videoData.length);
+        console.log("Transcoded video data received, size:", videoData.length);
 
-        // Create a blob URL from the binary data
-        const blob = new Blob([videoData], { type: "video/quicktime" });
+        // Create a blob URL from the video data
+        const blob = new Blob([new Uint8Array(videoData)], {
+          type: "video/mp4",
+        });
         blobUrl = URL.createObjectURL(blob);
 
         console.log("Created video blob URL:", blobUrl);
         setCurrentVideoSrc(blobUrl);
+        setIsTranscoding(false);
       } catch (error) {
-        console.error("Error loading video:", error);
+        console.error("Error transcoding video:", error);
         setCurrentVideoSrc(null);
+        setIsTranscoding(false);
       }
     }
 
@@ -194,8 +202,6 @@ export function App(): React.ReactNode {
       }
     };
   }, [currentImageSrc]);
-
-  // Note: Video blob URL cleanup is now handled in the loadVideo effect above
 
   const handleScrubberChange = React.useCallback(
     (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -387,19 +393,34 @@ export function App(): React.ReactNode {
         ) : // Videos view
         currentVideoSrc ? (
           <video
+            key={currentVideoSrc}
             src={currentVideoSrc}
             controls
+            autoPlay
             className="w-full h-full object-contain absolute top-0 left-0 bottom-0 right-0"
-            onError={() => {
+            onError={(e) => {
+              const videoElement = e.currentTarget;
               console.error("Failed to load video:", currentVideoSrc);
+              console.error("Video error code:", videoElement.error?.code);
+              console.error("Video error message:", videoElement.error?.message);
               setCurrentVideoSrc(null);
+            }}
+            onLoadedMetadata={() => {
+              console.log("Video metadata loaded successfully");
+            }}
+            onCanPlay={() => {
+              console.log("Video can play");
             }}
           />
         ) : (
           <div className="flex items-center justify-center h-full text-gray-500 text-center">
             <div>
               <p className="text-xl mb-2">
-                {selectedVideo ? "Loading video…" : "No video selected"}
+                {isTranscoding
+                  ? "Transcoding video…"
+                  : selectedVideo
+                    ? "Loading video…"
+                    : "No video selected"}
               </p>
               {!selectedVideo && videos.length > 0 && (
                 <p>Select a video to begin playback</p>
@@ -408,7 +429,15 @@ export function App(): React.ReactNode {
                 <p>No videos found in the Timelapse directory</p>
               )}
               {selectedVideo && (
-                <p className="text-sm mt-2">Loading: {selectedVideo}</p>
+                <p className="text-sm mt-2">
+                  {isTranscoding ? "Transcoding: " : "Loading: "}
+                  {selectedVideo}
+                </p>
+              )}
+              {isTranscoding && (
+                <p className="text-xs mt-2 text-gray-400">
+                  This may take a moment for the first playback…
+                </p>
               )}
             </div>
           </div>
