@@ -112,3 +112,159 @@ pub fn run() {
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_greet() {
+        let result = greet("Alice");
+        assert_eq!(result, "Hello, Alice! You've been greeted from Rust!");
+
+        let result = greet("Bob");
+        assert_eq!(result, "Hello, Bob! You've been greeted from Rust!");
+    }
+
+    #[tokio::test]
+    async fn test_start_timelapse_success() {
+        let state: PhotographerState = Arc::new(Mutex::new(None));
+
+        // Create a mock State wrapper
+        let state_wrapper = State::from(&state);
+
+        let result = start_timelapse(state_wrapper).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "Timelapse started successfully");
+
+        // Verify photographer was created
+        let guard = state.lock().unwrap();
+        assert!(guard.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_start_timelapse_already_running() {
+        let state: PhotographerState = Arc::new(Mutex::new(None));
+
+        // Start timelapse first time
+        let state_wrapper = State::from(&state);
+        let result = start_timelapse(state_wrapper).await;
+        assert!(result.is_ok());
+
+        // Try to start again - should fail
+        let state_wrapper = State::from(&state);
+        let result = start_timelapse(state_wrapper).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "Timelapse is already running");
+    }
+
+    #[tokio::test]
+    async fn test_stop_timelapse_success() {
+        let state: PhotographerState = Arc::new(Mutex::new(None));
+
+        // Start timelapse first
+        let state_wrapper = State::from(&state);
+        let _ = start_timelapse(state_wrapper).await;
+
+        // Stop timelapse
+        let state_wrapper = State::from(&state);
+        let result = stop_timelapse(state_wrapper).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "Timelapse stopped successfully");
+
+        // Verify photographer was removed
+        let guard = state.lock().unwrap();
+        assert!(guard.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_stop_timelapse_not_running() {
+        let state: PhotographerState = Arc::new(Mutex::new(None));
+
+        let state_wrapper = State::from(&state);
+        let result = stop_timelapse(state_wrapper).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "Timelapse is not running");
+    }
+
+    #[tokio::test]
+    async fn test_is_timelapse_running() {
+        let state: PhotographerState = Arc::new(Mutex::new(None));
+
+        // Initially not running
+        let state_wrapper = State::from(&state);
+        let result = is_timelapse_running(state_wrapper).await;
+        assert!(result.is_ok());
+        assert!(!result.unwrap());
+
+        // Start timelapse
+        let state_wrapper = State::from(&state);
+        let _ = start_timelapse(state_wrapper).await;
+
+        // Now should be running
+        let state_wrapper = State::from(&state);
+        let result = is_timelapse_running(state_wrapper).await;
+        assert!(result.is_ok());
+        assert!(result.unwrap());
+
+        // Stop timelapse
+        let state_wrapper = State::from(&state);
+        let _ = stop_timelapse(state_wrapper).await;
+
+        // Should not be running again
+        let state_wrapper = State::from(&state);
+        let result = is_timelapse_running(state_wrapper).await;
+        assert!(result.is_ok());
+        assert!(!result.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_get_error_logs_when_running() {
+        let state: PhotographerState = Arc::new(Mutex::new(None));
+
+        // Start timelapse
+        let state_wrapper = State::from(&state);
+        let _ = start_timelapse(state_wrapper).await;
+
+        // Get error logs
+        let state_wrapper = State::from(&state);
+        let result = get_error_logs(state_wrapper).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_get_error_logs_when_not_running() {
+        let state: PhotographerState = Arc::new(Mutex::new(None));
+
+        let state_wrapper = State::from(&state);
+        let result = get_error_logs(state_wrapper).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_clear_error_logs_success() {
+        let state: PhotographerState = Arc::new(Mutex::new(None));
+
+        // Start timelapse
+        let state_wrapper = State::from(&state);
+        let _ = start_timelapse(state_wrapper).await;
+
+        // Clear error logs
+        let state_wrapper = State::from(&state);
+        let result = clear_error_logs(state_wrapper).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "Error logs cleared successfully");
+    }
+
+    #[tokio::test]
+    async fn test_clear_error_logs_not_running() {
+        let state: PhotographerState = Arc::new(Mutex::new(None));
+
+        let state_wrapper = State::from(&state);
+        let result = clear_error_logs(state_wrapper).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "Timelapse is not running");
+    }
+}

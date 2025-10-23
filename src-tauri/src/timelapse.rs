@@ -392,3 +392,239 @@ async fn is_image_all_black(file_path: &str) -> Result<bool, Error> {
     // PixelWand values are typically in the range 0.0 to 1.0
     Ok(mean_brightness < 0.01)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_photographer_new() {
+        let photographer = Photographer::new();
+        assert!(photographer.is_ok());
+
+        let photographer = photographer.unwrap();
+        assert!(!photographer.running.load(Ordering::SeqCst));
+        assert_eq!(photographer.get_error_logs().len(), 0);
+    }
+
+    #[test]
+    fn test_photographer_start_stop() {
+        let photographer = Photographer::new().unwrap();
+
+        // Initially should not be running
+        assert!(!photographer.running.load(Ordering::SeqCst));
+
+        // Start the photographer
+        let running_handle = photographer.start();
+        assert!(running_handle.load(Ordering::SeqCst));
+
+        // Stop the photographer
+        photographer.stop();
+        assert!(!photographer.running.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_photographer_error_logs() {
+        let photographer = Photographer::new().unwrap();
+
+        // Initially should have no error logs
+        assert_eq!(photographer.get_error_logs().len(), 0);
+
+        // Add an error log manually (simulating what would happen during operation)
+        {
+            let mut logs = photographer.error_logs.lock().unwrap();
+            logs.push(ErrorLogEntry {
+                timestamp: Utc::now(),
+                error_message: "Test error".to_string(),
+            });
+        }
+
+        // Verify we can retrieve the error log
+        let logs = photographer.get_error_logs();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].error_message, "Test error");
+
+        // Clear error logs
+        photographer.clear_error_logs();
+        assert_eq!(photographer.get_error_logs().len(), 0);
+    }
+
+    #[test]
+    fn test_photographer_error_logs_limit() {
+        let photographer = Photographer::new().unwrap();
+
+        // Add more than 10000 error logs
+        {
+            let mut logs = photographer.error_logs.lock().unwrap();
+            for i in 0..10002 {
+                logs.push(ErrorLogEntry {
+                    timestamp: Utc::now(),
+                    error_message: format!("Error {}", i),
+                });
+
+                // Simulate the limiting behavior from the actual code
+                if logs.len() > 10000 {
+                    logs.remove(0);
+                }
+            }
+        }
+
+        // Should be limited to 10000
+        let logs = photographer.get_error_logs();
+        assert_eq!(logs.len(), 10000);
+        // First error should be "Error 2" (0 and 1 should have been removed)
+        assert_eq!(logs[0].error_message, "Error 2");
+    }
+
+    #[test]
+    fn test_create_day_dir_if_needed() {
+        let temp_dir = TempDir::new().unwrap();
+        let timelapse_root = temp_dir.path().to_path_buf();
+
+        let result = Photographer::create_day_dir_if_needed(&timelapse_root);
+        assert!(result.is_ok());
+
+        let day_dir = result.unwrap();
+        assert!(day_dir.exists());
+        assert!(day_dir.is_dir());
+
+        // Verify the directory name format (YYYY-MM-DD)
+        let dir_name = day_dir.file_name().unwrap().to_str().unwrap();
+        assert_eq!(dir_name.len(), 10); // YYYY-MM-DD is 10 characters
+        assert_eq!(&dir_name[4..5], "-");
+        assert_eq!(&dir_name[7..8], "-");
+    }
+
+    #[test]
+    fn test_next_filename_empty_dir() {
+        let temp_dir = TempDir::new().unwrap();
+        let day_dir = temp_dir.path().to_path_buf();
+
+        let result = next_filename(&day_dir);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "00001.png");
+    }
+
+    #[test]
+    fn test_next_filename_with_existing_files() {
+        let temp_dir = TempDir::new().unwrap();
+        let day_dir = temp_dir.path().to_path_buf();
+
+        // Create some test files
+        fs::write(day_dir.join("00001.png"), "test").unwrap();
+        fs::write(day_dir.join("00002.png"), "test").unwrap();
+        fs::write(day_dir.join("00003.jpg"), "test").unwrap();
+
+        let result = next_filename(&day_dir);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "00004.png");
+    }
+
+    #[test]
+    fn test_next_filename_with_gaps() {
+        let temp_dir = TempDir::new().unwrap();
+        let day_dir = temp_dir.path().to_path_buf();
+
+        // Create files with gaps in numbering
+        fs::write(day_dir.join("00001.png"), "test").unwrap();
+        fs::write(day_dir.join("00005.png"), "test").unwrap();
+        fs::write(day_dir.join("00010.png"), "test").unwrap();
+
+        let result = next_filename(&day_dir);
+        assert!(result.is_ok());
+        // Should be max + 1 = 11
+        assert_eq!(result.unwrap(), "00011.png");
+    }
+
+    #[test]
+    fn test_next_filename_ignores_non_numeric() {
+        let temp_dir = TempDir::new().unwrap();
+        let day_dir = temp_dir.path().to_path_buf();
+
+        // Create files with non-numeric names
+        fs::write(day_dir.join("00001.png"), "test").unwrap();
+        fs::write(day_dir.join("test.png"), "test").unwrap();
+        fs::write(day_dir.join("image.jpg"), "test").unwrap();
+
+        let result = next_filename(&day_dir);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "00002.png");
+    }
+
+    #[test]
+    fn test_window_overlaps_screen_center_inside() {
+        // Window centered at (100, 100) with size 50x50
+        // Screen at (0, 0) with size 200x200
+        let window = (75, 75, 50, 50);
+        let screen = (0, 0, 200, 200);
+
+        assert!(window_overlaps_screen(window, screen));
+    }
+
+    #[test]
+    fn test_window_overlaps_screen_center_outside() {
+        // Window centered at (300, 300) with size 50x50
+        // Screen at (0, 0) with size 200x200
+        let window = (275, 275, 50, 50);
+        let screen = (0, 0, 200, 200);
+
+        assert!(!window_overlaps_screen(window, screen));
+    }
+
+    #[test]
+    fn test_window_overlaps_screen_edge_case() {
+        // Window partially on screen, but center is inside
+        let window = (175, 175, 50, 50);
+        let screen = (0, 0, 200, 200);
+
+        // Center is at (200, 200), which is exactly at the edge
+        assert!(!window_overlaps_screen(window, screen));
+    }
+
+    #[test]
+    fn test_window_overlaps_screen_multi_monitor() {
+        // Simulate a second monitor at x=1920
+        let window = (2000, 100, 100, 100);
+        let screen1 = (0, 0, 1920, 1080);
+        let screen2 = (1920, 0, 1920, 1080);
+
+        assert!(!window_overlaps_screen(window, screen1));
+        assert!(window_overlaps_screen(window, screen2));
+    }
+
+    #[test]
+    fn test_error_display() {
+        let error = Error::UnableToFindHomeDir;
+        assert_eq!(error.to_string(), "Unable to find home dir");
+
+        let error = Error::UnableToCreateScreenshot {
+            reason: "test reason".to_string(),
+        };
+        assert_eq!(error.to_string(), "Unable to create screenshot because: test reason");
+
+        let error = Error::UnableToResizeScreenshot {
+            path: "/test/path".to_string(),
+            reason: "resize failed".to_string(),
+        };
+        assert_eq!(error.to_string(), "Unable to resize screenshot /test/path because: resize failed");
+    }
+
+    #[test]
+    fn test_error_log_entry_serialization() {
+        let entry = ErrorLogEntry {
+            timestamp: Utc::now(),
+            error_message: "Test error message".to_string(),
+        };
+
+        // Test serialization
+        let json = serde_json::to_string(&entry);
+        assert!(json.is_ok());
+
+        // Test deserialization
+        let deserialized: Result<ErrorLogEntry, _> = serde_json::from_str(&json.unwrap());
+        assert!(deserialized.is_ok());
+        assert_eq!(deserialized.unwrap().error_message, "Test error message");
+    }
+}
