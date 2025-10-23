@@ -1,4 +1,4 @@
-import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { invoke } from "@tauri-apps/api/core";
 import { BaseDirectory } from "@tauri-apps/api/path";
 import { readFile } from "@tauri-apps/plugin-fs";
 import React from "react";
@@ -64,6 +64,8 @@ export function App(): React.ReactNode {
 
   // Load current video when video is selected
   React.useEffect(() => {
+    let blobUrl: string | null = null;
+
     async function loadVideo(): Promise<void> {
       if (viewMode !== "videos" || !selectedVideo) {
         setCurrentVideoSrc(null);
@@ -78,18 +80,21 @@ export function App(): React.ReactNode {
         setIsTranscoding(true);
         console.log("Loading video:", selectedVideo);
 
-        // Call Tauri command to get the transcoded video path (uses cache if available)
-        const transcodedPath = await invoke<string>("transcode_video", {
+        // Call Tauri command to transcode the video (uses cache if available)
+        const videoData = await invoke<number[]>("transcode_video", {
           videoFilename: selectedVideo,
         });
 
-        console.log("Transcoded video path:", transcodedPath);
+        console.log("Video data received, size:", videoData.length);
 
-        // Convert the file path to an asset URL that the webview can stream
-        const videoUrl = convertFileSrc(transcodedPath);
+        // Create a blob URL from the video data
+        const blob = new Blob([new Uint8Array(videoData)], {
+          type: "video/mp4",
+        });
+        blobUrl = URL.createObjectURL(blob);
 
-        console.log("Converted video URL:", videoUrl);
-        setCurrentVideoSrc(videoUrl);
+        console.log("Created video blob URL:", blobUrl);
+        setCurrentVideoSrc(blobUrl);
         setIsTranscoding(false);
       } catch (error) {
         console.error("Error loading video:", error);
@@ -99,6 +104,13 @@ export function App(): React.ReactNode {
     }
 
     loadVideo();
+
+    // Clean up blob URL when effect re-runs or component unmounts
+    return () => {
+      if (blobUrl) {
+        URL.revokeObjectURL(blobUrl);
+      }
+    };
   }, [selectedVideo, viewMode]);
 
   // Keyboard navigation

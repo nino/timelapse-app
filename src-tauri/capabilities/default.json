@@ -14,9 +14,7 @@
       "allow": [
         { "path": "$HOME/Timelapse" },
         { "path": "$HOME/Timelapse/*" },
-        { "path": "$HOME/Timelapse/*/*" },
-        { "path": "$HOME/Timelapse/.cache" },
-        { "path": "$HOME/Timelapse/.cache/*" }
+        { "path": "$HOME/Timelapse/*/*" }
       ]
     }
   ]
