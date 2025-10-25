@@ -1,3 +1,4 @@
+import { invoke } from "@tauri-apps/api/core";
 import { BaseDirectory } from "@tauri-apps/api/path";
 import { readFile } from "@tauri-apps/plugin-fs";
 import React from "react";
@@ -23,6 +24,7 @@ export function App(): React.ReactNode {
   const [currentVideoSrc, setCurrentVideoSrc] = React.useState<string | null>(
     null,
   );
+  const [isTranscoding, setIsTranscoding] = React.useState(false);
 
   // Get current date folder name (YYYY-MM-DD format)
   const currentDateFolder = React.useMemo(() => {
@@ -49,7 +51,7 @@ export function App(): React.ReactNode {
   // Auto-select most recent video (for videos mode)
   React.useEffect(() => {
     if (viewMode === "videos" && videos.length > 0 && !selectedVideo) {
-      setSelectedVideo(videos[0]); // Already sorted with most recent first
+      setSelectedVideo(videos[videos.length - 1]); // Videos are in chronological order, so last is most recent
     }
   }, [videos, selectedVideo, viewMode]);
 
@@ -62,35 +64,53 @@ export function App(): React.ReactNode {
 
   // Load current video when video is selected
   React.useEffect(() => {
+    let blobUrl: string | null = null;
+
     async function loadVideo(): Promise<void> {
       if (viewMode !== "videos" || !selectedVideo) {
         setCurrentVideoSrc(null);
+        setIsTranscoding(false);
         return;
       }
 
-      try {
-        const videoPath = `Timelapse/${selectedVideo}`;
-        console.log("Loading video from path:", videoPath);
+      // Clear the current video immediately so user sees loading state
+      setCurrentVideoSrc(null);
 
-        const videoData = await readFile(videoPath, {
-          baseDir: BaseDirectory.Home,
+      try {
+        setIsTranscoding(true);
+        console.log("Loading video:", selectedVideo);
+
+        // Call Tauri command to transcode the video (uses cache if available)
+        const videoData = await invoke<number[]>("transcode_video", {
+          videoFilename: selectedVideo,
         });
 
-        console.log("Video data loaded, size:", videoData.length);
+        console.log("Video data received, size:", videoData.length);
 
-        // Create a blob URL from the binary data
-        const blob = new Blob([videoData], { type: "video/quicktime" });
-        const blobUrl = URL.createObjectURL(blob);
+        // Create a blob URL from the video data
+        const blob = new Blob([new Uint8Array(videoData)], {
+          type: "video/mp4",
+        });
+        blobUrl = URL.createObjectURL(blob);
 
         console.log("Created video blob URL:", blobUrl);
         setCurrentVideoSrc(blobUrl);
+        setIsTranscoding(false);
       } catch (error) {
         console.error("Error loading video:", error);
         setCurrentVideoSrc(null);
+        setIsTranscoding(false);
       }
     }
 
     loadVideo();
+
+    // Clean up blob URL when effect re-runs or component unmounts
+    return () => {
+      if (blobUrl) {
+        URL.revokeObjectURL(blobUrl);
+      }
+    };
   }, [selectedVideo, viewMode]);
 
   // Keyboard navigation
@@ -185,15 +205,6 @@ export function App(): React.ReactNode {
       }
     };
   }, [currentImageSrc]);
-
-  // Clean up video blob URLs when component unmounts or video changes
-  React.useEffect(() => {
-    return (): void => {
-      if (currentVideoSrc && currentVideoSrc.startsWith("blob:")) {
-        URL.revokeObjectURL(currentVideoSrc);
-      }
-    };
-  }, [currentVideoSrc]);
 
   const handleScrubberChange = React.useCallback(
     (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -385,19 +396,33 @@ export function App(): React.ReactNode {
         ) : // Videos view
         currentVideoSrc ? (
           <video
+            key={currentVideoSrc}
             src={currentVideoSrc}
             controls
             className="w-full h-full object-contain absolute top-0 left-0 bottom-0 right-0"
-            onError={() => {
+            onError={(e) => {
+              const videoElement = e.currentTarget;
               console.error("Failed to load video:", currentVideoSrc);
+              console.error("Video error code:", videoElement.error?.code);
+              console.error("Video error message:", videoElement.error?.message);
               setCurrentVideoSrc(null);
+            }}
+            onLoadedMetadata={() => {
+              console.log("Video metadata loaded successfully");
+            }}
+            onCanPlay={() => {
+              console.log("Video can play");
             }}
           />
         ) : (
           <div className="flex items-center justify-center h-full text-gray-500 text-center">
             <div>
               <p className="text-xl mb-2">
-                {selectedVideo ? "Loading video…" : "No video selected"}
+                {isTranscoding
+                  ? "Loading video…"
+                  : selectedVideo
+                    ? "Loading video…"
+                    : "No video selected"}
               </p>
               {!selectedVideo && videos.length > 0 && (
                 <p>Select a video to begin playback</p>

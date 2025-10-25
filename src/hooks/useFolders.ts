@@ -90,8 +90,7 @@ export function useVideos(): {
       const videoList = entries
         .filter((entry) => entry.isFile && entry.name.endsWith(".mov"))
         .map((entry) => entry.name)
-        .sort()
-        .reverse(); // Most recent first
+        .sort(); // Chronological order (oldest first)
       setVideos(videoList);
     } catch (error) {
       setVideosError(ensureError(error));
