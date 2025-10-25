@@ -1,7 +1,7 @@
 {
   "name": "timelapse-app",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.2",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -13,7 +13,8 @@
     "test": "vitest",
     "test:ui": "vitest --ui",
     "test:run": "vitest run",
-    "test:coverage": "vitest run --coverage"
+    "test:coverage": "vitest run --coverage",
+    "version:bump": "tsx scripts/bump-version.ts"
   },
   "dependencies": {
     "@tanstack/react-virtual": "^3.13.9",
@@ -51,6 +52,7 @@
     "postcss": "8.4.35",
     "postcss-nesting": "^13.0.1",
     "tailwindcss": "^4.1.10",
+    "tsx": "^4.20.6",
     "typescript": "~5.6.2",
     "vite": "^6.0.3",
     "vitest": "^4.0.1"
