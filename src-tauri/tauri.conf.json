@@ -4,9 +4,9 @@
   "version": "0.1.0",
   "identifier": "com.timelapse-app.app",
   "build": {
-    "beforeDevCommand": "deno task dev",
+    "beforeDevCommand": "yarn dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "deno task build",
+    "beforeBuildCommand": "yarn build",
     "frontendDist": "../dist"
   },
   "app": {
