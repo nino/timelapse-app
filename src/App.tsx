@@ -21,10 +21,13 @@ export function App(): React.ReactNode {
   const [currentImageSrc, setCurrentImageSrc] = React.useState<string | null>(
     null,
   );
-  const [currentVideoSrc, setCurrentVideoSrc] = React.useState<string | null>(
+  const [videoCacheFolder, setVideoCacheFolder] = React.useState<string | null>(
     null,
   );
-  const [isTranscoding, setIsTranscoding] = React.useState(false);
+  const [isExtractingFrames, setIsExtractingFrames] = React.useState(false);
+  const { files: videoFiles } = useFiles(
+    videoCacheFolder ? `.cache/${videoCacheFolder}` : null,
+  );
 
   // Get current date folder name (YYYY-MM-DD format)
   const currentDateFolder = React.useMemo(() => {
@@ -62,94 +65,67 @@ export function App(): React.ReactNode {
     }
   }, [selectedFolder, files.length, viewMode]);
 
-  // Load current video when video is selected
+  // Reset image index when video frames are loaded
   React.useEffect(() => {
-    let blobUrl: string | null = null;
+    if (viewMode === "videos" && videoFiles.length > 0) {
+      setCurrentImageIndex(0); // Start from first frame for videos
+    }
+  }, [videoFiles.length, viewMode]);
 
-    async function loadVideo(): Promise<void> {
+  // Extract frames from selected video
+  React.useEffect(() => {
+    async function extractFrames(): Promise<void> {
       if (viewMode !== "videos" || !selectedVideo) {
-        setCurrentVideoSrc(null);
-        setIsTranscoding(false);
+        setVideoCacheFolder(null);
+        setIsExtractingFrames(false);
         return;
       }
 
-      // Clear the current video immediately so user sees loading state
-      setCurrentVideoSrc(null);
-
       try {
-        setIsTranscoding(true);
-        console.log("Loading video:", selectedVideo);
+        setIsExtractingFrames(true);
+        console.log("Extracting frames from video:", selectedVideo);
 
-        // Call Tauri command to transcode the video (uses cache if available)
-        const videoData = await invoke<number[]>("transcode_video", {
+        // Call Tauri command to extract frames (uses cache if available)
+        const cacheFolder = await invoke<string>("extract_video_frames", {
           videoFilename: selectedVideo,
         });
 
-        console.log("Video data received, size:", videoData.length);
-
-        // Create a blob URL from the video data
-        const blob = new Blob([new Uint8Array(videoData)], {
-          type: "video/mp4",
-        });
-        blobUrl = URL.createObjectURL(blob);
-
-        console.log("Created video blob URL:", blobUrl);
-        setCurrentVideoSrc(blobUrl);
-        setIsTranscoding(false);
+        console.log("Frames extracted to cache folder:", cacheFolder);
+        setVideoCacheFolder(cacheFolder);
+        setIsExtractingFrames(false);
       } catch (error) {
-        console.error("Error loading video:", error);
-        setCurrentVideoSrc(null);
-        setIsTranscoding(false);
+        console.error("Error extracting frames:", error);
+        setVideoCacheFolder(null);
+        setIsExtractingFrames(false);
       }
     }
 
-    loadVideo();
-
-    // Clean up blob URL when effect re-runs or component unmounts
-    return () => {
-      if (blobUrl) {
-        URL.revokeObjectURL(blobUrl);
-      }
-    };
+    extractFrames();
   }, [selectedVideo, viewMode]);
 
   // Keyboard navigation
   React.useEffect(() => {
     const handleKeydown = (e: KeyboardEvent): void => {
+      const activeFiles = viewMode === "images" ? files : videoFiles;
+
       if (viewMode === "images" && (!selectedFolder || files.length === 0))
         return;
-      if (viewMode === "videos" && videos.length === 0) return;
+      if (viewMode === "videos" && videoFiles.length === 0) return;
 
-      if (viewMode === "images") {
-        let step = 1;
-        if (e.shiftKey) step = 10;
-        if (e.altKey) step = 100; // Option key on Mac is altKey
+      let step = 1;
+      if (e.shiftKey) step = 10;
+      if (e.altKey) step = 100; // Option key on Mac is altKey
 
-        let newIndex = currentImageIndex;
+      let newIndex = currentImageIndex;
 
-        if (e.key === "ArrowLeft") {
-          e.preventDefault();
-          newIndex = Math.max(0, currentImageIndex - step);
-          setCurrentImageIndex(newIndex);
-        } else if (e.key === "ArrowRight") {
-          e.preventDefault();
-          newIndex = Math.min(files.length - 1, currentImageIndex + step);
-          setCurrentImageIndex(newIndex);
-        }
-      } else if (viewMode === "videos") {
-        if (e.key === "ArrowLeft") {
-          e.preventDefault();
-          const currentIndex = videos.indexOf(selectedVideo || "");
-          if (currentIndex > 0) {
-            setSelectedVideo(videos[currentIndex - 1]);
-          }
-        } else if (e.key === "ArrowRight") {
-          e.preventDefault();
-          const currentIndex = videos.indexOf(selectedVideo || "");
-          if (currentIndex < videos.length - 1) {
-            setSelectedVideo(videos[currentIndex + 1]);
-          }
-        }
+      if (e.key === "ArrowLeft") {
+        e.preventDefault();
+        newIndex = Math.max(0, currentImageIndex - step);
+        setCurrentImageIndex(newIndex);
+      } else if (e.key === "ArrowRight") {
+        e.preventDefault();
+        newIndex = Math.min(activeFiles.length - 1, currentImageIndex + step);
+        setCurrentImageIndex(newIndex);
       }
     };
 
@@ -158,44 +134,71 @@ export function App(): React.ReactNode {
   }, [
     selectedFolder,
     files.length,
+    videoFiles.length,
     currentImageIndex,
     viewMode,
-    videos,
-    selectedVideo,
   ]);
 
-  // Load current image when folder or index changes
+  // Load current image when folder or index changes (works for both images and videos)
   React.useEffect(() => {
     async function loadImage(): Promise<void> {
-      if (!selectedFolder || files.length === 0 || !files[currentImageIndex]) {
-        setCurrentImageSrc(null);
-        return;
-      }
+      if (viewMode === "images") {
+        if (!selectedFolder || files.length === 0 || !files[currentImageIndex]) {
+          setCurrentImageSrc(null);
+          return;
+        }
 
-      try {
-        const imagePath = `Timelapse/${selectedFolder}/${files[currentImageIndex]}`;
-        console.log("Loading image from path:", imagePath);
+        try {
+          const imagePath = `Timelapse/${selectedFolder}/${files[currentImageIndex]}`;
+          console.log("Loading image from path:", imagePath);
 
-        const imageData = await readFile(imagePath, {
-          baseDir: BaseDirectory.Home,
-        });
+          const imageData = await readFile(imagePath, {
+            baseDir: BaseDirectory.Home,
+          });
 
-        console.log("Image data loaded, size:", imageData.length);
+          console.log("Image data loaded, size:", imageData.length);
 
-        // Create a blob URL from the binary data
-        const blob = new Blob([imageData], { type: "image/jpeg" });
-        const blobUrl = URL.createObjectURL(blob);
+          // Create a blob URL from the binary data
+          const blob = new Blob([imageData], { type: "image/jpeg" });
+          const blobUrl = URL.createObjectURL(blob);
 
-        console.log("Created blob URL:", blobUrl);
-        setCurrentImageSrc(blobUrl);
-      } catch (error) {
-        console.error("Error loading image:", error);
-        setCurrentImageSrc(null);
+          console.log("Created blob URL:", blobUrl);
+          setCurrentImageSrc(blobUrl);
+        } catch (error) {
+          console.error("Error loading image:", error);
+          setCurrentImageSrc(null);
+        }
+      } else if (viewMode === "videos") {
+        if (!videoCacheFolder || videoFiles.length === 0 || !videoFiles[currentImageIndex]) {
+          setCurrentImageSrc(null);
+          return;
+        }
+
+        try {
+          const framePath = `Timelapse/.cache/${videoCacheFolder}/${videoFiles[currentImageIndex]}`;
+          console.log("Loading video frame from path:", framePath);
+
+          const frameData = await readFile(framePath, {
+            baseDir: BaseDirectory.Home,
+          });
+
+          console.log("Frame data loaded, size:", frameData.length);
+
+          // Create a blob URL from the binary data
+          const blob = new Blob([frameData], { type: "image/jpeg" });
+          const blobUrl = URL.createObjectURL(blob);
+
+          console.log("Created blob URL:", blobUrl);
+          setCurrentImageSrc(blobUrl);
+        } catch (error) {
+          console.error("Error loading frame:", error);
+          setCurrentImageSrc(null);
+        }
       }
     }
 
     loadImage();
-  }, [selectedFolder, files, currentImageIndex]);
+  }, [selectedFolder, files, videoCacheFolder, videoFiles, currentImageIndex, viewMode]);
 
   // Clean up blob URLs when component unmounts or image changes
   React.useEffect(() => {
@@ -355,6 +358,16 @@ export function App(): React.ReactNode {
                   {videos.length} videos
                 </span>
               )}
+              {selectedVideo && videoFiles.length > 0 && (
+                <>
+                  <span className="text-gray-600 text-sm">
+                    {videoFiles.length} frames
+                  </span>
+                  <span className="text-gray-600 text-sm tabular-nums">
+                    Frame {currentImageIndex + 1} / {videoFiles.length}
+                  </span>
+                </>
+              )}
             </>
           )}
         </div>
@@ -362,76 +375,62 @@ export function App(): React.ReactNode {
 
       {/* Main content area */}
       <div className="relative overflow-hidden object-contain">
-        {viewMode === "images" ? (
-          // Images view
-          currentImageSrc ? (
-            <img
-              src={currentImageSrc}
-              alt={`Screenshot ${currentImageIndex + 1}`}
-              className="w-full h-full object-contain absolute top-0 left-0 bottom-0 right-0"
-              onError={() => {
-                console.error("Failed to load image:", currentImageSrc);
-                setCurrentImageSrc(null);
-              }}
-            />
-          ) : (
-            <div className="flex items-center justify-center h-full text-gray-500 text-center">
-              <div>
-                <p className="text-xl mb-2">
-                  {files.length > 0
-                    ? "Loading image…"
-                    : "No screenshots available"}
-                </p>
-                {files.length === 0 && (
-                  <p>Select a date folder with screenshots to begin</p>
-                )}
-                {files.length > 0 && (
-                  <p className="text-sm mt-2">
-                    Trying to load: {files[currentImageIndex]}
-                  </p>
-                )}
-              </div>
-            </div>
-          )
-        ) : // Videos view
-        currentVideoSrc ? (
-          <video
-            key={currentVideoSrc}
-            src={currentVideoSrc}
-            controls
+        {currentImageSrc ? (
+          <img
+            src={currentImageSrc}
+            alt={
+              viewMode === "images"
+                ? `Screenshot ${currentImageIndex + 1}`
+                : `Frame ${currentImageIndex + 1}`
+            }
             className="w-full h-full object-contain absolute top-0 left-0 bottom-0 right-0"
-            onError={(e) => {
-              const videoElement = e.currentTarget;
-              console.error("Failed to load video:", currentVideoSrc);
-              console.error("Video error code:", videoElement.error?.code);
-              console.error("Video error message:", videoElement.error?.message);
-              setCurrentVideoSrc(null);
-            }}
-            onLoadedMetadata={() => {
-              console.log("Video metadata loaded successfully");
-            }}
-            onCanPlay={() => {
-              console.log("Video can play");
+            onError={() => {
+              console.error("Failed to load image:", currentImageSrc);
+              setCurrentImageSrc(null);
             }}
           />
         ) : (
           <div className="flex items-center justify-center h-full text-gray-500 text-center">
             <div>
-              <p className="text-xl mb-2">
-                {isTranscoding
-                  ? "Loading video…"
-                  : selectedVideo
-                    ? "Loading video…"
-                    : "No video selected"}
-              </p>
-              {!selectedVideo && videos.length > 0 && (
-                <p>Select a video to begin playback</p>
-              )}
-              {!selectedVideo && videos.length === 0 && (
-                <p>No videos found in the Timelapse directory</p>
-              )}
-              {selectedVideo && (
-                <p className="text-sm mt-2">Loading: {selectedVideo}</p>
+              {viewMode === "images" ? (
+                <>
+                  <p className="text-xl mb-2">
+                    {files.length > 0
+                      ? "Loading image…"
+                      : "No screenshots available"}
+                  </p>
+                  {files.length === 0 && (
+                    <p>Select a date folder with screenshots to begin</p>
+                  )}
+                  {files.length > 0 && (
+                    <p className="text-sm mt-2">
+                      Trying to load: {files[currentImageIndex]}
+                    </p>
+                  )}
+                </>
+              ) : (
+                <>
+                  <p className="text-xl mb-2">
+                    {isExtractingFrames
+                      ? "Extracting frames from video…"
+                      : videoFiles.length > 0
+                        ? "Loading frame…"
+                        : selectedVideo
+                          ? "Loading video…"
+                          : "No video selected"}
+                  </p>
+                  {!selectedVideo && videos.length > 0 && (
+                    <p>Select a video to begin</p>
+                  )}
+                  {!selectedVideo && videos.length === 0 && (
+                    <p>No videos found in the Timelapse directory</p>
+                  )}
+                  {selectedVideo && videoFiles.length > 0 && (
+                    <p className="text-sm mt-2">
+                      Trying to load: {videoFiles[currentImageIndex]}
+                    </p>
+                  )}
+                </>
               )}
             </div>
           </div>
@@ -441,67 +440,25 @@ export function App(): React.ReactNode {
       {/* Bottom controls */}
       <div className="bg-gray-100 p-4">
         <div className="flex items-center gap-4">
-          {viewMode === "images" ? (
-            <>
-              {/* Image scrubber */}
-              <div className="flex-1 bg-gray-200 p-1 pt-0 rounded-full">
-                <input
-                  type="range"
-                  min={0}
-                  max={Math.max(0, files.length - 1)}
-                  value={currentImageIndex}
-                  onChange={handleScrubberChange}
-                  disabled={files.length === 0}
-                  className="w-full h-2 bg-gray-300 rounded-lg appearance-none cursor-pointer 
-                             disabled:opacity-50 disabled:cursor-not-allowed"
-                />
-              </div>
+          {/* Scrubber (works for both images and videos) */}
+          <div className="flex-1 bg-gray-200 p-1 pt-0 rounded-full">
+            <input
+              type="range"
+              min={0}
+              max={Math.max(0, (viewMode === "images" ? files.length : videoFiles.length) - 1)}
+              value={currentImageIndex}
+              onChange={handleScrubberChange}
+              disabled={viewMode === "images" ? files.length === 0 : videoFiles.length === 0}
+              className="w-full h-2 bg-gray-300 rounded-lg appearance-none cursor-pointer
+                         disabled:opacity-50 disabled:cursor-not-allowed"
+            />
+          </div>
 
-              {/* Current time display */}
-              <div className="text-sm text-gray-600 min-w-[60px] text-center">
-                {files.length > 0 ? formatTime(currentImageIndex) : "--:--"}
-              </div>
-            </>
-          ) : (
-            <>
-              {/* Video navigation */}
-              <div className="flex-1 flex items-center justify-center gap-4">
-                <button
-                  onClick={() => {
-                    const currentIndex = videos.indexOf(selectedVideo || "");
-                    if (currentIndex > 0) {
-                      setSelectedVideo(videos[currentIndex - 1]);
-                    }
-                  }}
-                  disabled={
-                    !selectedVideo || videos.indexOf(selectedVideo) === 0
-                  }
-                  className="bg-white hover:bg-gray-50 disabled:bg-gray-200 disabled:text-gray-400 px-4 py-2 rounded-lg text-sm font-medium transition-colors border border-gray-300"
-                >
-                  ← Previous Video
-                </button>
-                <span className="text-sm text-gray-600">
-                  {selectedVideo
-                    ? `${videos.indexOf(selectedVideo) + 1} / ${videos.length}`
-                    : "--"}
-                </span>
-                <button
-                  onClick={() => {
-                    const currentIndex = videos.indexOf(selectedVideo || "");
-                    if (currentIndex < videos.length - 1) {
-                      setSelectedVideo(videos[currentIndex + 1]);
-                    }
-                  }}
-                  disabled={
-                    !selectedVideo ||
-                    videos.indexOf(selectedVideo) === videos.length - 1
-                  }
-                  className="bg-white hover:bg-gray-50 disabled:bg-gray-200 disabled:text-gray-400 px-4 py-2 rounded-lg text-sm font-medium transition-colors border border-gray-300"
-                >
-                  Next Video →
-                </button>
-              </div>
-            </>
+          {/* Current time/frame display */}
+          {viewMode === "images" && (
+            <div className="text-sm text-gray-600 min-w-[60px] text-center">
+              {files.length > 0 ? formatTime(currentImageIndex) : "--:--"}
+            </div>
           )}
 
           {/* Refresh button */}
