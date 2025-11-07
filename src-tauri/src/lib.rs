@@ -1,4 +1,5 @@
 mod timelapse;
+mod database;
 
 use std::process::Command;
 use std::sync::{Arc, Mutex};
