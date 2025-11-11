@@ -150,6 +150,14 @@ impl Photographer {
         }
     }
 
+    pub fn get_screenshot_metadata(&self, frame_number: u32) -> Result<Option<(String, String)>, Error> {
+        if let Ok(db_guard) = self.db.lock() {
+            Ok(db_guard.get_screenshot_by_frame(frame_number)?)
+        } else {
+            Err(Error::DatabaseError(rusqlite::Error::InvalidQuery))
+        }
+    }
+
     fn create_day_dir_if_needed(timelapse_root_path: &PathBuf) -> Result<PathBuf, Error> {
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
         let day_dir = timelapse_root_path.join(&today);

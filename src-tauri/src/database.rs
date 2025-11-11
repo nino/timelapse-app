@@ -124,6 +124,25 @@ impl ScreenshotDatabase {
         )?;
         Ok(())
     }
+
+    /// Get screenshot metadata by frame number
+    pub fn get_screenshot_by_frame(&self, frame_number: u32) -> Result<Option<(String, String)>> {
+        let result = self.conn.query_row(
+            "SELECT created_at, local_time FROM screenshots WHERE frame_number = ?1",
+            [frame_number],
+            |row| {
+                let created_at: String = row.get(0)?;
+                let local_time: String = row.get(1)?;
+                Ok((created_at, local_time))
+            },
+        );
+
+        match result {
+            Ok(data) => Ok(Some(data)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
 }
 
 #[cfg(test)]

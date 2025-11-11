@@ -28,6 +28,9 @@ export function App(): React.ReactNode {
   const { files: videoFiles } = useFiles(
     videoCacheFolder ? `.cache/${videoCacheFolder}` : null,
   );
+  const [currentTimestamp, setCurrentTimestamp] = React.useState<string | null>(
+    null,
+  );
 
   // Get current date folder name (YYYY-MM-DD format)
   const currentDateFolder = React.useMemo(() => {
@@ -234,15 +237,66 @@ export function App(): React.ReactNode {
     }
   }, [refreshFolders, refreshVideos, selectedFolder, selectedVideo, viewMode]);
 
-  const formatTime = React.useCallback((index: number) => {
-    // Assume screenshots are taken every few seconds, estimate time
-    const totalMinutes = Math.floor((index * 1) / 60); // Assuming 1 second between screenshots
-    const hours = Math.floor(totalMinutes / 60);
-    const minutes = totalMinutes % 60;
-    return `${hours.toString().padStart(2, "0")}:${minutes
-      .toString()
-      .padStart(2, "0")}`;
-  }, []);
+  // Fetch timestamp for current frame from database
+  React.useEffect(() => {
+    async function fetchTimestamp(): Promise<void> {
+      if (viewMode !== "images" || files.length === 0) {
+        setCurrentTimestamp(null);
+        return;
+      }
+
+      try {
+        // Extract frame number from filename (e.g., "00001.png" -> 1)
+        const filename = files[currentImageIndex];
+        const frameNumber = parseInt(filename.replace(".png", ""), 10);
+
+        const metadata = await invoke<[string, string] | null>(
+          "get_screenshot_metadata",
+          {
+            frameNumber,
+          },
+        );
+
+        if (metadata && metadata[1]) {
+          setCurrentTimestamp(metadata[1]); // Use local_time
+        } else {
+          setCurrentTimestamp(null);
+        }
+      } catch (error) {
+        console.error("Error fetching timestamp:", error);
+        setCurrentTimestamp(null);
+      }
+    }
+
+    fetchTimestamp();
+  }, [currentImageIndex, files, viewMode]);
+
+  const formatTime = React.useCallback(
+    (index: number) => {
+      // If we have a real timestamp from the database, use it
+      if (currentTimestamp) {
+        try {
+          const date = new Date(currentTimestamp);
+          const hours = date.getHours();
+          const minutes = date.getMinutes();
+          return `${hours.toString().padStart(2, "0")}:${minutes
+            .toString()
+            .padStart(2, "0")}`;
+        } catch (e) {
+          console.error("Error parsing timestamp:", e);
+        }
+      }
+
+      // Fall back to estimate if no timestamp available
+      const totalMinutes = Math.floor((index * 1) / 60); // Assuming 1 second between screenshots
+      const hours = Math.floor(totalMinutes / 60);
+      const minutes = totalMinutes % 60;
+      return `${hours.toString().padStart(2, "0")}:${minutes
+        .toString()
+        .padStart(2, "0")}`;
+    },
+    [currentTimestamp],
+  );
 
   if (foldersError) {
     return (
@@ -332,7 +386,8 @@ export function App(): React.ReactNode {
                     Frame {currentImageIndex + 1} / {files.length}
                   </span>
                   <span className="text-gray-600 text-sm tabular-nums">
-                    ~{formatTime(currentImageIndex)}
+                    {currentTimestamp ? "" : "~"}
+                    {formatTime(currentImageIndex)}
                   </span>
                 </>
               )}
