@@ -1,4 +1,5 @@
 mod timelapse;
+mod database;
 
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -127,6 +128,22 @@ async fn extract_video_frames(video_filename: String) -> Result<String, String> 
 }
 
 #[tauri::command]
+async fn get_screenshot_metadata(
+    state: State<'_, PhotographerState>,
+    frame_number: u32,
+) -> Result<Option<(String, String)>, String> {
+    let photographer_guard = state.lock().map_err(|e| e.to_string())?;
+
+    if let Some(photographer) = &*photographer_guard {
+        photographer
+            .get_screenshot_metadata(frame_number)
+            .map_err(|e| e.to_string())
+    } else {
+        Err("Timelapse is not running".to_string())
+    }
+}
+
+#[tauri::command]
 async fn evict_old_cache() -> Result<String, String> {
     let home_dir = dirs::home_dir().ok_or("Unable to find home directory")?;
     let cache_dir = home_dir.join("Timelapse").join(".cache");
@@ -217,7 +234,8 @@ pub fn run() {
             get_error_logs,
             clear_error_logs,
             extract_video_frames,
-            evict_old_cache
+            evict_old_cache,
+            get_screenshot_metadata
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -1,5 +1,5 @@
 use active_win_pos_rs::get_active_window;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Utc, Local};
 use magick_rust::{magick_wand_genesis, MagickWand};
 use screenshots::Screen;
 use serde::{Deserialize, Serialize};
@@ -11,6 +11,7 @@ use std::{
 };
 use thiserror::Error;
 use tokio::time::{sleep, Duration};
+use crate::database::ScreenshotDatabase;
 
 // Ensure MagickWand is initialized only once
 static MAGICK_WAND_GENESIS: Once = Once::new();
@@ -44,6 +45,9 @@ pub enum Error {
     #[error("Unable to check if image is black: {reason}")]
     UnableToCheckIfImageIsBlack { reason: String },
 
+    #[error("Database error: {0}")]
+    DatabaseError(#[from] rusqlite::Error),
+
     #[error("IO Error")]
     IoError(#[from] std::io::Error),
 }
@@ -52,6 +56,7 @@ pub struct Photographer {
     timelapse_root_path: PathBuf,
     running: Arc<AtomicBool>,
     error_logs: Arc<Mutex<Vec<ErrorLogEntry>>>,
+    db: Arc<Mutex<ScreenshotDatabase>>,
 }
 
 impl Photographer {
@@ -59,12 +64,22 @@ impl Photographer {
         // Initialize MagickWand
         init_magick_wand();
 
+        let timelapse_root_path = dirs::home_dir()
+            .ok_or(Error::UnableToFindHomeDir)?
+            .join("Timelapse");
+
+        // Create the Timelapse directory if it doesn't exist
+        std::fs::create_dir_all(&timelapse_root_path)?;
+
+        // Initialize the database
+        let db_path = timelapse_root_path.join("screenshots.db");
+        let db = ScreenshotDatabase::new(db_path)?;
+
         Ok(Photographer {
-            timelapse_root_path: dirs::home_dir()
-                .ok_or(Error::UnableToFindHomeDir)?
-                .join("Timelapse"),
+            timelapse_root_path,
             running: Arc::new(AtomicBool::new(false)),
             error_logs: Arc::new(Mutex::new(Vec::new())),
+            db: Arc::new(Mutex::new(db)),
         })
     }
 
@@ -75,12 +90,13 @@ impl Photographer {
         let timelapse_root_path = self.timelapse_root_path.clone();
         let running_clone = Arc::clone(&running);
         let error_logs_clone = Arc::clone(&self.error_logs);
+        let db_clone = Arc::clone(&self.db);
 
         tokio::spawn(async move {
             println!("Starting timelapse background task...");
 
             while running_clone.load(Ordering::SeqCst) {
-                match Self::do_screenshot(&timelapse_root_path).await {
+                match Self::do_screenshot(&timelapse_root_path, &db_clone).await {
                     Ok(is_black) => {
                         if is_black {
                             // Image was all black and deleted, wait 10 seconds
@@ -134,6 +150,14 @@ impl Photographer {
         }
     }
 
+    pub fn get_screenshot_metadata(&self, frame_number: u32) -> Result<Option<(String, String)>, Error> {
+        if let Ok(db_guard) = self.db.lock() {
+            Ok(db_guard.get_screenshot_by_frame(frame_number)?)
+        } else {
+            Err(Error::DatabaseError(rusqlite::Error::InvalidQuery))
+        }
+    }
+
     fn create_day_dir_if_needed(timelapse_root_path: &PathBuf) -> Result<PathBuf, Error> {
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
         let day_dir = timelapse_root_path.join(&today);
@@ -141,11 +165,15 @@ impl Photographer {
         Ok(day_dir)
     }
 
-    async fn do_screenshot(timelapse_root_path: &PathBuf) -> Result<bool, Error> {
+    async fn do_screenshot(
+        timelapse_root_path: &PathBuf,
+        db: &Arc<Mutex<ScreenshotDatabase>>,
+    ) -> Result<bool, Error> {
         let day_dir = Self::create_day_dir_if_needed(timelapse_root_path)?;
+        let filename = next_filename(&day_dir)?;
         let screenshot_path = String::from(
             day_dir
-                .join(next_filename(&day_dir)?)
+                .join(&filename)
                 .to_str()
                 .ok_or(Error::UnableToConvertScreenshotPathToString)?,
         );
@@ -159,6 +187,19 @@ impl Photographer {
             std::fs::remove_file(&screenshot_path)?;
             Ok(true) // Return true to indicate image was black and deleted
         } else {
+            // Extract frame number from filename (e.g., "00001.png" -> 1)
+            let frame_number: u32 = filename
+                .replace(".png", "")
+                .parse()
+                .unwrap_or(0);
+
+            // Insert metadata into database with both UTC and local timestamps
+            let created_at = Utc::now();
+            let local_time = Local::now();
+            if let Ok(db_guard) = db.lock() {
+                db_guard.insert_screenshot(frame_number, created_at, local_time)?;
+            }
+
             Ok(false) // Return false for normal screenshots
         }
     }
