@@ -73,7 +73,7 @@ async fn clear_error_logs(state: State<'_, PhotographerState>) -> Result<String,
 }
 
 #[tauri::command]
-async fn transcode_video(video_filename: String) -> Result<Vec<u8>, String> {
+async fn extract_video_frames(video_filename: String) -> Result<String, String> {
     let home_dir = dirs::home_dir().ok_or("Unable to find home directory")?;
     let source_path = home_dir.join("Timelapse").join(&video_filename);
 
@@ -81,39 +81,39 @@ async fn transcode_video(video_filename: String) -> Result<Vec<u8>, String> {
     let cache_dir = home_dir.join("Timelapse").join(".cache");
     std::fs::create_dir_all(&cache_dir).map_err(|e| format!("Failed to create cache directory: {}", e))?;
 
-    // Generate cache filename (replace .mov with .mp4)
-    let cache_filename = video_filename.replace(".mov", ".mp4");
-    let cache_path = cache_dir.join(&cache_filename);
+    // Generate cache folder name (remove .mov extension)
+    let cache_folder_name = video_filename.trim_end_matches(".mov");
+    let cache_folder_path = cache_dir.join(cache_folder_name);
 
-    // Check if transcoded version already exists
-    if cache_path.exists() {
-        println!("Using cached transcoded video: {:?}", cache_path);
-        let video_data = std::fs::read(&cache_path)
-            .map_err(|e| format!("Failed to read cached video: {}", e))?;
-        return Ok(video_data);
+    // Check if frame sequence already exists
+    if cache_folder_path.exists() && cache_folder_path.is_dir() {
+        let entries = std::fs::read_dir(&cache_folder_path)
+            .map_err(|e| format!("Failed to read cache directory: {}", e))?;
+        let has_frames = entries.count() > 0;
+        if has_frames {
+            println!("Using cached frame sequence: {:?}", cache_folder_path);
+            return Ok(cache_folder_name.to_string());
+        }
     }
 
-    println!("Transcoding video: {:?} -> {:?}", source_path, cache_path);
+    // Create the cache folder for this video
+    std::fs::create_dir_all(&cache_folder_path)
+        .map_err(|e| format!("Failed to create cache folder: {}", e))?;
 
-    // Run ffmpeg to transcode the video
-    // Using H.264 codec with reasonable quality settings for browser compatibility
+    println!("Extracting frames from video: {:?} -> {:?}", source_path, cache_folder_path);
+
+    // Run ffmpeg to extract frames as JPEG images
+    // frame%06d.jpg creates frame000001.jpg, frame000002.jpg, etc.
+    let output_pattern = cache_folder_path.join("frame%06d.jpg");
     let output = Command::new("ffmpeg")
         .arg("-i")
         .arg(&source_path)
-        .arg("-c:v")
-        .arg("libx264")
-        .arg("-preset")
-        .arg("medium")
-        .arg("-crf")
-        .arg("23")
-        .arg("-c:a")
-        .arg("aac")
-        .arg("-b:a")
-        .arg("128k")
-        .arg("-movflags")
-        .arg("+faststart")
+        .arg("-vf")
+        .arg("fps=30") // Extract at 30 fps (adjust as needed)
+        .arg("-q:v")
+        .arg("2") // High quality JPEG (1-31, lower is better)
         .arg("-y")
-        .arg(&cache_path)
+        .arg(&output_pattern)
         .output()
         .map_err(|e| format!("Failed to execute ffmpeg: {}. Make sure ffmpeg is installed and in PATH.", e))?;
 
@@ -122,13 +122,55 @@ async fn transcode_video(video_filename: String) -> Result<Vec<u8>, String> {
         return Err(format!("ffmpeg failed: {}", stderr));
     }
 
-    println!("Transcoding complete: {:?}", cache_path);
+    println!("Frame extraction complete: {:?}", cache_folder_path);
 
-    // Read the transcoded video file and return as bytes
-    let video_data = std::fs::read(&cache_path)
-        .map_err(|e| format!("Failed to read transcoded video: {}", e))?;
+    Ok(cache_folder_name.to_string())
+}
 
-    Ok(video_data)
+#[tauri::command]
+async fn evict_old_cache() -> Result<String, String> {
+    let home_dir = dirs::home_dir().ok_or("Unable to find home directory")?;
+    let cache_dir = home_dir.join("Timelapse").join(".cache");
+
+    if !cache_dir.exists() {
+        return Ok("Cache directory does not exist".to_string());
+    }
+
+    let now = std::time::SystemTime::now();
+    let fifteen_days = std::time::Duration::from_secs(15 * 24 * 60 * 60);
+
+    let entries = std::fs::read_dir(&cache_dir)
+        .map_err(|e| format!("Failed to read cache directory: {}", e))?;
+
+    let mut removed_count = 0;
+
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("Failed to read entry: {}", e))?;
+        let path = entry.path();
+
+        if !path.is_dir() {
+            continue;
+        }
+
+        // Get the modification time of the directory
+        let metadata = std::fs::metadata(&path)
+            .map_err(|e| format!("Failed to get metadata for {:?}: {}", path, e))?;
+
+        let modified = metadata.modified()
+            .map_err(|e| format!("Failed to get modified time for {:?}: {}", path, e))?;
+
+        // Check if older than 15 days
+        if let Ok(age) = now.duration_since(modified) {
+            if age > fifteen_days {
+                println!("Removing old cache folder: {:?} (age: {} days)", path, age.as_secs() / 86400);
+                std::fs::remove_dir_all(&path)
+                    .map_err(|e| format!("Failed to remove directory {:?}: {}", path, e))?;
+                removed_count += 1;
+            }
+        }
+    }
+
+    Ok(format!("Removed {} old cache folders", removed_count))
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -146,6 +188,12 @@ pub fn run() {
 
             tauri::async_runtime::spawn(async move {
                 tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+
+                // Evict old cache entries on startup
+                match evict_old_cache().await {
+                    Ok(msg) => println!("Cache eviction: {}", msg),
+                    Err(e) => eprintln!("Failed to evict old cache: {}", e),
+                }
 
                 match Photographer::new() {
                     Ok(photographer) => {
@@ -169,7 +217,8 @@ pub fn run() {
             is_timelapse_running,
             get_error_logs,
             clear_error_logs,
-            transcode_video
+            extract_video_frames,
+            evict_old_cache
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
