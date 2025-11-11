@@ -1,5 +1,5 @@
 use active_win_pos_rs::get_active_window;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Utc, Local};
 use magick_rust::{magick_wand_genesis, MagickWand};
 use screenshots::Screen;
 use serde::{Deserialize, Serialize};
@@ -185,10 +185,11 @@ impl Photographer {
                 .parse()
                 .unwrap_or(0);
 
-            // Insert metadata into database
-            let creation_date = Utc::now();
+            // Insert metadata into database with both UTC and local timestamps
+            let created_at = Utc::now();
+            let local_time = Local::now();
             if let Ok(db_guard) = db.lock() {
-                db_guard.insert_screenshot(frame_number, creation_date)?;
+                db_guard.insert_screenshot(frame_number, created_at, local_time)?;
             }
 
             Ok(false) // Return false for normal screenshots

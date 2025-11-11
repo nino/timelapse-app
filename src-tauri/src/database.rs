@@ -1,6 +1,6 @@
 use rusqlite::{Connection, Result};
 use std::path::PathBuf;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Utc, Local};
 
 pub struct ScreenshotDatabase {
     conn: Connection,
@@ -16,7 +16,8 @@ impl ScreenshotDatabase {
             "CREATE TABLE IF NOT EXISTS screenshots (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 frame_number INTEGER NOT NULL,
-                creation_date TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                local_time TEXT NOT NULL
             )",
             [],
         )?;
@@ -25,10 +26,19 @@ impl ScreenshotDatabase {
     }
 
     /// Insert a new screenshot record
-    pub fn insert_screenshot(&self, frame_number: u32, creation_date: DateTime<Utc>) -> Result<()> {
+    pub fn insert_screenshot(
+        &self,
+        frame_number: u32,
+        created_at: DateTime<Utc>,
+        local_time: DateTime<Local>,
+    ) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO screenshots (frame_number, creation_date) VALUES (?1, ?2)",
-            rusqlite::params![frame_number, creation_date.to_rfc3339()],
+            "INSERT INTO screenshots (frame_number, created_at, local_time) VALUES (?1, ?2, ?3)",
+            rusqlite::params![
+                frame_number,
+                created_at.to_rfc3339(),
+                local_time.to_rfc3339()
+            ],
         )?;
         Ok(())
     }
@@ -60,8 +70,9 @@ mod tests {
 
         // Insert a screenshot record
         let frame_number = 1;
-        let creation_date = Utc::now();
-        let result = db.insert_screenshot(frame_number, creation_date);
+        let created_at = Utc::now();
+        let local_time = Local::now();
+        let result = db.insert_screenshot(frame_number, created_at, local_time);
         assert!(result.is_ok());
 
         // Verify the record was inserted
@@ -80,7 +91,7 @@ mod tests {
 
         // Insert multiple screenshot records
         for i in 1..=5 {
-            let result = db.insert_screenshot(i, Utc::now());
+            let result = db.insert_screenshot(i, Utc::now(), Local::now());
             assert!(result.is_ok());
         }
 
