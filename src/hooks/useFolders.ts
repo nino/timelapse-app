@@ -25,6 +25,7 @@ export function useFolders(): {
       });
       const folderList = entries
         .filter((entry) => entry.isDirectory)
+        .filter((entry) => !entry.name.startsWith(".")) // Exclude hidden folders like .cache
         .map((entry) => entry.name);
       setFolders(folderList);
     } catch (error) {
