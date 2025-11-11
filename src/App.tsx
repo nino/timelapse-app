@@ -83,6 +83,7 @@ export function App(): React.ReactNode {
 
       try {
         setIsExtractingFrames(true);
+        setVideoCacheFolder(null); // Clear old frames immediately
         console.log("Extracting frames from video:", selectedVideo);
 
         // Call Tauri command to extract frames (uses cache if available)
