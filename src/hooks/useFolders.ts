@@ -53,14 +53,50 @@ export function useFiles(folder: string | null): {
         setFiles([]);
         return;
       }
-      const entries = await readDir(`Timelapse/${folder}`, {
-        baseDir: BaseDirectory.Home,
-      });
-      const fileList = (entries)
-        .filter((entry) => entry.isFile)
-        .map((entry) => entry.name)
-        .sort();
-      setFiles(fileList);
+
+      // Retry logic for video cache folders that might be still being created
+      const maxRetries = 5;
+      const retryDelay = 500; // ms
+      let lastError: Error | null = null;
+
+      for (let attempt = 0; attempt < maxRetries; attempt++) {
+        try {
+          const entries = await readDir(`Timelapse/${folder}`, {
+            baseDir: BaseDirectory.Home,
+          });
+          const fileList = (entries)
+            .filter((entry) => entry.isFile)
+            .map((entry) => entry.name)
+            .sort();
+
+          // If we got files, or if this is not a cache folder, accept the result
+          if (fileList.length > 0 || !folder.startsWith(".cache/")) {
+            setFiles(fileList);
+            return;
+          }
+
+          // For cache folders, if no files found, retry after delay
+          if (attempt < maxRetries - 1) {
+            console.log(`No files found in ${folder}, retrying in ${retryDelay}ms (attempt ${attempt + 1}/${maxRetries})...`);
+            await new Promise(resolve => setTimeout(resolve, retryDelay));
+          }
+        } catch (error) {
+          lastError = ensureError(error);
+          // If directory doesn't exist yet, wait and retry
+          if (attempt < maxRetries - 1) {
+            console.log(`Error reading ${folder}, retrying in ${retryDelay}ms (attempt ${attempt + 1}/${maxRetries})...`, error);
+            await new Promise(resolve => setTimeout(resolve, retryDelay));
+          }
+        }
+      }
+
+      // If we got here, all retries failed
+      if (lastError) {
+        throw lastError;
+      } else {
+        // No error, but no files found after all retries
+        setFiles([]);
+      }
     } catch (error) {
       setFilesError(ensureError(error));
     }
