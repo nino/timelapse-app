@@ -53,9 +53,9 @@ signals:
 private:
    void loadFolders();
 
-   QString m_basePath;
-   QStringList m_folders;
-   QFileSystemWatcher* m_watcher{nullptr};
+   QString _basePath;
+   QStringList _folders;
+   QFileSystemWatcher* _watcher{nullptr};
 };
 
 }  // namespace timelapse

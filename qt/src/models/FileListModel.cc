@@ -7,8 +7,8 @@ namespace timelapse {
 
 FileListModel::FileListModel(QObject* parent)
    : QAbstractListModel(parent)
-   , m_watcher(new QFileSystemWatcher(this)) {
-   connect(m_watcher, &QFileSystemWatcher::directoryChanged,
+   , _watcher(new QFileSystemWatcher(this)) {
+   connect(this->_watcher, &QFileSystemWatcher::directoryChanged,
            this, &FileListModel::refresh);
 }
 
@@ -16,24 +16,24 @@ auto FileListModel::rowCount(QModelIndex const& parent) const -> int {
    if (parent.isValid()) {
       return 0;
    }
-   return static_cast<int>(m_files.size());
+   return static_cast<int>(this->_files.size());
 }
 
 auto FileListModel::data(QModelIndex const& index, int role) const -> QVariant {
-   if (!index.isValid() || index.row() >= m_files.size()) {
+   if (!index.isValid() || index.row() >= this->_files.size()) {
       return {};
    }
 
-   QString const& file = m_files.at(index.row());
+   QString const& file = this->_files.at(index.row());
 
    switch (role) {
    case Qt::DisplayRole:
    case NameRole:
       return file;
    case PathRole:
-      return m_folderPath + "/" + file;
+      return this->_folderPath + "/" + file;
    case FrameNumberRole:
-      return extractFrameNumber(file);
+      return this->extractFrameNumber(file);
    default:
       return {};
    }
@@ -48,84 +48,84 @@ auto FileListModel::roleNames() const -> QHash<int, QByteArray> {
 }
 
 auto FileListModel::folderPath() const -> QString {
-   return m_folderPath;
+   return this->_folderPath;
 }
 
 void FileListModel::setFolderPath(QString const& path) {
-   if (m_folderPath == path) {
+   if (this->_folderPath == path) {
       return;
    }
 
    // Remove old path from watcher
-   if (!m_folderPath.isEmpty()) {
-      m_watcher->removePath(m_folderPath);
+   if (!this->_folderPath.isEmpty()) {
+      this->_watcher->removePath(this->_folderPath);
    }
 
-   m_folderPath = path;
+   this->_folderPath = path;
 
    // Add new path to watcher
-   if (!m_folderPath.isEmpty() && QDir(m_folderPath).exists()) {
-      m_watcher->addPath(m_folderPath);
+   if (!this->_folderPath.isEmpty() && QDir(this->_folderPath).exists()) {
+      this->_watcher->addPath(this->_folderPath);
    }
 
    emit folderPathChanged();
-   loadFiles();
+   this->loadFiles();
 }
 
 auto FileListModel::fileFilter() const -> QString {
-   return m_fileFilter;
+   return this->_fileFilter;
 }
 
 void FileListModel::setFileFilter(QString const& filter) {
-   if (m_fileFilter == filter) {
+   if (this->_fileFilter == filter) {
       return;
    }
 
-   m_fileFilter = filter;
+   this->_fileFilter = filter;
    emit fileFilterChanged();
-   loadFiles();
+   this->loadFiles();
 }
 
 auto FileListModel::count() const -> int {
-   return static_cast<int>(m_files.size());
+   return static_cast<int>(this->_files.size());
 }
 
 auto FileListModel::fileAt(int index) const -> QString {
-   if (index < 0 || index >= m_files.size()) {
+   if (index < 0 || index >= this->_files.size()) {
       return {};
    }
-   return m_files.at(index);
+   return this->_files.at(index);
 }
 
 auto FileListModel::pathAt(int index) const -> QString {
-   if (index < 0 || index >= m_files.size()) {
+   if (index < 0 || index >= this->_files.size()) {
       return {};
    }
-   return m_folderPath + "/" + m_files.at(index);
+   return this->_folderPath + "/" + this->_files.at(index);
 }
 
 auto FileListModel::frameNumberAt(int index) const -> int32_t {
-   if (index < 0 || index >= m_files.size()) {
+   if (index < 0 || index >= this->_files.size()) {
       return 0;
    }
-   return extractFrameNumber(m_files.at(index));
+   return this->extractFrameNumber(this->_files.at(index));
 }
 
 void FileListModel::refresh() {
-   loadFiles();
+   this->loadFiles();
 }
 
 void FileListModel::loadFiles() {
    beginResetModel();
-   m_files.clear();
+   this->_files.clear();
 
-   if (m_folderPath.isEmpty()) {
+   if (this->_folderPath.isEmpty()) {
       endResetModel();
       emit countChanged();
       return;
    }
 
-   QDir dir(m_folderPath);
+   QDir dir(this->_folderPath);
    if (!dir.exists()) {
       endResetModel();
       emit countChanged();
@@ -133,9 +133,9 @@ void FileListModel::loadFiles() {
    }
 
    QStringList filters;
-   filters << m_fileFilter;
+   filters << this->_fileFilter;
 
-   m_files = dir.entryList(filters, QDir::Files, QDir::Name);
+   this->_files = dir.entryList(filters, QDir::Files, QDir::Name);
 
    endResetModel();
    emit countChanged();

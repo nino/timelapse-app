@@ -6,57 +6,57 @@ namespace timelapse {
 
 FrameScrubber::FrameScrubber(QWidget* parent)
    : QWidget(parent)
-   , m_slider(new QSlider(Qt::Horizontal, this)) {
+   , _slider(new QSlider(Qt::Horizontal, this)) {
    auto* layout = new QHBoxLayout(this);
    layout->setContentsMargins(0, 0, 0, 0);
-   layout->addWidget(m_slider);
+   layout->addWidget(this->_slider);
 
-   m_slider->setMinimum(0);
-   m_slider->setMaximum(0);
-   m_slider->setValue(0);
+   this->_slider->setMinimum(0);
+   this->_slider->setMaximum(0);
+   this->_slider->setValue(0);
 
-   connect(m_slider, &QSlider::valueChanged, this, &FrameScrubber::valueChanged);
-   connect(m_slider, &QSlider::sliderPressed, this, &FrameScrubber::sliderPressed);
-   connect(m_slider, &QSlider::sliderReleased, this, &FrameScrubber::sliderReleased);
+   connect(this->_slider, &QSlider::valueChanged, this, &FrameScrubber::valueChanged);
+   connect(this->_slider, &QSlider::sliderPressed, this, &FrameScrubber::sliderPressed);
+   connect(this->_slider, &QSlider::sliderReleased, this, &FrameScrubber::sliderReleased);
 
-   setupStylesheet();
+   this->setupStylesheet();
 }
 
 auto FrameScrubber::value() const -> int {
-   return m_slider->value();
+   return this->_slider->value();
 }
 
 auto FrameScrubber::minimum() const -> int {
-   return m_slider->minimum();
+   return this->_slider->minimum();
 }
 
 auto FrameScrubber::maximum() const -> int {
-   return m_slider->maximum();
+   return this->_slider->maximum();
 }
 
 void FrameScrubber::setValue(int value) {
-   m_slider->setValue(value);
+   this->_slider->setValue(value);
 }
 
 void FrameScrubber::setMinimum(int min) {
-   m_slider->setMinimum(min);
+   this->_slider->setMinimum(min);
 }
 
 void FrameScrubber::setMaximum(int max) {
-   m_slider->setMaximum(max);
+   this->_slider->setMaximum(max);
 }
 
 void FrameScrubber::setRange(int min, int max) {
-   m_slider->setRange(min, max);
+   this->_slider->setRange(min, max);
 }
 
 void FrameScrubber::setEnabled(bool enabled) {
-   m_slider->setEnabled(enabled);
+   this->_slider->setEnabled(enabled);
    QWidget::setEnabled(enabled);
 }
 
 void FrameScrubber::setupStylesheet() {
-   m_slider->setStyleSheet(R"(
+   this->_slider->setStyleSheet(R"(
       QSlider::groove:horizontal {
          border: 1px solid #4b5563;
          height: 8px;

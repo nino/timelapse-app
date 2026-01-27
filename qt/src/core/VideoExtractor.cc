@@ -14,17 +14,17 @@ VideoExtractor::VideoExtractor(QObject* parent)
    : QObject(parent) {}
 
 VideoExtractor::~VideoExtractor() {
-   cancelExtraction();
+   this->cancelExtraction();
 }
 
 auto VideoExtractor::extractFrames(QString const& videoPath, int32_t fps)
    -> std::expected<QString, QString> {
-   if (m_extracting) {
+   if (this->_extracting) {
       return std::unexpected("Extraction already in progress");
    }
 
    // Find ffmpeg
-   auto ffmpegPath = findFfmpeg();
+   auto ffmpegPath = this->findFfmpeg();
    if (!ffmpegPath) {
       return std::unexpected(ffmpegPath.error());
    }
@@ -34,12 +34,12 @@ auto VideoExtractor::extractFrames(QString const& videoPath, int32_t fps)
    QString videoFilename = videoInfo.fileName();
 
    // Check if already cached
-   if (hasCachedFrames(videoFilename)) {
-      return generateCacheFolderName(videoFilename);
+   if (this->hasCachedFrames(videoFilename)) {
+      return this->generateCacheFolderName(videoFilename);
    }
 
    // Create cache folder
-   QString cacheFolderName = generateCacheFolderName(videoFilename);
+   QString cacheFolderName = this->generateCacheFolderName(videoFilename);
    QString cacheFolderPath = PathUtils::cacheDir() + "/" + cacheFolderName;
 
    if (!PathUtils::ensureDir(cacheFolderPath)) {
@@ -55,35 +55,35 @@ auto VideoExtractor::extractFrames(QString const& videoPath, int32_t fps)
         << outputPattern;
 
    // Start ffmpeg process
-   m_ffmpegProcess = new QProcess(this);
-   m_extracting = true;
+   this->_ffmpegProcess = new QProcess(this);
+   this->_extracting = true;
 
    emit extractionStarted(videoPath);
 
-   m_ffmpegProcess->start(*ffmpegPath, args);
+   this->_ffmpegProcess->start(*ffmpegPath, args);
 
-   if (!m_ffmpegProcess->waitForStarted(5000)) {
-      m_extracting = false;
-      QString error = m_ffmpegProcess->errorString();
-      delete m_ffmpegProcess;
-      m_ffmpegProcess = nullptr;
+   if (!this->_ffmpegProcess->waitForStarted(5000)) {
+      this->_extracting = false;
+      QString error = this->_ffmpegProcess->errorString();
+      delete this->_ffmpegProcess;
+      this->_ffmpegProcess = nullptr;
       return std::unexpected("Failed to start ffmpeg: " + error);
    }
 
    // Wait for completion (blocking for simplicity)
    // In a real app, you'd use signals for async handling
-   if (!m_ffmpegProcess->waitForFinished(-1)) {  // No timeout
-      m_extracting = false;
-      QString error = m_ffmpegProcess->errorString();
-      delete m_ffmpegProcess;
-      m_ffmpegProcess = nullptr;
+   if (!this->_ffmpegProcess->waitForFinished(-1)) {  // No timeout
+      this->_extracting = false;
+      QString error = this->_ffmpegProcess->errorString();
+      delete this->_ffmpegProcess;
+      this->_ffmpegProcess = nullptr;
       return std::unexpected("ffmpeg failed: " + error);
    }
 
-   int exitCode = m_ffmpegProcess->exitCode();
-   m_extracting = false;
-   delete m_ffmpegProcess;
-   m_ffmpegProcess = nullptr;
+   int exitCode = this->_ffmpegProcess->exitCode();
+   this->_extracting = false;
+   delete this->_ffmpegProcess;
+   this->_ffmpegProcess = nullptr;
 
    if (exitCode != 0) {
       return std::unexpected("ffmpeg exited with code: " + QString::number(exitCode));
@@ -94,7 +94,7 @@ auto VideoExtractor::extractFrames(QString const& videoPath, int32_t fps)
 }
 
 auto VideoExtractor::hasCachedFrames(QString const& videoFilename) const -> bool {
-   QString cacheFolderPath = getCacheFolderPath(videoFilename);
+   QString cacheFolderPath = this->getCacheFolderPath(videoFilename);
    QDir cacheDir(cacheFolderPath);
 
    if (!cacheDir.exists()) {
@@ -108,19 +108,19 @@ auto VideoExtractor::hasCachedFrames(QString const& videoFilename) const -> bool
 }
 
 auto VideoExtractor::getCacheFolderPath(QString const& videoFilename) const -> QString {
-   return PathUtils::cacheDir() + "/" + generateCacheFolderName(videoFilename);
+   return PathUtils::cacheDir() + "/" + this->generateCacheFolderName(videoFilename);
 }
 
 auto VideoExtractor::isExtracting() const -> bool {
-   return m_extracting;
+   return this->_extracting;
 }
 
 void VideoExtractor::cancelExtraction() {
-   if (m_ffmpegProcess && m_ffmpegProcess->state() != QProcess::NotRunning) {
-      m_ffmpegProcess->kill();
-      m_ffmpegProcess->waitForFinished(3000);
+   if (this->_ffmpegProcess && this->_ffmpegProcess->state() != QProcess::NotRunning) {
+      this->_ffmpegProcess->kill();
+      this->_ffmpegProcess->waitForFinished(3000);
    }
-   m_extracting = false;
+   this->_extracting = false;
 }
 
 auto VideoExtractor::findFfmpeg() const -> std::expected<QString, QString> {

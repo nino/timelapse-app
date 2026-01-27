@@ -47,15 +47,15 @@ private:
    void scheduleNextCapture(std::chrono::milliseconds delay);
    void logError(QString const& error);
 
-   std::unique_ptr<ScreenCapture> m_screenCapture;
-   std::unique_ptr<ImageProcessor> m_imageProcessor;
-   std::unique_ptr<Database> m_database;
-   std::unique_ptr<ErrorLog> m_errorLog;
+   std::unique_ptr<ScreenCapture> _screenCapture;
+   std::unique_ptr<ImageProcessor> _imageProcessor;
+   std::unique_ptr<Database> _database;
+   std::unique_ptr<ErrorLog> _errorLog;
 
-   QTimer* m_captureTimer{nullptr};
-   QString m_currentDayDir;
-   QString m_currentDate;
-   std::atomic<bool> m_running{false};
+   QTimer* _captureTimer{nullptr};
+   QString _currentDayDir;
+   QString _currentDate;
+   std::atomic<bool> _running{false};
 };
 
 }  // namespace timelapse

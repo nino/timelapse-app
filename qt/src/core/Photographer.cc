@@ -11,110 +11,110 @@ namespace timelapse {
 
 Photographer::Photographer(QObject* parent)
    : QObject(parent)
-   , m_screenCapture(ScreenCapture::create(this))
-   , m_imageProcessor(std::make_unique<ImageProcessor>(this))
-   , m_errorLog(std::make_unique<ErrorLog>(this)) {
+   , _screenCapture(ScreenCapture::create(this))
+   , _imageProcessor(std::make_unique<ImageProcessor>(this))
+   , _errorLog(std::make_unique<ErrorLog>(this)) {
    // Ensure directories exist
    PathUtils::ensureDir(PathUtils::timelapseDir());
    PathUtils::ensureDir(PathUtils::cacheDir());
 
    // Initialize database
-   m_database = std::make_unique<Database>(PathUtils::databasePath(), this);
+   this->_database = std::make_unique<Database>(PathUtils::databasePath(), this);
 
    // Setup timer
-   m_captureTimer = new QTimer(this);
-   m_captureTimer->setSingleShot(true);
-   connect(m_captureTimer, &QTimer::timeout, this, &Photographer::captureScreenshot);
+   this->_captureTimer = new QTimer(this);
+   this->_captureTimer->setSingleShot(true);
+   connect(this->_captureTimer, &QTimer::timeout, this, &Photographer::captureScreenshot);
 }
 
 Photographer::~Photographer() {
-   stop();
+   this->stop();
 }
 
 auto Photographer::isRunning() const -> bool {
-   return m_running.load();
+   return this->_running.load();
 }
 
 auto Photographer::errorLog() const -> ErrorLog* {
-   return m_errorLog.get();
+   return this->_errorLog.get();
 }
 
 auto Photographer::database() const -> Database* {
-   return m_database.get();
+   return this->_database.get();
 }
 
 auto Photographer::getScreenshotMetadata(uint32_t frameNumber)
    -> std::expected<std::optional<ScreenshotMetadata>, QString> {
-   return m_database->getScreenshotByFrame(frameNumber);
+   return this->_database->getScreenshotByFrame(frameNumber);
 }
 
 void Photographer::start() {
-   if (m_running.exchange(true)) {
+   if (this->_running.exchange(true)) {
       return;  // Already running
    }
 
    emit runningChanged(true);
-   captureScreenshot();
+   this->captureScreenshot();
 }
 
 void Photographer::stop() {
-   if (!m_running.exchange(false)) {
+   if (!this->_running.exchange(false)) {
       return;  // Already stopped
    }
 
-   m_captureTimer->stop();
+   this->_captureTimer->stop();
    emit runningChanged(false);
 }
 
 void Photographer::captureScreenshot() {
-   if (!m_running.load()) {
+   if (!this->_running.load()) {
       return;
    }
 
    // Check if date changed (new day)
    QString today = PathUtils::currentDateString();
-   if (today != m_currentDate) {
-      m_currentDate = today;
-      m_currentDayDir.clear();  // Force recreation
+   if (today != this->_currentDate) {
+      this->_currentDate = today;
+      this->_currentDayDir.clear();  // Force recreation
    }
 
    // Ensure day directory exists
-   auto dayDir = ensureDayDirectory();
+   auto dayDir = this->ensureDayDirectory();
    if (!dayDir) {
-      logError(dayDir.error());
-      scheduleNextCapture(kErrorWait);
+      this->logError(dayDir.error());
+      this->scheduleNextCapture(kErrorWait);
       return;
    }
 
    // Capture screenshot
-   auto image = m_screenCapture->captureFocused();
+   auto image = this->_screenCapture->captureFocused();
    if (!image) {
-      logError("Capture failed: " + image.error());
-      scheduleNextCapture(kErrorWait);
+      this->logError("Capture failed: " + image.error());
+      this->scheduleNextCapture(kErrorWait);
       return;
    }
 
    // Process image (resize with letterbox)
-   auto processed = m_imageProcessor->resizeWithLetterbox(
+   auto processed = this->_imageProcessor->resizeWithLetterbox(
       *image, kTargetWidth, kTargetHeight);
    if (!processed) {
-      logError("Processing failed: " + processed.error());
-      scheduleNextCapture(kErrorWait);
+      this->logError("Processing failed: " + processed.error());
+      this->scheduleNextCapture(kErrorWait);
       return;
    }
 
    // Check for black screen
-   if (m_imageProcessor->isImageBlack(*processed, kBlackThreshold)) {
+   if (this->_imageProcessor->isImageBlack(*processed, kBlackThreshold)) {
       emit screenshotSkipped("Screen is black");
-      scheduleNextCapture(kBlackScreenWait);
+      this->scheduleNextCapture(kBlackScreenWait);
       return;
    }
 
    // Get next frame number
-   auto frameNumber = getNextFrameNumber(*dayDir);
+   auto frameNumber = this->getNextFrameNumber(*dayDir);
    if (!frameNumber) {
-      logError("Failed to get frame number: " + frameNumber.error());
-      scheduleNextCapture(kErrorWait);
+      this->logError("Failed to get frame number: " + frameNumber.error());
+      this->scheduleNextCapture(kErrorWait);
       return;
    }
 
@@ -123,38 +123,38 @@ void Photographer::captureScreenshot() {
    QString filepath = *dayDir + "/" + filename;
 
    // Save image
-   auto saveResult = m_imageProcessor->saveImage(*processed, filepath);
+   auto saveResult = this->_imageProcessor->saveImage(*processed, filepath);
    if (!saveResult) {
-      logError("Save failed: " + saveResult.error());
-      scheduleNextCapture(kErrorWait);
+      this->logError("Save failed: " + saveResult.error());
+      this->scheduleNextCapture(kErrorWait);
       return;
    }
 
    // Record in database
    QDateTime now = QDateTime::currentDateTimeUtc();
    QDateTime local = QDateTime::currentDateTime();
-   auto dbResult = m_database->insertScreenshot(*frameNumber, now, local);
+   auto dbResult = this->_database->insertScreenshot(*frameNumber, now, local);
    if (!dbResult) {
-      logError("Database insert failed: " + dbResult.error());
+      this->logError("Database insert failed: " + dbResult.error());
       // Continue anyway - screenshot was saved
    }
 
    emit screenshotCaptured(filepath, *frameNumber);
-   scheduleNextCapture(kScreenshotInterval);
+   this->scheduleNextCapture(kScreenshotInterval);
 }
 
 auto Photographer::ensureDayDirectory() -> std::expected<QString, QString> {
-   if (!m_currentDayDir.isEmpty()) {
-      return m_currentDayDir;
+   if (!this->_currentDayDir.isEmpty()) {
+      return this->_currentDayDir;
    }
 
-   QString dayDir = PathUtils::dayFolder(m_currentDate);
+   QString dayDir = PathUtils::dayFolder(this->_currentDate);
    if (!PathUtils::ensureDir(dayDir)) {
       return std::unexpected("Failed to create day directory: " + dayDir);
    }
 
-   m_currentDayDir = dayDir;
-   return m_currentDayDir;
+   this->_currentDayDir = dayDir;
+   return this->_currentDayDir;
 }
 
 auto Photographer::getNextFrameNumber(QString const& dayDir)
@@ -189,13 +189,13 @@ auto Photographer::getNextFrameNumber(QString const& dayDir)
 }
 
 void Photographer::scheduleNextCapture(std::chrono::milliseconds delay) {
-   if (m_running.load()) {
-      m_captureTimer->start(delay.count());
+   if (this->_running.load()) {
+      this->_captureTimer->start(delay.count());
    }
 }
 
 void Photographer::logError(QString const& error) {
-   m_errorLog->append(error);
+   this->_errorLog->append(error);
    emit errorOccurred(error);
 }
 

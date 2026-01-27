@@ -56,10 +56,10 @@ private:
    void loadFiles();
    [[nodiscard]] auto extractFrameNumber(QString const& filename) const -> int32_t;
 
-   QString m_folderPath;
-   QString m_fileFilter{"*.png"};
-   QStringList m_files;
-   QFileSystemWatcher* m_watcher{nullptr};
+   QString _folderPath;
+   QString _fileFilter{"*.png"};
+   QStringList _files;
+   QFileSystemWatcher* _watcher{nullptr};
 };
 
 }  // namespace timelapse

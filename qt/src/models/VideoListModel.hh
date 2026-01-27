@@ -50,9 +50,9 @@ signals:
 private:
    void loadVideos();
 
-   QString m_basePath;
-   QStringList m_videos;
-   QFileSystemWatcher* m_watcher{nullptr};
+   QString _basePath;
+   QStringList _videos;
+   QFileSystemWatcher* _watcher{nullptr};
 };
 
 }  // namespace timelapse

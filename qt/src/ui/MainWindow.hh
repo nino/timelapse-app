@@ -51,35 +51,35 @@ private:
    void selectInitialVideo();
 
    // Core components
-   std::unique_ptr<Photographer> m_photographer;
-   std::unique_ptr<VideoExtractor> m_videoExtractor;
-   std::unique_ptr<CacheManager> m_cacheManager;
+   std::unique_ptr<Photographer> _photographer;
+   std::unique_ptr<VideoExtractor> _videoExtractor;
+   std::unique_ptr<CacheManager> _cacheManager;
 
    // Models
-   std::unique_ptr<FolderListModel> m_folderModel;
-   std::unique_ptr<FileListModel> m_fileModel;
-   std::unique_ptr<VideoListModel> m_videoModel;
-   std::unique_ptr<FileListModel> m_videoFrameModel;
+   std::unique_ptr<FolderListModel> _folderModel;
+   std::unique_ptr<FileListModel> _fileModel;
+   std::unique_ptr<VideoListModel> _videoModel;
+   std::unique_ptr<FileListModel> _videoFrameModel;
 
    // UI widgets
-   QWidget* m_centralWidget{nullptr};
-   QPushButton* m_imagesButton{nullptr};
-   QPushButton* m_videosButton{nullptr};
-   QButtonGroup* m_modeButtonGroup{nullptr};
-   QComboBox* m_folderCombo{nullptr};
-   QComboBox* m_videoCombo{nullptr};
-   QLabel* m_frameCountLabel{nullptr};
-   QLabel* m_timestampLabel{nullptr};
-   QLabel* m_statusLabel{nullptr};
-   ImageViewer* m_imageViewer{nullptr};
-   FrameScrubber* m_scrubber{nullptr};
-   QPushButton* m_refreshButton{nullptr};
+   QWidget* _centralWidget{nullptr};
+   QPushButton* _imagesButton{nullptr};
+   QPushButton* _videosButton{nullptr};
+   QButtonGroup* _modeButtonGroup{nullptr};
+   QComboBox* _folderCombo{nullptr};
+   QComboBox* _videoCombo{nullptr};
+   QLabel* _frameCountLabel{nullptr};
+   QLabel* _timestampLabel{nullptr};
+   QLabel* _statusLabel{nullptr};
+   ImageViewer* _imageViewer{nullptr};
+   FrameScrubber* _scrubber{nullptr};
+   QPushButton* _refreshButton{nullptr};
 
    // State
-   ViewMode m_viewMode{ViewMode::Images};
-   int m_currentFrame{0};
-   QString m_currentVideoCacheFolder;
-   bool m_isExtractingFrames{false};
+   ViewMode _viewMode{ViewMode::Images};
+   int _currentFrame{0};
+   QString _currentVideoCacheFolder;
+   bool _isExtractingFrames{false};
 };
 
 }  // namespace timelapse

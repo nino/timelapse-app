@@ -43,8 +43,8 @@ private:
    [[nodiscard]] auto generateCacheFolderName(QString const& videoFilename) const
       -> QString;
 
-   QProcess* m_ffmpegProcess{nullptr};
-   bool m_extracting{false};
+   QProcess* _ffmpegProcess{nullptr};
+   bool _extracting{false};
 };
 
 }  // namespace timelapse

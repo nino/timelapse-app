@@ -10,55 +10,55 @@ ErrorLog::ErrorLog(QObject* parent)
    : QObject(parent) {}
 
 void ErrorLog::append(QString const& message) {
-   QMutexLocker locker(&m_mutex);
+   QMutexLocker locker(&this->_mutex);
 
-   m_entries.push_back(ErrorLogEntry{
+   this->_entries.push_back(ErrorLogEntry{
       .timestamp = QDateTime::currentDateTime(),
       .message = message,
    });
 
-   trimIfNeeded();
+   this->trimIfNeeded();
 
    locker.unlock();
    emit errorLogged(message);
 }
 
 auto ErrorLog::entries() const -> std::vector<ErrorLogEntry> {
-   QMutexLocker locker(&m_mutex);
-   return m_entries;
+   QMutexLocker locker(&this->_mutex);
+   return this->_entries;
 }
 
 auto ErrorLog::recentEntries(int32_t count) const -> std::vector<ErrorLogEntry> {
-   QMutexLocker locker(&m_mutex);
+   QMutexLocker locker(&this->_mutex);
 
-   if (count >= static_cast<int32_t>(m_entries.size())) {
-      return m_entries;
+   if (count >= static_cast<int32_t>(this->_entries.size())) {
+      return this->_entries;
    }
 
    return std::vector<ErrorLogEntry>(
-      m_entries.end() - count,
-      m_entries.end());
+      this->_entries.end() - count,
+      this->_entries.end());
 }
 
 void ErrorLog::clear() {
    {
-      QMutexLocker locker(&m_mutex);
-      m_entries.clear();
+      QMutexLocker locker(&this->_mutex);
+      this->_entries.clear();
    }
    emit cleared();
 }
 
 auto ErrorLog::count() const -> int32_t {
-   QMutexLocker locker(&m_mutex);
-   return static_cast<int32_t>(m_entries.size());
+   QMutexLocker locker(&this->_mutex);
+   return static_cast<int32_t>(this->_entries.size());
 }
 
 void ErrorLog::trimIfNeeded() {
    // Called with mutex already held
-   if (m_entries.size() > static_cast<size_t>(kMaxErrorLogs)) {
+   if (this->_entries.size() > static_cast<size_t>(kMaxErrorLogs)) {
       // Remove oldest entries
-      auto excess = m_entries.size() - kMaxErrorLogs;
-      m_entries.erase(m_entries.begin(), m_entries.begin() + excess);
+      auto excess = this->_entries.size() - kMaxErrorLogs;
+      this->_entries.erase(this->_entries.begin(), this->_entries.begin() + excess);
    }
 }
 

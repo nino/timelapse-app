@@ -7,8 +7,8 @@ namespace timelapse {
 
 VideoListModel::VideoListModel(QObject* parent)
    : QAbstractListModel(parent)
-   , m_watcher(new QFileSystemWatcher(this)) {
-   connect(m_watcher, &QFileSystemWatcher::directoryChanged,
+   , _watcher(new QFileSystemWatcher(this)) {
+   connect(this->_watcher, &QFileSystemWatcher::directoryChanged,
            this, &VideoListModel::refresh);
 }
 
@@ -16,24 +16,24 @@ auto VideoListModel::rowCount(QModelIndex const& parent) const -> int {
    if (parent.isValid()) {
       return 0;
    }
-   return static_cast<int>(m_videos.size());
+   return static_cast<int>(this->_videos.size());
 }
 
 auto VideoListModel::data(QModelIndex const& index, int role) const -> QVariant {
-   if (!index.isValid() || index.row() >= m_videos.size()) {
+   if (!index.isValid() || index.row() >= this->_videos.size()) {
       return {};
    }
 
-   QString const& video = m_videos.at(index.row());
+   QString const& video = this->_videos.at(index.row());
 
    switch (role) {
    case Qt::DisplayRole:
    case NameRole:
       return video;
    case PathRole:
-      return m_basePath + "/" + video;
+      return this->_basePath + "/" + video;
    case SizeRole: {
-      QFileInfo info(m_basePath + "/" + video);
+      QFileInfo info(this->_basePath + "/" + video);
       return info.size();
    }
    default:
@@ -50,71 +50,71 @@ auto VideoListModel::roleNames() const -> QHash<int, QByteArray> {
 }
 
 auto VideoListModel::basePath() const -> QString {
-   return m_basePath;
+   return this->_basePath;
 }
 
 void VideoListModel::setBasePath(QString const& path) {
-   if (m_basePath == path) {
+   if (this->_basePath == path) {
       return;
    }
 
    // Remove old path from watcher
-   if (!m_basePath.isEmpty()) {
-      m_watcher->removePath(m_basePath);
+   if (!this->_basePath.isEmpty()) {
+      this->_watcher->removePath(this->_basePath);
    }
 
-   m_basePath = path;
+   this->_basePath = path;
 
    // Add new path to watcher
-   if (!m_basePath.isEmpty() && QDir(m_basePath).exists()) {
-      m_watcher->addPath(m_basePath);
+   if (!this->_basePath.isEmpty() && QDir(this->_basePath).exists()) {
+      this->_watcher->addPath(this->_basePath);
    }
 
    emit basePathChanged();
-   loadVideos();
+   this->loadVideos();
 }
 
 auto VideoListModel::count() const -> int {
-   return static_cast<int>(m_videos.size());
+   return static_cast<int>(this->_videos.size());
 }
 
 auto VideoListModel::videoAt(int index) const -> QString {
-   if (index < 0 || index >= m_videos.size()) {
+   if (index < 0 || index >= this->_videos.size()) {
       return {};
    }
-   return m_videos.at(index);
+   return this->_videos.at(index);
 }
 
 auto VideoListModel::pathAt(int index) const -> QString {
-   if (index < 0 || index >= m_videos.size()) {
+   if (index < 0 || index >= this->_videos.size()) {
       return {};
    }
-   return m_basePath + "/" + m_videos.at(index);
+   return this->_basePath + "/" + this->_videos.at(index);
 }
 
 auto VideoListModel::mostRecentVideo() const -> QString {
-   if (m_videos.isEmpty()) {
+   if (this->_videos.isEmpty()) {
       return {};
    }
    // Videos are sorted by name, last is most recent
-   return m_videos.last();
+   return this->_videos.last();
 }
 
 void VideoListModel::refresh() {
-   loadVideos();
+   this->loadVideos();
 }
 
 void VideoListModel::loadVideos() {
    beginResetModel();
-   m_videos.clear();
+   this->_videos.clear();
 
-   if (m_basePath.isEmpty()) {
+   if (this->_basePath.isEmpty()) {
       endResetModel();
       emit countChanged();
       return;
    }
 
-   QDir dir(m_basePath);
+   QDir dir(this->_basePath);
    if (!dir.exists()) {
       endResetModel();
       emit countChanged();
@@ -125,7 +125,7 @@ void VideoListModel::loadVideos() {
    QStringList filters;
    filters << "*.mov" << "*.mp4" << "*.avi" << "*.mkv";
 
-   m_videos = dir.entryList(filters, QDir::Files, QDir::Name);
+   this->_videos = dir.entryList(filters, QDir::Files, QDir::Name);
 
    endResetModel();
    emit countChanged();

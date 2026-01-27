@@ -20,18 +20,18 @@ ImageViewer::ImageViewer(QWidget* parent)
 
 void ImageViewer::setImage(QImage const& image) {
    if (image.isNull()) {
-      clear();
+      this->clear();
       return;
    }
 
-   m_pixmap = QPixmap::fromImage(image);
-   updateScaledPixmap();
+   this->_pixmap = QPixmap::fromImage(image);
+   this->updateScaledPixmap();
    update();
 }
 
 void ImageViewer::setImagePath(QString const& path) {
    if (path.isEmpty()) {
-      clear();
+      this->clear();
       return;
    }
 
@@ -44,23 +44,23 @@ void ImageViewer::setImagePath(QString const& path) {
       return;
    }
 
-   setImage(image);
+   this->setImage(image);
    emit imageLoaded(path);
 }
 
 void ImageViewer::clear() {
-   m_pixmap = QPixmap();
-   m_scaledPixmap = QPixmap();
+   this->_pixmap = QPixmap();
+   this->_scaledPixmap = QPixmap();
    update();
 }
 
 auto ImageViewer::hasImage() const -> bool {
-   return !m_pixmap.isNull();
+   return !this->_pixmap.isNull();
 }
 
 void ImageViewer::setPlaceholderText(QString const& text) {
-   m_placeholderText = text;
-   if (!hasImage()) {
+   this->_placeholderText = text;
+   if (!this->hasImage()) {
       update();
    }
 }
@@ -72,34 +72,34 @@ void ImageViewer::paintEvent(QPaintEvent* event) {
    painter.setRenderHint(QPainter::Antialiasing);
    painter.setRenderHint(QPainter::SmoothPixmapTransform);
 
-   if (m_scaledPixmap.isNull()) {
+   if (this->_scaledPixmap.isNull()) {
       // Draw placeholder text
       painter.setPen(QColor(128, 128, 128));
       painter.setFont(QFont("sans-serif", 16));
-      painter.drawText(rect(), Qt::AlignCenter, m_placeholderText);
+      painter.drawText(rect(), Qt::AlignCenter, this->_placeholderText);
       return;
    }
 
    // Calculate position to center the image
-   int x = (width() - m_scaledPixmap.width()) / 2;
-   int y = (height() - m_scaledPixmap.height()) / 2;
+   int x = (width() - this->_scaledPixmap.width()) / 2;
+   int y = (height() - this->_scaledPixmap.height()) / 2;
 
-   painter.drawPixmap(x, y, m_scaledPixmap);
+   painter.drawPixmap(x, y, this->_scaledPixmap);
 }
 
 void ImageViewer::resizeEvent(QResizeEvent* event) {
    QWidget::resizeEvent(event);
-   updateScaledPixmap();
+   this->updateScaledPixmap();
 }
 
 void ImageViewer::updateScaledPixmap() {
-   if (m_pixmap.isNull()) {
-      m_scaledPixmap = QPixmap();
+   if (this->_pixmap.isNull()) {
+      this->_scaledPixmap = QPixmap();
       return;
    }
 
    // Scale to fit while maintaining aspect ratio
-   m_scaledPixmap = m_pixmap.scaled(
+   this->_scaledPixmap = this->_pixmap.scaled(
       size(),
       Qt::KeepAspectRatio,
       Qt::SmoothTransformation);

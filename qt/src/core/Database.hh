@@ -46,8 +46,8 @@ private:
    [[nodiscard]] auto migrationApplied(QString const& name) -> bool;
    auto recordMigration(QString const& name) -> std::expected<void, QString>;
 
-   QSqlDatabase m_db;
-   QString m_connectionName;
+   QSqlDatabase _db;
+   QString _connectionName;
 };
 
 }  // namespace timelapse

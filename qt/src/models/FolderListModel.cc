@@ -9,8 +9,8 @@ namespace timelapse {
 
 FolderListModel::FolderListModel(QObject* parent)
    : QAbstractListModel(parent)
-   , m_watcher(new QFileSystemWatcher(this)) {
-   connect(m_watcher, &QFileSystemWatcher::directoryChanged,
+   , _watcher(new QFileSystemWatcher(this)) {
+   connect(this->_watcher, &QFileSystemWatcher::directoryChanged,
            this, &FolderListModel::refresh);
 }
 
@@ -18,24 +18,24 @@ auto FolderListModel::rowCount(QModelIndex const& parent) const -> int {
    if (parent.isValid()) {
       return 0;
    }
-   return static_cast<int>(m_folders.size());
+   return static_cast<int>(this->_folders.size());
 }
 
 auto FolderListModel::data(QModelIndex const& index, int role) const -> QVariant {
-   if (!index.isValid() || index.row() >= m_folders.size()) {
+   if (!index.isValid() || index.row() >= this->_folders.size()) {
       return {};
    }
 
-   QString const& folder = m_folders.at(index.row());
+   QString const& folder = this->_folders.at(index.row());
 
    switch (role) {
    case Qt::DisplayRole:
    case NameRole:
       return folder;
    case PathRole:
-      return m_basePath + "/" + folder;
+      return this->_basePath + "/" + folder;
    case IsTodayRole:
-      return folder == todayFolderName();
+      return folder == this->todayFolderName();
    default:
       return {};
    }
@@ -50,43 +50,43 @@ auto FolderListModel::roleNames() const -> QHash<int, QByteArray> {
 }
 
 auto FolderListModel::basePath() const -> QString {
-   return m_basePath;
+   return this->_basePath;
 }
 
 void FolderListModel::setBasePath(QString const& path) {
-   if (m_basePath == path) {
+   if (this->_basePath == path) {
       return;
    }
 
    // Remove old path from watcher
-   if (!m_basePath.isEmpty()) {
-      m_watcher->removePath(m_basePath);
+   if (!this->_basePath.isEmpty()) {
+      this->_watcher->removePath(this->_basePath);
    }
 
-   m_basePath = path;
+   this->_basePath = path;
 
    // Add new path to watcher
-   if (!m_basePath.isEmpty() && QDir(m_basePath).exists()) {
-      m_watcher->addPath(m_basePath);
+   if (!this->_basePath.isEmpty() && QDir(this->_basePath).exists()) {
+      this->_watcher->addPath(this->_basePath);
    }
 
    emit basePathChanged();
-   loadFolders();
+   this->loadFolders();
 }
 
 auto FolderListModel::count() const -> int {
-   return static_cast<int>(m_folders.size());
+   return static_cast<int>(this->_folders.size());
 }
 
 auto FolderListModel::folderAt(int index) const -> QString {
-   if (index < 0 || index >= m_folders.size()) {
+   if (index < 0 || index >= this->_folders.size()) {
       return {};
    }
-   return m_folders.at(index);
+   return this->_folders.at(index);
 }
 
 auto FolderListModel::indexOf(QString const& folderName) const -> int {
-   return m_folders.indexOf(folderName);
+   return this->_folders.indexOf(folderName);
 }
 
 auto FolderListModel::todayFolderName() const -> QString {
@@ -94,28 +94,28 @@ auto FolderListModel::todayFolderName() const -> QString {
 }
 
 auto FolderListModel::mostRecentFolder() const -> QString {
-   if (m_folders.isEmpty()) {
+   if (this->_folders.isEmpty()) {
       return {};
    }
    // Folders are sorted in ascending order, so last is most recent
-   return m_folders.last();
+   return this->_folders.last();
 }
 
 void FolderListModel::refresh() {
-   loadFolders();
+   this->loadFolders();
 }
 
 void FolderListModel::loadFolders() {
    beginResetModel();
-   m_folders.clear();
+   this->_folders.clear();
 
-   if (m_basePath.isEmpty()) {
+   if (this->_basePath.isEmpty()) {
       endResetModel();
       emit countChanged();
       return;
    }
 
-   QDir dir(m_basePath);
+   QDir dir(this->_basePath);
    if (!dir.exists()) {
       endResetModel();
       emit countChanged();
@@ -129,12 +129,12 @@ void FolderListModel::loadFolders() {
 
    for (auto const& entry : entries) {
       if (datePattern.match(entry).hasMatch()) {
-         m_folders.append(entry);
+         this->_folders.append(entry);
       }
    }
 
    // Sort in ascending order (oldest first, newest last)
-   std::sort(m_folders.begin(), m_folders.end());
+   std::sort(this->_folders.begin(), this->_folders.end());
 
    endResetModel();
    emit countChanged();

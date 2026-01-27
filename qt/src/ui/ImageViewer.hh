@@ -39,9 +39,9 @@ protected:
 private:
    void updateScaledPixmap();
 
-   QPixmap m_pixmap;
-   QPixmap m_scaledPixmap;
-   QString m_placeholderText{"No image loaded"};
+   QPixmap _pixmap;
+   QPixmap _scaledPixmap;
+   QString _placeholderText{"No image loaded"};
 };
 
 }  // namespace timelapse

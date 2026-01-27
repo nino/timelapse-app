@@ -13,11 +13,11 @@ class ScreenCaptureLinux : public ScreenCapture {
 public:
    explicit ScreenCaptureLinux(QObject* parent = nullptr)
       : ScreenCapture(parent)
-      , m_display(XOpenDisplay(nullptr)) {}
+      , _display(XOpenDisplay(nullptr)) {}
 
    ~ScreenCaptureLinux() override {
-      if (m_display) {
-         XCloseDisplay(m_display);
+      if (this->_display) {
+         XCloseDisplay(this->_display);
       }
    }
 
@@ -40,45 +40,45 @@ public:
 
    [[nodiscard]] auto focusedScreen() const
       -> std::expected<ScreenInfo, QString> override {
-      if (!m_display) {
+      if (!this->_display) {
          // Fall back to primary screen
-         return getPrimaryScreen();
+         return this->getPrimaryScreen();
       }
 
       // Get the focused window
       Window focusedWindow;
       int revertTo;
-      XGetInputFocus(m_display, &focusedWindow, &revertTo);
+      XGetInputFocus(this->_display, &focusedWindow, &revertTo);
 
       if (focusedWindow == None || focusedWindow == PointerRoot) {
-         return getPrimaryScreen();
+         return this->getPrimaryScreen();
       }
 
       // Get window geometry
       Window root;
       int x, y;
       unsigned int width, height, border, depth;
-      if (!XGetGeometry(m_display, focusedWindow, &root,
+      if (!XGetGeometry(this->_display, focusedWindow, &root,
                         &x, &y, &width, &height, &border, &depth)) {
-         return getPrimaryScreen();
+         return this->getPrimaryScreen();
       }
 
       // Translate coordinates to root window
       Window child;
       int rootX, rootY;
-      XTranslateCoordinates(m_display, focusedWindow, root,
+      XTranslateCoordinates(this->_display, focusedWindow, root,
                            0, 0, &rootX, &rootY, &child);
 
       QPoint center(rootX + width / 2, rootY + height / 2);
 
       // Find which screen contains this point
-      for (auto const& screen : screens()) {
+      for (auto const& screen : this->screens()) {
          if (screen.geometry.contains(center)) {
             return screen;
          }
       }
 
-      return getPrimaryScreen();
+      return this->getPrimaryScreen();
    }
 
    [[nodiscard]] auto capture(ScreenInfo const& screen)
@@ -99,7 +99,7 @@ public:
 private:
    [[nodiscard]] auto getPrimaryScreen() const
       -> std::expected<ScreenInfo, QString> {
-      auto allScreens = screens();
+      auto allScreens = this->screens();
       for (auto const& screen : allScreens) {
          if (screen.isPrimary) {
             return screen;
@@ -111,7 +111,7 @@ private:
       return std::unexpected("No screens found");
    }
 
-   Display* m_display;
+   Display* _display;
 };
 
 // Factory implementation for Linux

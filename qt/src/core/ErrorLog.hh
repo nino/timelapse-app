@@ -46,8 +46,8 @@ signals:
 private:
    void trimIfNeeded();
 
-   mutable QMutex m_mutex;
-   std::vector<ErrorLogEntry> m_entries;
+   mutable QMutex _mutex;
+   std::vector<ErrorLogEntry> _entries;
 };
 
 }  // namespace timelapse

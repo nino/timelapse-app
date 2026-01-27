@@ -35,7 +35,7 @@ signals:
 private:
    void setupStylesheet();
 
-   QSlider* m_slider{nullptr};
+   QSlider* _slider{nullptr};
 };
 
 }  // namespace timelapse
