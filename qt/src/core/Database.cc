@@ -18,7 +18,7 @@ Database::Database(QString const& dbPath, QObject* parent)
    }
 
    if (auto result = this->runMigrations(); !result) {
-      qWarning() << "Failed to run migrations:" << result.error();
+      qWarning() << "Failed to run migrations:" << result.error().message();
    }
 }
 
@@ -33,7 +33,7 @@ auto Database::isOpen() const -> bool {
    return this->_db.isOpen();
 }
 
-auto Database::runMigrations() -> std::expected<void, QString> {
+auto Database::runMigrations() -> std::expected<void, Error> {
    // Create migrations table first
    if (auto result = this->createMigrationsTable(); !result) {
       return result;
@@ -50,7 +50,8 @@ auto Database::runMigrations() -> std::expected<void, QString> {
             local_time TEXT NOT NULL
          )
       )")) {
-         return std::unexpected(query.lastError().text());
+         return std::unexpected(Error{ErrorCode::DatabaseQueryFailed,
+                                      query.lastError().text()});
       }
 
       // Create index on frame_number
@@ -58,7 +59,8 @@ auto Database::runMigrations() -> std::expected<void, QString> {
          CREATE INDEX IF NOT EXISTS idx_screenshots_frame
          ON screenshots(frame_number)
       )")) {
-         return std::unexpected(query.lastError().text());
+         return std::unexpected(Error{ErrorCode::DatabaseQueryFailed,
+                                      query.lastError().text()});
       }
 
       if (auto result = this->recordMigration("001_create_screenshots"); !result) {
@@ -69,7 +71,7 @@ auto Database::runMigrations() -> std::expected<void, QString> {
    return {};
 }
 
-auto Database::createMigrationsTable() -> std::expected<void, QString> {
+auto Database::createMigrationsTable() -> std::expected<void, Error> {
    QSqlQuery query(this->_db);
    if (!query.exec(R"(
       CREATE TABLE IF NOT EXISTS migrations (
@@ -78,7 +80,8 @@ auto Database::createMigrationsTable() -> std::expected<void, QString> {
          applied_at TEXT NOT NULL
       )
    )")) {
-      return std::unexpected(query.lastError().text());
+      return std::unexpected(Error{ErrorCode::DatabaseQueryFailed,
+                                   query.lastError().text()});
    }
    return {};
 }
@@ -95,7 +98,7 @@ auto Database::migrationApplied(QString const& name) -> bool {
    return query.value(0).toInt() > 0;
 }
 
-auto Database::recordMigration(QString const& name) -> std::expected<void, QString> {
+auto Database::recordMigration(QString const& name) -> std::expected<void, Error> {
    QSqlQuery query(this->_db);
    query.prepare(R"(
       INSERT INTO migrations (migration_name, applied_at)
@@ -105,7 +108,8 @@ auto Database::recordMigration(QString const& name) -> std::expected<void, QStri
    query.bindValue(":applied_at", QDateTime::currentDateTimeUtc().toString(Qt::ISODate));
 
    if (!query.exec()) {
-      return std::unexpected(query.lastError().text());
+      return std::unexpected(Error{ErrorCode::DatabaseQueryFailed,
+                                   query.lastError().text()});
    }
    return {};
 }
@@ -113,7 +117,7 @@ auto Database::recordMigration(QString const& name) -> std::expected<void, QStri
 auto Database::insertScreenshot(uint32_t frameNumber,
                                 QDateTime const& createdAt,
                                 QDateTime const& localTime)
-   -> std::expected<void, QString> {
+   -> std::expected<void, Error> {
    QSqlQuery query(this->_db);
    query.prepare(R"(
       INSERT INTO screenshots (frame_number, created_at, local_time)
@@ -125,14 +129,15 @@ auto Database::insertScreenshot(uint32_t frameNumber,
    query.bindValue(":local", localTime.toString(Qt::ISODate));
 
    if (!query.exec()) {
-      return std::unexpected(query.lastError().text());
+      return std::unexpected(Error{ErrorCode::DatabaseQueryFailed,
+                                   query.lastError().text()});
    }
 
    return {};
 }
 
 auto Database::getScreenshotByFrame(uint32_t frameNumber)
-   -> std::expected<std::optional<ScreenshotMetadata>, QString> {
+   -> std::expected<std::optional<ScreenshotMetadata>, Error> {
    QSqlQuery query(this->_db);
    query.prepare(R"(
       SELECT frame_number, created_at, local_time
@@ -142,7 +147,8 @@ auto Database::getScreenshotByFrame(uint32_t frameNumber)
    query.bindValue(":frame", frameNumber);
 
    if (!query.exec()) {
-      return std::unexpected(query.lastError().text());
+      return std::unexpected(Error{ErrorCode::DatabaseQueryFailed,
+                                   query.lastError().text()});
    }
 
    if (!query.next()) {
@@ -156,10 +162,11 @@ auto Database::getScreenshotByFrame(uint32_t frameNumber)
    };
 }
 
-auto Database::screenshotCount() -> std::expected<int64_t, QString> {
+auto Database::screenshotCount() -> std::expected<int64_t, Error> {
    QSqlQuery query(this->_db);
    if (!query.exec("SELECT COUNT(*) FROM screenshots")) {
-      return std::unexpected(query.lastError().text());
+      return std::unexpected(Error{ErrorCode::DatabaseQueryFailed,
+                                   query.lastError().text()});
    }
 
    if (!query.next()) {

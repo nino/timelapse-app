@@ -39,7 +39,7 @@ public:
    }
 
    [[nodiscard]] auto focusedScreen() const
-      -> std::expected<ScreenInfo, QString> override {
+      -> std::expected<ScreenInfo, Error> override {
       if (!this->_display) {
          // Fall back to primary screen
          return this->getPrimaryScreen();
@@ -82,15 +82,15 @@ public:
    }
 
    [[nodiscard]] auto capture(ScreenInfo const& screen)
-      -> std::expected<QImage, QString> override {
+      -> std::expected<QImage, Error> override {
       auto* qscreen = QGuiApplication::screens().value(screen.id);
       if (!qscreen) {
-         return std::unexpected("Screen not found");
+         return std::unexpected(Error{ErrorCode::ScreenNotFound, "Screen not found"});
       }
 
       QPixmap pixmap = qscreen->grabWindow(0);
       if (pixmap.isNull()) {
-         return std::unexpected("Failed to capture screen");
+         return std::unexpected(Error{ErrorCode::CaptureFailed, "Failed to capture screen"});
       }
 
       return pixmap.toImage();
@@ -98,7 +98,7 @@ public:
 
 private:
    [[nodiscard]] auto getPrimaryScreen() const
-      -> std::expected<ScreenInfo, QString> {
+      -> std::expected<ScreenInfo, Error> {
       auto allScreens = this->screens();
       for (auto const& screen : allScreens) {
          if (screen.isPrimary) {
@@ -108,7 +108,7 @@ private:
       if (!allScreens.empty()) {
          return allScreens[0];
       }
-      return std::unexpected("No screens found");
+      return std::unexpected(Error{ErrorCode::NoScreensFound, "No screens found"});
    }
 
    Display* _display;

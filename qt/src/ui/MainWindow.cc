@@ -332,7 +332,7 @@ void MainWindow::onVideoSelected(int index) {
    this->_isExtractingFrames = false;
 
    if (!result) {
-      this->_imageViewer->setPlaceholderText("Failed to extract frames: " + result.error());
+      this->_imageViewer->setPlaceholderText("Failed to extract frames: " + result.error().message());
       return;
    }
 

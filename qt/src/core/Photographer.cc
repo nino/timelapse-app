@@ -44,7 +44,7 @@ auto Photographer::database() const -> Database* {
 }
 
 auto Photographer::getScreenshotMetadata(uint32_t frameNumber)
-   -> std::expected<std::optional<ScreenshotMetadata>, QString> {
+   -> std::expected<std::optional<ScreenshotMetadata>, Error> {
    return this->_database->getScreenshotByFrame(frameNumber);
 }
 
@@ -89,7 +89,8 @@ void Photographer::captureScreenshot() {
    // Capture screenshot
    auto image = this->_screenCapture->captureFocused();
    if (!image) {
-      this->logError("Capture failed: " + image.error());
+      this->logError(Error{image.error().code(),
+                           "Capture failed: " + image.error().message()});
       this->scheduleNextCapture(kErrorWait);
       return;
    }
@@ -98,7 +99,8 @@ void Photographer::captureScreenshot() {
    auto processed = this->_imageProcessor->resizeWithLetterbox(
       *image, kTargetWidth, kTargetHeight);
    if (!processed) {
-      this->logError("Processing failed: " + processed.error());
+      this->logError(Error{processed.error().code(),
+                           "Processing failed: " + processed.error().message()});
       this->scheduleNextCapture(kErrorWait);
       return;
    }
@@ -113,7 +115,8 @@ void Photographer::captureScreenshot() {
    // Get next frame number
    auto frameNumber = this->getNextFrameNumber(*dayDir);
    if (!frameNumber) {
-      this->logError("Failed to get frame number: " + frameNumber.error());
+      this->logError(Error{frameNumber.error().code(),
+                           "Failed to get frame number: " + frameNumber.error().message()});
       this->scheduleNextCapture(kErrorWait);
       return;
    }
@@ -125,7 +128,8 @@ void Photographer::captureScreenshot() {
    // Save image
    auto saveResult = this->_imageProcessor->saveImage(*processed, filepath);
    if (!saveResult) {
-      this->logError("Save failed: " + saveResult.error());
+      this->logError(Error{saveResult.error().code(),
+                           "Save failed: " + saveResult.error().message()});
       this->scheduleNextCapture(kErrorWait);
       return;
    }
@@ -135,7 +139,8 @@ void Photographer::captureScreenshot() {
    QDateTime local = QDateTime::currentDateTime();
    auto dbResult = this->_database->insertScreenshot(*frameNumber, now, local);
    if (!dbResult) {
-      this->logError("Database insert failed: " + dbResult.error());
+      this->logError(Error{dbResult.error().code(),
+                           "Database insert failed: " + dbResult.error().message()});
       // Continue anyway - screenshot was saved
    }
 
@@ -143,14 +148,15 @@ void Photographer::captureScreenshot() {
    this->scheduleNextCapture(kScreenshotInterval);
 }
 
-auto Photographer::ensureDayDirectory() -> std::expected<QString, QString> {
+auto Photographer::ensureDayDirectory() -> std::expected<QString, Error> {
    if (!this->_currentDayDir.isEmpty()) {
       return this->_currentDayDir;
    }
 
    QString dayDir = PathUtils::dayFolder(this->_currentDate);
    if (!PathUtils::ensureDir(dayDir)) {
-      return std::unexpected("Failed to create day directory: " + dayDir);
+      return std::unexpected(Error{ErrorCode::DirectoryCreationFailed,
+                                   "Failed to create day directory: " + dayDir});
    }
 
    this->_currentDayDir = dayDir;
@@ -158,7 +164,7 @@ auto Photographer::ensureDayDirectory() -> std::expected<QString, QString> {
 }
 
 auto Photographer::getNextFrameNumber(QString const& dayDir)
-   -> std::expected<uint32_t, QString> {
+   -> std::expected<uint32_t, Error> {
    QDir dir(dayDir);
    if (!dir.exists()) {
       return 1;  // First frame
@@ -194,9 +200,9 @@ void Photographer::scheduleNextCapture(std::chrono::milliseconds delay) {
    }
 }
 
-void Photographer::logError(QString const& error) {
-   this->_errorLog->append(error);
-   emit errorOccurred(error);
+void Photographer::logError(Error const& error) {
+   this->_errorLog->append(error.message());
+   emit errorOccurred(error.message());
 }
 
 }  // namespace timelapse

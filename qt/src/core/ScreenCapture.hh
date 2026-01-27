@@ -8,6 +8,8 @@
 #include <memory>
 #include <vector>
 
+#include "Error.hh"
+
 namespace timelapse {
 
 struct ScreenInfo {
@@ -33,14 +35,14 @@ public:
 
    // Get the screen containing the active window
    [[nodiscard]] virtual auto focusedScreen() const
-      -> std::expected<ScreenInfo, QString> = 0;
+      -> std::expected<ScreenInfo, Error> = 0;
 
    // Capture a specific screen
    [[nodiscard]] virtual auto capture(ScreenInfo const& screen)
-      -> std::expected<QImage, QString> = 0;
+      -> std::expected<QImage, Error> = 0;
 
    // Convenience: capture the focused screen
-   [[nodiscard]] auto captureFocused() -> std::expected<QImage, QString>;
+   [[nodiscard]] auto captureFocused() -> std::expected<QImage, Error>;
 
 signals:
    void captureError(QString const& error);

@@ -6,37 +6,37 @@
 
 #include "Constants.hh"
 
-namespace timelapse {
+namespace timelapse::PathUtils {
 
-auto PathUtils::homeDir() -> QString {
+auto homeDir() -> QString {
    return QStandardPaths::writableLocation(QStandardPaths::HomeLocation);
 }
 
-auto PathUtils::timelapseDir() -> QString {
+auto timelapseDir() -> QString {
    return homeDir() + "/" + kTimelapseDir;
 }
 
-auto PathUtils::cacheDir() -> QString {
+auto cacheDir() -> QString {
    return timelapseDir() + "/" + kCacheDir;
 }
 
-auto PathUtils::databasePath() -> QString {
+auto databasePath() -> QString {
    return cacheDir() + "/" + kDatabaseName;
 }
 
-auto PathUtils::dayFolder(QString const& date) -> QString {
+auto dayFolder(QString const& date) -> QString {
    return timelapseDir() + "/" + date;
 }
 
-auto PathUtils::currentDateString() -> QString {
+auto currentDateString() -> QString {
    return QDate::currentDate().toString("yyyy-MM-dd");
 }
 
-auto PathUtils::formatFrameNumber(int32_t number) -> QString {
+auto formatFrameNumber(int32_t number) -> QString {
    return QString("%1").arg(number, kFrameNumberDigits, 10, QChar('0'));
 }
 
-auto PathUtils::ensureDir(QString const& path) -> bool {
+auto ensureDir(QString const& path) -> bool {
    QDir dir(path);
    if (dir.exists()) {
       return true;
@@ -44,4 +44,4 @@ auto PathUtils::ensureDir(QString const& path) -> bool {
    return dir.mkpath(".");
 }
 
-}  // namespace timelapse
+}  // namespace timelapse::PathUtils

@@ -6,6 +6,7 @@
 #include <memory>
 
 #include "Database.hh"
+#include "Error.hh"
 #include "ErrorLog.hh"
 #include "ImageProcessor.hh"
 #include "ScreenCapture.hh"
@@ -26,7 +27,7 @@ public:
 
    // Get metadata for a specific frame (delegates to database)
    [[nodiscard]] auto getScreenshotMetadata(uint32_t frameNumber)
-      -> std::expected<std::optional<ScreenshotMetadata>, QString>;
+      -> std::expected<std::optional<ScreenshotMetadata>, Error>;
 
 public slots:
    void start();
@@ -42,10 +43,10 @@ private slots:
    void captureScreenshot();
 
 private:
-   auto ensureDayDirectory() -> std::expected<QString, QString>;
-   auto getNextFrameNumber(QString const& dayDir) -> std::expected<uint32_t, QString>;
+   auto ensureDayDirectory() -> std::expected<QString, Error>;
+   auto getNextFrameNumber(QString const& dayDir) -> std::expected<uint32_t, Error>;
    void scheduleNextCapture(std::chrono::milliseconds delay);
-   void logError(QString const& error);
+   void logError(Error const& error);
 
    std::unique_ptr<ScreenCapture> _screenCapture;
    std::unique_ptr<ImageProcessor> _imageProcessor;

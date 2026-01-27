@@ -18,9 +18,10 @@ VideoExtractor::~VideoExtractor() {
 }
 
 auto VideoExtractor::extractFrames(QString const& videoPath, int32_t fps)
-   -> std::expected<QString, QString> {
+   -> std::expected<QString, Error> {
    if (this->_extracting) {
-      return std::unexpected("Extraction already in progress");
+      return std::unexpected(Error{ErrorCode::ExtractionInProgress,
+                                   "Extraction already in progress"});
    }
 
    // Find ffmpeg
@@ -43,7 +44,8 @@ auto VideoExtractor::extractFrames(QString const& videoPath, int32_t fps)
    QString cacheFolderPath = PathUtils::cacheDir() + "/" + cacheFolderName;
 
    if (!PathUtils::ensureDir(cacheFolderPath)) {
-      return std::unexpected("Failed to create cache folder: " + cacheFolderPath);
+      return std::unexpected(Error{ErrorCode::CacheCreationFailed,
+                                   "Failed to create cache folder: " + cacheFolderPath});
    }
 
    // Build ffmpeg command
@@ -67,7 +69,8 @@ auto VideoExtractor::extractFrames(QString const& videoPath, int32_t fps)
       QString error = this->_ffmpegProcess->errorString();
       delete this->_ffmpegProcess;
       this->_ffmpegProcess = nullptr;
-      return std::unexpected("Failed to start ffmpeg: " + error);
+      return std::unexpected(Error{ErrorCode::FfmpegStartFailed,
+                                   "Failed to start ffmpeg: " + error});
    }
 
    // Wait for completion (blocking for simplicity)
@@ -77,7 +80,7 @@ auto VideoExtractor::extractFrames(QString const& videoPath, int32_t fps)
       QString error = this->_ffmpegProcess->errorString();
       delete this->_ffmpegProcess;
       this->_ffmpegProcess = nullptr;
-      return std::unexpected("ffmpeg failed: " + error);
+      return std::unexpected(Error{ErrorCode::FfmpegFailed, "ffmpeg failed: " + error});
    }
 
    int exitCode = this->_ffmpegProcess->exitCode();
@@ -86,7 +89,8 @@ auto VideoExtractor::extractFrames(QString const& videoPath, int32_t fps)
    this->_ffmpegProcess = nullptr;
 
    if (exitCode != 0) {
-      return std::unexpected("ffmpeg exited with code: " + QString::number(exitCode));
+      return std::unexpected(Error{ErrorCode::FfmpegExitError,
+                                   "ffmpeg exited with code: " + QString::number(exitCode)});
    }
 
    emit extractionFinished(cacheFolderName);
@@ -123,7 +127,7 @@ void VideoExtractor::cancelExtraction() {
    this->_extracting = false;
 }
 
-auto VideoExtractor::findFfmpeg() const -> std::expected<QString, QString> {
+auto VideoExtractor::findFfmpeg() const -> std::expected<QString, Error> {
    // Check common locations
    QStringList searchPaths;
 
@@ -154,7 +158,8 @@ auto VideoExtractor::findFfmpeg() const -> std::expected<QString, QString> {
       }
    }
 
-   return std::unexpected("ffmpeg not found. Please install ffmpeg.");
+   return std::unexpected(Error{ErrorCode::FfmpegNotFound,
+                                "ffmpeg not found. Please install ffmpeg."});
 }
 
 auto VideoExtractor::generateCacheFolderName(QString const& videoFilename) const

@@ -13,9 +13,9 @@ ImageProcessor::ImageProcessor(QObject* parent)
 auto ImageProcessor::resizeWithLetterbox(QImage const& source,
                                          int32_t targetWidth,
                                          int32_t targetHeight)
-   -> std::expected<QImage, QString> {
+   -> std::expected<QImage, Error> {
    if (source.isNull()) {
-      return std::unexpected("Source image is null");
+      return std::unexpected(Error{ErrorCode::Unknown, "Source image is null"});
    }
 
    // Create a black background image at target size
@@ -57,18 +57,19 @@ auto ImageProcessor::resizeWithLetterbox(QImage const& source,
 }
 
 auto ImageProcessor::isImageBlack(QImage const& image, double threshold) const -> bool {
-   double brightness = calculateMeanBrightness(image);
+   double brightness = this->calculateMeanBrightness(image);
    return brightness < threshold;
 }
 
 auto ImageProcessor::saveImage(QImage const& image, QString const& path)
-   -> std::expected<void, QString> {
+   -> std::expected<void, Error> {
    if (image.isNull()) {
-      return std::unexpected("Cannot save null image");
+      return std::unexpected(Error{ErrorCode::Unknown, "Cannot save null image"});
    }
 
    if (!image.save(path, "PNG")) {
-      return std::unexpected("Failed to save image to: " + path);
+      return std::unexpected(Error{ErrorCode::FileWriteError,
+                                   "Failed to save image to: " + path});
    }
 
    return {};

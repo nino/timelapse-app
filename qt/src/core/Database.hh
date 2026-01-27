@@ -7,6 +7,8 @@
 #include <expected>
 #include <optional>
 
+#include "Error.hh"
+
 namespace timelapse {
 
 struct ScreenshotMetadata {
@@ -31,20 +33,20 @@ public:
    // Insert a new screenshot record
    auto insertScreenshot(uint32_t frameNumber,
                          QDateTime const& createdAt,
-                         QDateTime const& localTime) -> std::expected<void, QString>;
+                         QDateTime const& localTime) -> std::expected<void, Error>;
 
    // Get metadata for a specific frame
    [[nodiscard]] auto getScreenshotByFrame(uint32_t frameNumber)
-      -> std::expected<std::optional<ScreenshotMetadata>, QString>;
+      -> std::expected<std::optional<ScreenshotMetadata>, Error>;
 
    // Get total screenshot count
-   [[nodiscard]] auto screenshotCount() -> std::expected<int64_t, QString>;
+   [[nodiscard]] auto screenshotCount() -> std::expected<int64_t, Error>;
 
 private:
-   auto runMigrations() -> std::expected<void, QString>;
-   auto createMigrationsTable() -> std::expected<void, QString>;
+   auto runMigrations() -> std::expected<void, Error>;
+   auto createMigrationsTable() -> std::expected<void, Error>;
    [[nodiscard]] auto migrationApplied(QString const& name) -> bool;
-   auto recordMigration(QString const& name) -> std::expected<void, QString>;
+   auto recordMigration(QString const& name) -> std::expected<void, Error>;
 
    QSqlDatabase _db;
    QString _connectionName;

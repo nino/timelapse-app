@@ -32,17 +32,17 @@ public:
    }
 
    [[nodiscard]] auto focusedScreen() const
-      -> std::expected<ScreenInfo, QString> override {
+      -> std::expected<ScreenInfo, Error> override {
       // Get the foreground window
       HWND foregroundWindow = GetForegroundWindow();
       if (!foregroundWindow) {
-         return getPrimaryScreen();
+         return this->getPrimaryScreen();
       }
 
       // Get window rect
       RECT rect;
       if (!GetWindowRect(foregroundWindow, &rect)) {
-         return getPrimaryScreen();
+         return this->getPrimaryScreen();
       }
 
       // Calculate center point
@@ -51,25 +51,25 @@ public:
          (rect.top + rect.bottom) / 2);
 
       // Find which screen contains this point
-      for (auto const& screen : screens()) {
+      for (auto const& screen : this->screens()) {
          if (screen.geometry.contains(center)) {
             return screen;
          }
       }
 
-      return getPrimaryScreen();
+      return this->getPrimaryScreen();
    }
 
    [[nodiscard]] auto capture(ScreenInfo const& screen)
-      -> std::expected<QImage, QString> override {
+      -> std::expected<QImage, Error> override {
       auto* qscreen = QGuiApplication::screens().value(screen.id);
       if (!qscreen) {
-         return std::unexpected("Screen not found");
+         return std::unexpected(Error{ErrorCode::ScreenNotFound, "Screen not found"});
       }
 
       QPixmap pixmap = qscreen->grabWindow(0);
       if (pixmap.isNull()) {
-         return std::unexpected("Failed to capture screen");
+         return std::unexpected(Error{ErrorCode::CaptureFailed, "Failed to capture screen"});
       }
 
       return pixmap.toImage();
@@ -77,8 +77,8 @@ public:
 
 private:
    [[nodiscard]] auto getPrimaryScreen() const
-      -> std::expected<ScreenInfo, QString> {
-      auto allScreens = screens();
+      -> std::expected<ScreenInfo, Error> {
+      auto allScreens = this->screens();
       for (auto const& screen : allScreens) {
          if (screen.isPrimary) {
             return screen;
@@ -87,7 +87,7 @@ private:
       if (!allScreens.empty()) {
          return allScreens[0];
       }
-      return std::unexpected("No screens found");
+      return std::unexpected(Error{ErrorCode::NoScreensFound, "No screens found"});
    }
 };
 

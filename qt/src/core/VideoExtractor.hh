@@ -5,6 +5,8 @@
 #include <QString>
 #include <expected>
 
+#include "Error.hh"
+
 namespace timelapse {
 
 class VideoExtractor : public QObject {
@@ -18,7 +20,7 @@ public:
    // Returns the cache folder name on success
    [[nodiscard]] auto extractFrames(QString const& videoPath,
                                     int32_t fps = 30)
-      -> std::expected<QString, QString>;
+      -> std::expected<QString, Error>;
 
    // Check if frames already exist in cache for a video
    [[nodiscard]] auto hasCachedFrames(QString const& videoFilename) const -> bool;
@@ -39,7 +41,7 @@ signals:
    void extractionFailed(QString const& error);
 
 private:
-   [[nodiscard]] auto findFfmpeg() const -> std::expected<QString, QString>;
+   [[nodiscard]] auto findFfmpeg() const -> std::expected<QString, Error>;
    [[nodiscard]] auto generateCacheFolderName(QString const& videoFilename) const
       -> QString;
 

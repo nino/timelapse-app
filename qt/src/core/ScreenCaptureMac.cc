@@ -33,12 +33,12 @@ public:
    }
 
    [[nodiscard]] auto focusedScreen() const
-      -> std::expected<ScreenInfo, QString> override {
+      -> std::expected<ScreenInfo, Error> override {
       // Get the active window bounds using CoreGraphics
-      auto windowBounds = getActiveWindowBounds();
+      auto windowBounds = this->getActiveWindowBounds();
       if (!windowBounds) {
          // Fall back to primary screen
-         auto allScreens = screens();
+         auto allScreens = this->screens();
          for (auto const& screen : allScreens) {
             if (screen.isPrimary) {
                return screen;
@@ -47,38 +47,38 @@ public:
          if (!allScreens.empty()) {
             return allScreens[0];
          }
-         return std::unexpected("No screens found");
+         return std::unexpected(Error{ErrorCode::NoScreensFound, "No screens found"});
       }
 
       // Find which screen contains the window center
       QPoint center = windowBounds->center();
-      for (auto const& screen : screens()) {
+      for (auto const& screen : this->screens()) {
          if (screen.geometry.contains(center)) {
             return screen;
          }
       }
 
       // Fall back to primary
-      for (auto const& screen : screens()) {
+      for (auto const& screen : this->screens()) {
          if (screen.isPrimary) {
             return screen;
          }
       }
 
-      return std::unexpected("Could not determine focused screen");
+      return std::unexpected(Error{ErrorCode::ScreenNotFound, "Could not determine focused screen"});
    }
 
    [[nodiscard]] auto capture(ScreenInfo const& screen)
-      -> std::expected<QImage, QString> override {
+      -> std::expected<QImage, Error> override {
       // Use Qt's screen grab for simplicity and cross-platform consistency
       auto* qscreen = QGuiApplication::screens().value(screen.id);
       if (!qscreen) {
-         return std::unexpected("Screen not found");
+         return std::unexpected(Error{ErrorCode::ScreenNotFound, "Screen not found"});
       }
 
       QPixmap pixmap = qscreen->grabWindow(0);
       if (pixmap.isNull()) {
-         return std::unexpected("Failed to capture screen");
+         return std::unexpected(Error{ErrorCode::CaptureFailed, "Failed to capture screen"});
       }
 
       return pixmap.toImage();
@@ -86,14 +86,14 @@ public:
 
 private:
    [[nodiscard]] auto getActiveWindowBounds() const
-      -> std::expected<QRect, QString> {
+      -> std::expected<QRect, Error> {
       // Get list of windows
       CFArrayRef windowList = CGWindowListCopyWindowInfo(
          kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
          kCGNullWindowID);
 
       if (!windowList) {
-         return std::unexpected("Failed to get window list");
+         return std::unexpected(Error{ErrorCode::CaptureFailed, "Failed to get window list"});
       }
 
       QRect result;
@@ -134,7 +134,7 @@ private:
       CFRelease(windowList);
 
       if (!found) {
-         return std::unexpected("No active window found");
+         return std::unexpected(Error{ErrorCode::CaptureFailed, "No active window found"});
       }
 
       return result;
