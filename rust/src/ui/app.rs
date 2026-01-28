@@ -1,22 +1,20 @@
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2::{declare_class, msg_send, msg_send_id, mutability, ClassType, DeclaredClass};
+use objc2::{define_class, msg_send, AllocAnyThread, MainThreadOnly};
 use objc2_app_kit::{
    NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSBackingStoreType,
-   NSButton, NSComboBox, NSControl, NSImage, NSImageScaling, NSImageView, NSLayoutConstraint,
-   NSPopUpButton, NSSlider, NSStackView, NSUserInterfaceLayoutOrientation, NSView, NSWindow,
-   NSWindowDelegate, NSWindowStyleMask,
+   NSButton, NSImage, NSImageScaling, NSImageView, NSLayoutConstraint, NSPopUpButton, NSSlider,
+   NSStackView, NSTextField, NSUserInterfaceLayoutOrientation, NSView, NSWindow,
+   NSWindowStyleMask,
 };
 use objc2_foundation::{
-   ns_string, CGFloat, MainThreadMarker, NSArray, NSNotification, NSObject, NSObjectProtocol,
-   NSPoint, NSRect, NSSize, NSString,
+   ns_string, MainThreadMarker, NSArray, NSNotification, NSObject, NSObjectProtocol, NSPoint,
+   NSRect, NSSize, NSString,
 };
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::Arc;
 
-use crate::core::{Photographer, VideoExtractor};
 use crate::utils::paths;
 
 // Application state
@@ -25,13 +23,6 @@ struct AppState {
    current_frame: usize,
    files: Vec<PathBuf>,
    folders: Vec<String>,
-   view_mode: ViewMode,
-}
-
-#[derive(Clone, Copy, PartialEq)]
-enum ViewMode {
-   Images,
-   Videos,
 }
 
 impl Default for AppState {
@@ -41,47 +32,40 @@ impl Default for AppState {
          current_frame: 0,
          files: Vec::new(),
          folders: Vec::new(),
-         view_mode: ViewMode::Images,
       }
    }
 }
-
-declare_class!(
-   pub struct AppDelegate;
-
-   unsafe impl ClassType for AppDelegate {
-      type Super = NSObject;
-      type Mutability = mutability::MainThreadOnly;
-      const NAME: &'static str = "AppDelegate";
-   }
-
-   impl DeclaredClass for AppDelegate {
-      type Ivars = AppDelegateIvars;
-   }
-
-   unsafe impl NSObjectProtocol for AppDelegate {}
-
-   unsafe impl NSApplicationDelegate for AppDelegate {
-      #[method(applicationDidFinishLaunching:)]
-      fn did_finish_launching(&self, _notification: &NSNotification) {
-         self.setup_window();
-      }
-
-      #[method(applicationShouldTerminateAfterLastWindowClosed:)]
-      fn should_terminate_after_last_window_closed(&self, _sender: &NSApplication) -> bool {
-         true
-      }
-   }
-);
 
 struct AppDelegateIvars {
    window: RefCell<Option<Retained<NSWindow>>>,
    image_view: RefCell<Option<Retained<NSImageView>>>,
    slider: RefCell<Option<Retained<NSSlider>>>,
    folder_popup: RefCell<Option<Retained<NSPopUpButton>>>,
-   frame_label: RefCell<Option<Retained<objc2_app_kit::NSTextField>>>,
+   frame_label: RefCell<Option<Retained<NSTextField>>>,
    state: RefCell<AppState>,
 }
+
+define_class!(
+   #[unsafe(super(NSObject))]
+   #[thread_kind = MainThreadOnly]
+   #[name = "AppDelegate"]
+   #[ivars = AppDelegateIvars]
+   pub struct AppDelegate;
+
+   unsafe impl NSObjectProtocol for AppDelegate {}
+
+   unsafe impl NSApplicationDelegate for AppDelegate {
+      #[unsafe(method(applicationDidFinishLaunching:))]
+      fn did_finish_launching(&self, _notification: &NSNotification) {
+         self.setup_window();
+      }
+
+      #[unsafe(method(applicationShouldTerminateAfterLastWindowClosed:))]
+      fn should_terminate_after_last_window_closed(&self, _sender: &NSApplication) -> bool {
+         true
+      }
+   }
+);
 
 impl AppDelegate {
    pub fn new(mtm: MainThreadMarker) -> Retained<Self> {
@@ -94,7 +78,7 @@ impl AppDelegate {
          frame_label: RefCell::new(None),
          state: RefCell::new(AppState::default()),
       });
-      unsafe { msg_send_id![super(this), init] }
+      unsafe { msg_send![super(this), init] }
    }
 
    fn setup_window(&self) {
@@ -112,7 +96,7 @@ impl AppDelegate {
             mtm.alloc(),
             frame,
             style,
-            NSBackingStoreType::NSBackingStoreBuffered,
+            NSBackingStoreType::Buffered,
             false,
          )
       };
@@ -140,30 +124,21 @@ impl AppDelegate {
          folder_popup.setTranslatesAutoresizingMaskIntoConstraints(false);
 
          // Create frame label
-         let frame_label = objc2_app_kit::NSTextField::labelWithString(ns_string!("Frame 0 / 0"));
+         let frame_label = NSTextField::labelWithString(ns_string!("Frame 0 / 0"));
          frame_label.setTranslatesAutoresizingMaskIntoConstraints(false);
 
          // Create mode buttons
-         let images_button = NSButton::buttonWithTitle_target_action(
-            ns_string!("Images"),
-            None,
-            None,
-         );
+         let images_button =
+            NSButton::buttonWithTitle_target_action(ns_string!("Images"), None, None);
          images_button.setTranslatesAutoresizingMaskIntoConstraints(false);
 
-         let videos_button = NSButton::buttonWithTitle_target_action(
-            ns_string!("Videos"),
-            None,
-            None,
-         );
+         let videos_button =
+            NSButton::buttonWithTitle_target_action(ns_string!("Videos"), None, None);
          videos_button.setTranslatesAutoresizingMaskIntoConstraints(false);
 
          // Create refresh button
-         let refresh_button = NSButton::buttonWithTitle_target_action(
-            ns_string!("Refresh"),
-            None,
-            None,
-         );
+         let refresh_button =
+            NSButton::buttonWithTitle_target_action(ns_string!("Refresh"), None, None);
          refresh_button.setTranslatesAutoresizingMaskIntoConstraints(false);
 
          // Create toolbar stack view
@@ -190,62 +165,45 @@ impl AppDelegate {
          content_view.addSubview(&bottom_controls);
 
          // Setup constraints
-         let views: &[&NSView] = &[
-            &toolbar,
-            &*image_view,
-            &bottom_controls,
-         ];
-
-         // Toolbar at top
-         NSLayoutConstraint::activateConstraints(&NSArray::from_vec(vec![
-            toolbar.topAnchor().constraintEqualToAnchor_constant(
-               &content_view.topAnchor(),
-               10.0,
-            ),
-            toolbar.leadingAnchor().constraintEqualToAnchor_constant(
-               &content_view.leadingAnchor(),
-               10.0,
-            ),
-            toolbar.trailingAnchor().constraintEqualToAnchor_constant(
-               &content_view.trailingAnchor(),
-               -10.0,
-            ),
+         NSLayoutConstraint::activateConstraints(&NSArray::from_slice(&[
+            toolbar
+               .topAnchor()
+               .constraintEqualToAnchor_constant(&content_view.topAnchor(), 10.0),
+            toolbar
+               .leadingAnchor()
+               .constraintEqualToAnchor_constant(&content_view.leadingAnchor(), 10.0),
+            toolbar
+               .trailingAnchor()
+               .constraintEqualToAnchor_constant(&content_view.trailingAnchor(), -10.0),
          ]));
 
          // Image view in center
-         NSLayoutConstraint::activateConstraints(&NSArray::from_vec(vec![
-            image_view.topAnchor().constraintEqualToAnchor_constant(
-               &toolbar.bottomAnchor(),
-               10.0,
-            ),
-            image_view.leadingAnchor().constraintEqualToAnchor_constant(
-               &content_view.leadingAnchor(),
-               10.0,
-            ),
-            image_view.trailingAnchor().constraintEqualToAnchor_constant(
-               &content_view.trailingAnchor(),
-               -10.0,
-            ),
-            image_view.bottomAnchor().constraintEqualToAnchor_constant(
-               &bottom_controls.topAnchor(),
-               -10.0,
-            ),
+         NSLayoutConstraint::activateConstraints(&NSArray::from_slice(&[
+            image_view
+               .topAnchor()
+               .constraintEqualToAnchor_constant(&toolbar.bottomAnchor(), 10.0),
+            image_view
+               .leadingAnchor()
+               .constraintEqualToAnchor_constant(&content_view.leadingAnchor(), 10.0),
+            image_view
+               .trailingAnchor()
+               .constraintEqualToAnchor_constant(&content_view.trailingAnchor(), -10.0),
+            image_view
+               .bottomAnchor()
+               .constraintEqualToAnchor_constant(&bottom_controls.topAnchor(), -10.0),
          ]));
 
          // Bottom controls at bottom
-         NSLayoutConstraint::activateConstraints(&NSArray::from_vec(vec![
-            bottom_controls.leadingAnchor().constraintEqualToAnchor_constant(
-               &content_view.leadingAnchor(),
-               10.0,
-            ),
-            bottom_controls.trailingAnchor().constraintEqualToAnchor_constant(
-               &content_view.trailingAnchor(),
-               -10.0,
-            ),
-            bottom_controls.bottomAnchor().constraintEqualToAnchor_constant(
-               &content_view.bottomAnchor(),
-               -10.0,
-            ),
+         NSLayoutConstraint::activateConstraints(&NSArray::from_slice(&[
+            bottom_controls
+               .leadingAnchor()
+               .constraintEqualToAnchor_constant(&content_view.leadingAnchor(), 10.0),
+            bottom_controls
+               .trailingAnchor()
+               .constraintEqualToAnchor_constant(&content_view.trailingAnchor(), -10.0),
+            bottom_controls
+               .bottomAnchor()
+               .constraintEqualToAnchor_constant(&content_view.bottomAnchor(), -10.0),
             bottom_controls.heightAnchor().constraintEqualToConstant(30.0),
          ]));
 
@@ -359,8 +317,7 @@ impl AppDelegate {
             if let Some(path_str) = path.to_str() {
                unsafe {
                   let ns_path = NSString::from_str(path_str);
-                  if let Some(image) =
-                     NSImage::initWithContentsOfFile(NSImage::alloc(), &ns_path)
+                  if let Some(image) = NSImage::initWithContentsOfFile(NSImage::alloc(), &ns_path)
                   {
                      image_view.setImage(Some(&image));
                   }
