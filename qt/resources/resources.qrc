@@ -1,0 +1,7 @@
+<!DOCTYPE RCC>
+<RCC version="1.0">
+   <qresource prefix="/">
+      <!-- Add resource files here as needed -->
+      <!-- <file>icons/app-icon.png</file> -->
+   </qresource>
+</RCC>

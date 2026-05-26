@@ -1,0 +1,75 @@
+Language: Cpp
+BasedOnStyle: Google
+
+# Indentation: 3 spaces
+IndentWidth: 3
+TabWidth: 3
+UseTab: Never
+ContinuationIndentWidth: 3
+ConstructorInitializerIndentWidth: 3
+AccessModifierOffset: -3
+
+# Pointer alignment: left (int* ptr)
+PointerAlignment: Left
+ReferenceAlignment: Left
+SpaceAroundPointerQualifiers: Default
+
+# Line width
+ColumnLimit: 100
+
+# Braces
+BreakBeforeBraces: Attach
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+AllowShortBlocksOnASingleLine: Empty
+
+# Namespaces
+NamespaceIndentation: None
+CompactNamespaces: false
+FixNamespaceComments: true
+
+# Includes
+SortIncludes: CaseInsensitive
+IncludeBlocks: Regroup
+IncludeCategories:
+  - Regex: '^<Q'
+    Priority: 2
+  - Regex: '^<'
+    Priority: 3
+  - Regex: '.*'
+    Priority: 1
+
+# Other
+Cpp11BracedListStyle: true
+IndentCaseLabels: false
+SpaceBeforeParens: ControlStatements
+SpaceInEmptyBlock: false
+SpacesInAngles: Never
+SpacesInContainerLiterals: false
+SpacesInParentheses: false
+SpacesInSquareBrackets: false
+
+# Alignment
+AlignAfterOpenBracket: Align
+AlignConsecutiveAssignments: false
+AlignConsecutiveDeclarations: false
+AlignEscapedNewlines: Left
+AlignOperands: Align
+AlignTrailingComments: true
+
+# Break
+BreakBeforeBinaryOperators: None
+BreakBeforeTernaryOperators: true
+BreakConstructorInitializers: BeforeColon
+BreakInheritanceList: BeforeColon
+BreakStringLiterals: true
+
+# Penalty (discourage certain breaks)
+PenaltyBreakAssignment: 2
+PenaltyBreakBeforeFirstCallParameter: 1
+PenaltyBreakComment: 300
+PenaltyBreakFirstLessLess: 120
+PenaltyBreakString: 1000
+PenaltyExcessCharacter: 1000000
+PenaltyReturnTypeOnItsOwnLine: 200
