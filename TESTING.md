@@ -6,9 +6,18 @@ This document describes the comprehensive test suite for the timelapse-app.
 
 The project includes extensive test coverage for both frontend (React/TypeScript) and backend (Rust) code:
 
-- **Frontend Tests**: 34 tests covering React components and hooks
-- **Rust Tests**: 23 tests covering core functionality and Tauri commands
-- **Total Coverage**: 57 tests across the application
+- **Frontend Tests**: 43 tests covering React components and hooks
+- **Rust Tests**: 33 tests covering core functionality and Tauri commands
+- **Total Coverage**: 76 tests across the application
+
+Both suites are hermetic. Every Rust test builds its `Photographer` through
+`Photographer::new_in` against a `TempDir`, so no test reads or writes a real
+library and none captures the screen. This holds in **both** profiles — worth
+stating explicitly, because `cargo test --release` turns `debug_assertions` off,
+which flips `TIMELAPSE_DIR_NAME` from `Timelapse_dev` to the production
+`Timelapse`; any test that called `Photographer::new()` would open the real
+database. Verified by running both profiles with `HOME` pointed at an empty
+directory and confirming nothing is created inside it.
 
 ## Frontend Tests
 
@@ -41,13 +50,13 @@ Tests for custom React hooks that handle file system operations:
 **useVideos hook:**
 - ✓ Loads video files (.mov) successfully
 - ✓ Only includes .mov files (filters other formats)
-- ✓ Sorts videos in reverse order (most recent first)
+- ✓ Sorts videos chronologically (oldest first)
 - ✓ Handles errors when loading videos
 - ✓ Refreshes videos when requested
 - ✓ Clears errors on successful refresh
 - ✓ Filters out directories
 
-#### `src/App.test.tsx` (16 tests)
+#### `src/App.test.tsx` (23 tests)
 Tests for the main App component:
 
 **Error Handling:**
@@ -70,6 +79,15 @@ Tests for the main App component:
 - ✓ Loads image when folder and files are available
 - ✓ Handles image loading errors gracefully
 
+**Video Loading:**
+- ✓ Extracts frames and renders the first frame
+- ✓ Shows loading state while frames are being extracted
+- ✓ Handles frame extraction errors
+- ✓ Handles frame read errors
+- ✓ Cleans up blob URL when switching videos
+- ✓ Cleans up blob URL when switching away from video mode
+- ✓ Shows frame count and an enabled scrubber
+
 **Blob URL Cleanup:**
 - ✓ Revokes blob URLs on cleanup (prevents memory leaks)
 
@@ -84,20 +102,29 @@ Tests for the main App component:
 - ✓ Handles empty folders list
 - ✓ Handles empty files list
 
+#### `src/timelapseRoot.test.ts` (2 tests)
+Guards the library-root contract:
+- ✓ Throws rather than guessing when the root is unresolved
+- ✓ Takes the root from Rust, not from the bundler environment
+
+Note: `src/test/setup.ts` pins the root to `Timelapse_test_root` — deliberately
+neither production name — so any path built from a hardcoded `"Timelapse"`
+literal fails the suite instead of passing silently.
+
 ### Running Frontend Tests
 
 ```bash
 # Run tests in watch mode (interactive)
-yarn test
+bun run test
 
 # Run tests once (CI mode)
-yarn test:run
+bun run test:run
 
 # Run tests with UI
-yarn test:ui
+bun run test:ui
 
 # Run tests with coverage report
-yarn test:coverage
+bun run test:coverage
 ```
 
 ## Rust Tests
@@ -109,7 +136,7 @@ yarn test:coverage
 
 ### Test Files
 
-#### `src-tauri/src/timelapse.rs` (13 tests)
+#### `src-tauri/src/timelapse.rs` (15 tests)
 Tests for core timelapse functionality:
 
 **Photographer struct:**
@@ -135,8 +162,14 @@ Tests for core timelapse functionality:
 - ✓ Error messages display correctly
 - ✓ ErrorLogEntry serializes/deserializes properly
 
-#### `src-tauri/src/lib.rs` (10 tests)
-Tests for Tauri commands:
+#### `src-tauri/src/paths.rs` (1 test)
+- ✓ The library directory name tracks the build profile
+
+#### `src-tauri/src/lib.rs` (12 tests)
+Tests for the Tauri command implementations. `tauri::State` wraps a private
+reference and has no public constructor, so each state-backed command is a thin
+shim over a `*_impl` function that takes `&PhotographerState`; the tests drive
+those directly.
 
 **greet command:**
 - ✓ Returns correct greeting message
@@ -159,6 +192,10 @@ Tests for Tauri commands:
 **clear_error_logs command:**
 - ✓ Clears logs successfully
 - ✓ Returns error when not running
+
+**get_screenshot_metadata command:**
+- ✓ Returns error when not running
+- ✓ Returns None for a frame that was never captured
 
 ### Running Rust Tests
 
@@ -230,7 +267,7 @@ To run all tests in CI:
 
 ```bash
 # Frontend tests
-yarn test:run
+bun run test:run
 
 # Rust tests
 cd src-tauri && cargo test --release
@@ -256,7 +293,7 @@ When adding new features:
 ## Troubleshooting
 
 ### Frontend Tests
-- If tests fail with "module not found", run `yarn install`
+- If tests fail with "module not found", run `bun install`
 - For timeout errors, increase timeout in test configuration
 - Clear node_modules and reinstall if seeing weird behavior
 

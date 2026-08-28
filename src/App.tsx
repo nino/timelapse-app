@@ -5,6 +5,7 @@ import React from "react";
 
 import "./App.css";
 import { useFiles, useFolders, useVideos } from "./hooks/useFolders";
+import { timelapseRoot } from "./timelapseRoot";
 
 type ViewMode = "images" | "videos";
 
@@ -153,7 +154,7 @@ export function App(): React.ReactNode {
         }
 
         try {
-          const imagePath = `Timelapse/${selectedFolder}/${files[currentImageIndex]}`;
+          const imagePath = `${timelapseRoot()}/${selectedFolder}/${files[currentImageIndex]}`;
           console.log("Loading image from path:", imagePath);
 
           const imageData = await readFile(imagePath, {
@@ -179,7 +180,7 @@ export function App(): React.ReactNode {
         }
 
         try {
-          const framePath = `Timelapse/.cache/${videoCacheFolder}/${videoFiles[currentImageIndex]}`;
+          const framePath = `${timelapseRoot()}/.cache/${videoCacheFolder}/${videoFiles[currentImageIndex]}`;
           console.log("Loading video frame from path:", framePath);
 
           const frameData = await readFile(framePath, {
