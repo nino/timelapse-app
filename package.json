@@ -17,16 +17,13 @@
     "version:bump": "bun scripts/bump-version.ts"
   },
   "dependencies": {
-    "@tanstack/react-virtual": "^3.14.10",
     "@tauri-apps/api": "^2.11.1",
     "@tauri-apps/plugin-fs": "^2.5.1",
     "@tauri-apps/plugin-opener": "^2.5.4",
     "react": "^19.2.8",
-    "react-dom": "^19.2.8",
-    "react-window": "^2.3.0"
+    "react-dom": "^19.2.8"
   },
   "devDependencies": {
-    "@tailwindcss/postcss": "^4.3.3",
     "@tailwindcss/vite": "^4.3.3",
     "@tauri-apps/cli": "^2.11.4",
     "@testing-library/dom": "^10.4.1",
@@ -36,16 +33,10 @@
     "@types/react": "^19.2.18",
     "@types/react-dom": "^19.2.5",
     "@vitejs/plugin-react": "^6.1.1",
-    "@vitest/browser": "^4.1.11",
     "@vitest/coverage-v8": "^4.1.11",
     "@vitest/ui": "^4.1.11",
-    "autoprefixer": "^10.5.4",
     "happy-dom": "^20.11.12",
-    "jsdom": "^30.0.1",
     "oxlint": "^1.80.0",
-    "playwright": "^1.62.1",
-    "postcss": "^8.5.26",
-    "postcss-nesting": "^14.0.1",
     "tailwindcss": "^4.3.3",
     "typescript": "^7.0.2",
     "vite": "^8.2.2",
