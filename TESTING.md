@@ -6,9 +6,8 @@ This document describes the comprehensive test suite for the timelapse-app.
 
 The project includes extensive test coverage for both frontend (React/TypeScript) and backend (Rust) code:
 
-- **Frontend Tests**: 43 tests covering React components and hooks
-- **Rust Tests**: 33 tests covering core functionality and Tauri commands
-- **Total Coverage**: 76 tests across the application
+- **Frontend Tests**: React components and hooks
+- **Rust Tests**: core functionality and Tauri commands
 
 Both suites are hermetic. Every Rust test builds its `Photographer` through
 `Photographer::new_in` against a `TempDir`, so no test reads or writes a real
@@ -29,7 +28,7 @@ directory and confirming nothing is created inside it.
 
 ### Test Files
 
-#### `src/hooks/useFolders.test.ts` (18 tests)
+#### `src/hooks/useFolders.test.ts`
 Tests for custom React hooks that handle file system operations:
 
 **useFolders hook:**
@@ -56,7 +55,7 @@ Tests for custom React hooks that handle file system operations:
 - ✓ Clears errors on successful refresh
 - ✓ Filters out directories
 
-#### `src/App.test.tsx` (23 tests)
+#### `src/App.test.tsx`
 Tests for the main App component:
 
 **Error Handling:**
@@ -102,7 +101,7 @@ Tests for the main App component:
 - ✓ Handles empty folders list
 - ✓ Handles empty files list
 
-#### `src/timelapseRoot.test.ts` (2 tests)
+#### `src/timelapseRoot.test.ts`
 Guards the library-root contract:
 - ✓ Throws rather than guessing when the root is unresolved
 - ✓ Takes the root from Rust, not from the bundler environment
@@ -136,7 +135,7 @@ bun run test:coverage
 
 ### Test Files
 
-#### `src-tauri/src/timelapse.rs` (15 tests)
+#### `src-tauri/src/timelapse.rs`
 Tests for core timelapse functionality:
 
 **Photographer struct:**
@@ -162,14 +161,16 @@ Tests for core timelapse functionality:
 - ✓ Error messages display correctly
 - ✓ ErrorLogEntry serializes/deserializes properly
 
-#### `src-tauri/src/paths.rs` (1 test)
+#### `src-tauri/src/paths.rs`
 - ✓ The library directory name tracks the build profile
 
-#### `src-tauri/src/lib.rs` (12 tests)
+#### `src-tauri/src/lib.rs`
 Tests for the Tauri command implementations. `tauri::State` wraps a private
 reference and has no public constructor, so each state-backed command is a thin
 shim over a `*_impl` function that takes `&PhotographerState`; the tests drive
-those directly.
+those directly. `evict_old_cache` and `extract_video_frames` are split the same
+way for a different reason — theirs take the library root as a `&Path`, so the
+tests can aim them at a `TempDir` instead of `$HOME`.
 
 **greet command:**
 - ✓ Returns correct greeting message
@@ -196,6 +197,27 @@ those directly.
 **get_screenshot_metadata command:**
 - ✓ Returns error when not running
 - ✓ Returns None for a frame that was never captured
+
+**evict_old_cache command:** (the only `remove_dir_all` in the app)
+- ✓ Removes a cache folder older than 15 days
+- ✓ Keeps a cache folder younger than 15 days
+- ✓ Puts the cutoff at 15 days, checked an hour either side
+- ✓ Skips plain files — only directories are ever removed
+- ✓ Counts only the folders it actually removed
+- ✓ Reports "does not exist" rather than erroring when there is no cache dir
+- ✓ Never reaches outside `.cache`, even for an equally old day folder
+
+Ages are stamped onto the directories with `File::set_times` rather than waited
+for, so these tests neither sleep nor depend on when they run.
+
+**extract_video_frames command:**
+- ✓ Reuses a populated cache folder without invoking ffmpeg
+- ✓ Treats an *empty* cache folder as a miss, not a hit
+- ✓ Creates the cache folder before invoking ffmpeg
+
+Only the first of these needs the cache-hit branch; the other two fall through
+to ffmpeg and assert on the failure, which holds whether or not ffmpeg is
+installed.
 
 ### Running Rust Tests
 
@@ -236,16 +258,6 @@ export default defineConfig({
 - Extends Vitest expect with jest-dom matchers
 - Mocks URL.createObjectURL and URL.revokeObjectURL
 - Automatic cleanup after each test
-
-## Test Coverage Summary
-
-| Area | Files | Tests | Coverage |
-|------|-------|-------|----------|
-| React Hooks | 1 | 18 | ✓ Comprehensive |
-| React Components | 1 | 16 | ✓ Comprehensive |
-| Rust Core Logic | 1 | 13 | ✓ Comprehensive |
-| Rust Tauri Commands | 1 | 10 | ✓ Comprehensive |
-| **Total** | **4** | **57** | **✓ Comprehensive** |
 
 ## Key Testing Patterns
 

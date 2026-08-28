@@ -2,6 +2,7 @@ mod timelapse;
 mod database;
 mod paths;
 
+use std::path::Path;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use tauri::{Manager, State};
@@ -128,13 +129,17 @@ async fn clear_error_logs(state: State<'_, PhotographerState>) -> Result<String,
     clear_error_logs_impl(state.inner())
 }
 
-#[tauri::command]
-async fn extract_video_frames(video_filename: String) -> Result<String, String> {
-    let timelapse_root = paths::timelapse_root().ok_or("Unable to find home directory")?;
-    let source_path = timelapse_root.join(&video_filename);
+/// Extract the frames of `<root>/<video_filename>` into
+/// `<root>/.cache/<basename>/`, and return that cache folder's name — the
+/// frontend reads the JPEGs out of it directly.
+///
+/// Takes the library root instead of resolving it so tests can aim it at a
+/// `TempDir`; the command below passes the real one.
+fn extract_video_frames_impl(root: &Path, video_filename: &str) -> Result<String, String> {
+    let source_path = root.join(video_filename);
 
     // Create cache directory if it doesn't exist
-    let cache_dir = timelapse_root.join(".cache");
+    let cache_dir = root.join(".cache");
     std::fs::create_dir_all(&cache_dir).map_err(|e| format!("Failed to create cache directory: {}", e))?;
 
     // Generate cache folder name (remove .mov extension)
@@ -184,6 +189,12 @@ async fn extract_video_frames(video_filename: String) -> Result<String, String> 
 }
 
 #[tauri::command]
+async fn extract_video_frames(video_filename: String) -> Result<String, String> {
+    let timelapse_root = paths::timelapse_root().ok_or("Unable to find home directory")?;
+    extract_video_frames_impl(&timelapse_root, &video_filename)
+}
+
+#[tauri::command]
 async fn get_screenshot_metadata(
     state: State<'_, PhotographerState>,
     frame_number: u32,
@@ -191,10 +202,14 @@ async fn get_screenshot_metadata(
     get_screenshot_metadata_impl(state.inner(), frame_number)
 }
 
-#[tauri::command]
-async fn evict_old_cache() -> Result<String, String> {
-    let timelapse_root = paths::timelapse_root().ok_or("Unable to find home directory")?;
-    let cache_dir = timelapse_root.join(".cache");
+/// Delete every directory directly under `<root>/.cache` whose mtime is more
+/// than 15 days old, and report how many went.
+///
+/// This is the only `remove_dir_all` in the app, so it takes the library root
+/// as an argument: that is what lets the tests exercise it against a `TempDir`
+/// instead of the real library.
+fn evict_old_cache_impl(root: &Path) -> Result<String, String> {
+    let cache_dir = root.join(".cache");
 
     if !cache_dir.exists() {
         return Ok("Cache directory does not exist".to_string());
@@ -235,6 +250,12 @@ async fn evict_old_cache() -> Result<String, String> {
     }
 
     Ok(format!("Removed {} old cache folders", removed_count))
+}
+
+#[tauri::command]
+async fn evict_old_cache() -> Result<String, String> {
+    let timelapse_root = paths::timelapse_root().ok_or("Unable to find home directory")?;
+    evict_old_cache_impl(&timelapse_root)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -307,7 +328,12 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::{self, File, FileTimes};
+    use std::path::PathBuf;
+    use std::time::{Duration, SystemTime};
     use tempfile::TempDir;
+
+    const DAY: Duration = Duration::from_secs(24 * 60 * 60);
 
     /// A photographer rooted in a temp dir, so nothing here reads or writes the
     /// real `~/Timelapse`. The `TempDir` is returned so the caller keeps it
@@ -465,5 +491,188 @@ mod tests {
         let result = get_screenshot_metadata_impl(&state, 1);
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
+    }
+
+    /// A temp library root with an empty `.cache` inside it. The `TempDir` is
+    /// returned so the caller keeps it alive for the duration of the test.
+    fn temp_library() -> (TempDir, PathBuf) {
+        let temp_dir = TempDir::new().unwrap();
+        let cache_dir = temp_dir.path().join(".cache");
+        fs::create_dir_all(&cache_dir).unwrap();
+        (temp_dir, cache_dir)
+    }
+
+    /// A cache folder holding one file, aged to `mtime_age`.
+    ///
+    /// Order matters: writing the file bumps the directory's mtime, so the
+    /// backdating has to come last.
+    fn cache_folder(cache_dir: &Path, name: &str, mtime_age: Duration) -> PathBuf {
+        let path = cache_dir.join(name);
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("frame000001.jpg"), b"not really a jpeg").unwrap();
+        set_age(&path, mtime_age);
+        path
+    }
+
+    /// Backdate `path`'s mtime by `age`. Eviction compares mtime against the
+    /// clock, so stamping it explicitly is what keeps these tests off the
+    /// wall-clock — no sleeping, and no dependence on when they run.
+    fn set_age(path: &Path, age: Duration) {
+        let when = SystemTime::now() - age;
+        File::open(path)
+            .unwrap()
+            .set_times(FileTimes::new().set_modified(when))
+            .unwrap();
+    }
+
+    #[test]
+    fn test_evict_old_cache_removes_stale_folder() {
+        let (temp_dir, cache_dir) = temp_library();
+        let stale = cache_folder(&cache_dir, "2020-01-01", 30 * DAY);
+
+        let result = evict_old_cache_impl(temp_dir.path());
+
+        assert_eq!(result.unwrap(), "Removed 1 old cache folders");
+        assert!(!stale.exists(), "a 30-day-old cache folder should be gone");
+    }
+
+    #[test]
+    fn test_evict_old_cache_keeps_recent_folder() {
+        let (temp_dir, cache_dir) = temp_library();
+        let recent = cache_folder(&cache_dir, "2026-08-01", 14 * DAY);
+
+        let result = evict_old_cache_impl(temp_dir.path());
+
+        assert_eq!(result.unwrap(), "Removed 0 old cache folders");
+        assert!(recent.exists(), "a 14-day-old cache folder should survive");
+        assert!(recent.join("frame000001.jpg").exists());
+    }
+
+    // The cutoff is `age > 15 days`. Both folders here sit an hour away from it
+    // so the outcome cannot hinge on how long the test itself takes to run.
+    #[test]
+    fn test_evict_old_cache_cutoff_is_fifteen_days() {
+        let (temp_dir, cache_dir) = temp_library();
+        let just_inside = cache_folder(&cache_dir, "inside", 15 * DAY - Duration::from_secs(3600));
+        let just_outside = cache_folder(&cache_dir, "outside", 15 * DAY + Duration::from_secs(3600));
+
+        let result = evict_old_cache_impl(temp_dir.path());
+
+        assert_eq!(result.unwrap(), "Removed 1 old cache folders");
+        assert!(just_inside.exists(), "14d23h is inside the window");
+        assert!(!just_outside.exists(), "15d1h is outside the window");
+    }
+
+    #[test]
+    fn test_evict_old_cache_skips_plain_files() {
+        let (temp_dir, cache_dir) = temp_library();
+        let loose_file = cache_dir.join("stale-note.txt");
+        fs::write(&loose_file, b"old, but not a directory").unwrap();
+        set_age(&loose_file, 30 * DAY);
+
+        let result = evict_old_cache_impl(temp_dir.path());
+
+        assert_eq!(result.unwrap(), "Removed 0 old cache folders");
+        assert!(loose_file.exists(), "eviction only ever removes directories");
+    }
+
+    #[test]
+    fn test_evict_old_cache_counts_only_what_it_removed() {
+        let (temp_dir, cache_dir) = temp_library();
+        let stale_a = cache_folder(&cache_dir, "stale-a", 20 * DAY);
+        let stale_b = cache_folder(&cache_dir, "stale-b", 90 * DAY);
+        let fresh = cache_folder(&cache_dir, "fresh", Duration::from_secs(60));
+        let loose_file = cache_dir.join("stale-note.txt");
+        fs::write(&loose_file, b"old, but not a directory").unwrap();
+        set_age(&loose_file, 30 * DAY);
+
+        let result = evict_old_cache_impl(temp_dir.path());
+
+        assert_eq!(result.unwrap(), "Removed 2 old cache folders");
+        assert!(!stale_a.exists());
+        assert!(!stale_b.exists());
+        assert!(fresh.exists());
+        assert!(loose_file.exists());
+    }
+
+    #[test]
+    fn test_evict_old_cache_without_cache_dir() {
+        // A library that has never had frames extracted from it.
+        let temp_dir = TempDir::new().unwrap();
+
+        let result = evict_old_cache_impl(temp_dir.path());
+
+        assert_eq!(result.unwrap(), "Cache directory does not exist");
+    }
+
+    #[test]
+    fn test_evict_old_cache_leaves_the_rest_of_the_library_alone() {
+        let (temp_dir, cache_dir) = temp_library();
+        cache_folder(&cache_dir, "stale", 30 * DAY);
+
+        // A day of screenshots, as old as the cache folder next to it.
+        let day_dir = temp_dir.path().join("2020-01-01");
+        fs::create_dir_all(&day_dir).unwrap();
+        fs::write(day_dir.join("00001.png"), b"screenshot").unwrap();
+        set_age(&day_dir, 30 * DAY);
+
+        evict_old_cache_impl(temp_dir.path()).unwrap();
+
+        assert!(
+            day_dir.join("00001.png").exists(),
+            "eviction must never reach outside .cache"
+        );
+    }
+
+    #[test]
+    fn test_extract_video_frames_reuses_populated_cache() {
+        let (temp_dir, cache_dir) = temp_library();
+        let cached = cache_dir.join("2026-08-27");
+        fs::create_dir_all(&cached).unwrap();
+        fs::write(cached.join("frame000001.jpg"), b"already extracted").unwrap();
+
+        // No such video exists, and ffmpeg may not be installed — reaching
+        // either would fail, so an Ok here is proof the cache branch was taken.
+        let result = extract_video_frames_impl(temp_dir.path(), "2026-08-27.mov");
+
+        assert_eq!(result.unwrap(), "2026-08-27");
+        assert_eq!(
+            fs::read(cached.join("frame000001.jpg")).unwrap(),
+            b"already extracted",
+            "the cached frames should be left untouched"
+        );
+        assert_eq!(
+            fs::read_dir(&cached).unwrap().count(),
+            1,
+            "no new frames should have been written"
+        );
+    }
+
+    // The mirror of the test above: an *empty* cache folder is not a hit, so
+    // this falls through to ffmpeg and fails there — either because ffmpeg is
+    // missing, or because it is present and the source video is not.
+    #[test]
+    fn test_extract_video_frames_empty_cache_folder_is_not_a_hit() {
+        let (temp_dir, cache_dir) = temp_library();
+        let empty = cache_dir.join("2026-08-27");
+        fs::create_dir_all(&empty).unwrap();
+
+        let result = extract_video_frames_impl(temp_dir.path(), "2026-08-27.mov");
+
+        assert!(result.is_err(), "an empty cache folder must not count as cached");
+    }
+
+    #[test]
+    fn test_extract_video_frames_creates_cache_dir_when_missing() {
+        // No `.cache` at all, and no video to extract.
+        let temp_dir = TempDir::new().unwrap();
+
+        let result = extract_video_frames_impl(temp_dir.path(), "2026-08-27.mov");
+
+        assert!(result.is_err(), "there is no source video to extract");
+        assert!(
+            temp_dir.path().join(".cache").join("2026-08-27").is_dir(),
+            "the cache folder should have been created before ffmpeg ran"
+        );
     }
 }
