@@ -2311,9 +2311,9 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
 name = "magick_rust"
-version = "1.1.0"
+version = "2.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b942012967e60a15c7400a09f786aeac0a5f6d9109f990693b87a84371a28ad6"
+checksum = "e2cfa487056882d926629b5f617bae837cc35338b2a8f63d9f751752e71e169b"
 dependencies = [
  "bindgen 0.72.1",
  "libc",
