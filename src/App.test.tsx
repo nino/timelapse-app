@@ -374,8 +374,8 @@ describe('App', () => {
       });
 
       // Make readFile take a long time so we can see the loading state
-      let resolveRead: (value: Uint8Array) => void;
-      const readPromise = new Promise<Uint8Array>(resolve => {
+      let resolveRead: (value: Uint8Array<ArrayBuffer>) => void;
+      const readPromise = new Promise<Uint8Array<ArrayBuffer>>(resolve => {
         resolveRead = resolve;
       });
       vi.mocked(readFile).mockReturnValue(readPromise);

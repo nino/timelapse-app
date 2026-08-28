@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { renderHook, waitFor } from '@testing-library/react';
 import { useFolders, useFiles, useVideos } from './useFolders';
 import { BaseDirectory } from '@tauri-apps/api/path';
+import type { DirEntry } from '@tauri-apps/plugin-fs';
 
 // Mock the Tauri plugin
 vi.mock('@tauri-apps/plugin-fs', () => ({
@@ -9,6 +10,13 @@ vi.mock('@tauri-apps/plugin-fs', () => ({
 }));
 
 const { readDir } = await import('@tauri-apps/plugin-fs');
+
+// Test fixtures omit isSymlink; fill it in so mocks satisfy DirEntry without casting.
+type MockDirEntry = Omit<DirEntry, 'isSymlink'>;
+
+function dirEntries(entries: Array<MockDirEntry>): Array<DirEntry> {
+  return entries.map((entry) => ({ ...entry, isSymlink: false }));
+}
 
 describe('useFolders', () => {
   beforeEach(() => {
@@ -22,7 +30,7 @@ describe('useFolders', () => {
       { name: 'video.mov', isDirectory: false, isFile: true },
     ];
 
-    vi.mocked(readDir).mockResolvedValue(mockFolders as any);
+    vi.mocked(readDir).mockResolvedValue(dirEntries(mockFolders));
 
     const { result } = renderHook(() => useFolders());
 
@@ -56,7 +64,7 @@ describe('useFolders', () => {
       { name: 'folder2', isDirectory: true, isFile: false },
     ];
 
-    vi.mocked(readDir).mockResolvedValue(mockEntries as any);
+    vi.mocked(readDir).mockResolvedValue(dirEntries(mockEntries));
 
     const { result } = renderHook(() => useFolders());
 
@@ -74,7 +82,7 @@ describe('useFolders', () => {
       { name: 'folder2', isDirectory: true, isFile: false },
     ];
 
-    vi.mocked(readDir).mockResolvedValueOnce(initialFolders as any);
+    vi.mocked(readDir).mockResolvedValueOnce(dirEntries(initialFolders));
 
     const { result } = renderHook(() => useFolders());
 
@@ -82,7 +90,7 @@ describe('useFolders', () => {
       expect(result.current.folders).toEqual(['folder1']);
     });
 
-    vi.mocked(readDir).mockResolvedValueOnce(updatedFolders as any);
+    vi.mocked(readDir).mockResolvedValueOnce(dirEntries(updatedFolders));
     result.current.refreshFolders();
 
     await waitFor(() => {
@@ -105,7 +113,7 @@ describe('useFolders', () => {
     const successFolders = [
       { name: 'folder1', isDirectory: true, isFile: false },
     ];
-    vi.mocked(readDir).mockResolvedValueOnce(successFolders as any);
+    vi.mocked(readDir).mockResolvedValueOnce(dirEntries(successFolders));
     result.current.refreshFolders();
 
     await waitFor(() => {
@@ -128,7 +136,7 @@ describe('useFiles', () => {
       { name: 'subfolder', isDirectory: true, isFile: false },
     ];
 
-    vi.mocked(readDir).mockResolvedValue(mockFiles as any);
+    vi.mocked(readDir).mockResolvedValue(dirEntries(mockFiles));
 
     const { result } = renderHook(() => useFiles('2025-01-15'));
 
@@ -177,7 +185,7 @@ describe('useFiles', () => {
       { name: 'file2.png', isDirectory: false, isFile: true },
     ];
 
-    vi.mocked(readDir).mockResolvedValue(mockEntries as any);
+    vi.mocked(readDir).mockResolvedValue(dirEntries(mockEntries));
 
     const { result } = renderHook(() => useFiles('test-folder'));
 
@@ -194,7 +202,7 @@ describe('useFiles', () => {
       { name: 'file2.png', isDirectory: false, isFile: true },
     ];
 
-    vi.mocked(readDir).mockResolvedValueOnce(folder1Files as any);
+    vi.mocked(readDir).mockResolvedValueOnce(dirEntries(folder1Files));
 
     const { result, rerender } = renderHook(
       ({ folder }) => useFiles(folder),
@@ -205,7 +213,7 @@ describe('useFiles', () => {
       expect(result.current.files).toEqual(['file1.png']);
     });
 
-    vi.mocked(readDir).mockResolvedValueOnce(folder2Files as any);
+    vi.mocked(readDir).mockResolvedValueOnce(dirEntries(folder2Files));
     rerender({ folder: 'folder2' });
 
     await waitFor(() => {
@@ -228,7 +236,7 @@ describe('useFiles', () => {
       { name: 'm.png', isDirectory: false, isFile: true },
     ];
 
-    vi.mocked(readDir).mockResolvedValue(mockFiles as any);
+    vi.mocked(readDir).mockResolvedValue(dirEntries(mockFiles));
 
     const { result } = renderHook(() => useFiles('test'));
 
@@ -251,7 +259,7 @@ describe('useVideos', () => {
       { name: 'image.png', isDirectory: false, isFile: true },
     ];
 
-    vi.mocked(readDir).mockResolvedValue(mockEntries as any);
+    vi.mocked(readDir).mockResolvedValue(dirEntries(mockEntries));
 
     const { result } = renderHook(() => useVideos());
 
@@ -276,7 +284,7 @@ describe('useVideos', () => {
       { name: 'video4.mov', isDirectory: false, isFile: true },
     ];
 
-    vi.mocked(readDir).mockResolvedValue(mockEntries as any);
+    vi.mocked(readDir).mockResolvedValue(dirEntries(mockEntries));
 
     const { result } = renderHook(() => useVideos());
 
@@ -292,7 +300,7 @@ describe('useVideos', () => {
       { name: 'c.mov', isDirectory: false, isFile: true },
     ];
 
-    vi.mocked(readDir).mockResolvedValue(mockEntries as any);
+    vi.mocked(readDir).mockResolvedValue(dirEntries(mockEntries));
 
     const { result } = renderHook(() => useVideos());
 
@@ -323,7 +331,7 @@ describe('useVideos', () => {
       { name: 'video2.mov', isDirectory: false, isFile: true },
     ];
 
-    vi.mocked(readDir).mockResolvedValueOnce(initialVideos as any);
+    vi.mocked(readDir).mockResolvedValueOnce(dirEntries(initialVideos));
 
     const { result } = renderHook(() => useVideos());
 
@@ -331,7 +339,7 @@ describe('useVideos', () => {
       expect(result.current.videos).toEqual(['video1.mov']);
     });
 
-    vi.mocked(readDir).mockResolvedValueOnce(updatedVideos as any);
+    vi.mocked(readDir).mockResolvedValueOnce(dirEntries(updatedVideos));
     result.current.refreshVideos();
 
     await waitFor(() => {
@@ -354,7 +362,7 @@ describe('useVideos', () => {
     const successVideos = [
       { name: 'video.mov', isDirectory: false, isFile: true },
     ];
-    vi.mocked(readDir).mockResolvedValueOnce(successVideos as any);
+    vi.mocked(readDir).mockResolvedValueOnce(dirEntries(successVideos));
     result.current.refreshVideos();
 
     await waitFor(() => {
@@ -369,7 +377,7 @@ describe('useVideos', () => {
       { name: 'folder.mov', isDirectory: true, isFile: false },
     ];
 
-    vi.mocked(readDir).mockResolvedValue(mockEntries as any);
+    vi.mocked(readDir).mockResolvedValue(dirEntries(mockEntries));
 
     const { result } = renderHook(() => useVideos());
 

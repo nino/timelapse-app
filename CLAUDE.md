@@ -8,17 +8,21 @@ A Tauri 2 desktop app (macOS-focused) that runs a background "photographer" loop
 
 ## Commands
 
+**The package manager is [Bun](https://bun.sh)** — `bun install`, `bun.lock`. Don't use yarn or npm; there is no `yarn.lock` and `package-lock.json` should never be committed.
+
 Frontend / build:
-- `yarn dev` — Vite dev server on port 1420 (Tauri's `beforeDevCommand`)
-- `yarn build` — `tsc && vite build` (produces `dist/` consumed by Tauri)
-- `yarn tauri dev` / `yarn tauri build` — run/bundle the desktop app
-- `yarn lint` / `yarn lint:fix` — ESLint over `.ts`/`.tsx` (Rust dir is ignored)
-- `yarn version:bump [major|minor|patch]` — updates **both** `package.json` and `src-tauri/tauri.conf.json` in lockstep; always use this rather than editing versions by hand
+- `bun run dev` — Vite dev server on port 1420 (Tauri's `beforeDevCommand`)
+- `bun run build` — `tsc && vite build` (produces `dist/` consumed by Tauri)
+- `bun run tauri dev` / `bun run tauri build` — run/bundle the desktop app
+- `bun run lint` / `bun run lint:fix` — oxlint over `.ts`/`.tsx` (Rust dir is ignored)
+- `bun run version:bump [major|minor|patch]` — updates **both** `package.json` and `src-tauri/tauri.conf.json` in lockstep; always use this rather than editing versions by hand. Bun runs the TypeScript file directly, so there is no `tsx`/`ts-node` step.
 
 Tests:
-- `yarn test` (watch) / `yarn test:run` (CI) / `yarn test:ui` / `yarn test:coverage` — Vitest with happy-dom; Tauri APIs are mocked in tests
+- `bun run test` (watch) / `bun run test:run` (CI) / `bun run test:ui` / `bun run test:coverage` — Vitest with happy-dom; Tauri APIs are mocked in tests
 - `cd src-tauri && cargo test` — Rust unit + Tauri command tests (uses `tempfile` for filesystem isolation)
 - Single Rust test: `cargo test <test_name>` from `src-tauri/`
+
+Note: the scripts run Vitest/Vite/oxlint under **Node**, not the Bun runtime — Bun is the package manager and script runner here. `bun run test:run` is not the same thing as `bun test` (Bun's own test runner), which this project does not use.
 
 ## Architecture
 
@@ -38,14 +42,15 @@ Tests:
 
 **Tauri ↔ frontend trust boundary.** The `fs` plugin's scope (`capabilities/default.json`) only permits `$HOME/Timelapse` up to two levels deep. If you add a new path the frontend needs to read, extend the `fs:scope` allow-list — otherwise `readFile`/`readDir` will fail at runtime, not at build time.
 
-## Conventions (enforced by ESLint — see `eslint.config.js`)
+## Conventions (enforced by oxlint — see `.oxlintrc.json`)
 
 - `@typescript-eslint/explicit-function-return-type: error` — every function (including arrow callbacks) needs an explicit return type
 - `@typescript-eslint/no-explicit-any: error`
-- `import/no-default-export: error` — use named exports. `vite.config.ts`, `vitest.config.ts`, and `eslint.config.js` are the only files with `// eslint-disable-next-line` for the default export they require.
-- `import/order` with alphabetised groups and blank lines between groups
-- `no-console: warn` with `warn`/`error` allowed (so `console.log` is a lint warning, not silently fine)
-- `src-tauri/**` is in the ESLint ignore list — don't try to lint Rust through yarn.
+- `import/no-default-export: error` — use named exports. `*.config.ts` / `*.config.js` and `scripts/**` are exempted via an `overrides` block (config files must default-export), so they no longer need per-line disable comments.
+- `no-console: warn` with `warn`/`error` allowed (so `console.log` is a lint warning, not silently fine). Off under `scripts/**`, which is CLI output.
+- oxlint's `correctness` category is on as `error`; `react/set-state-in-effect` is demoted to `warn` because the existing hooks trip it (7 sites in `App.tsx`/`useFolders.ts`).
+- `src-tauri/**` is in `ignorePatterns` — don't try to lint Rust through bun.
+- **Not enforced any more:** `import/order` (alphabetised, grouped imports) — oxlint has no equivalent rule. The convention still holds by hand; it is just no longer machine-checked.
 
 ## Things to know before changing behaviour
 

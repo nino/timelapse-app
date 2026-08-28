@@ -88,16 +88,16 @@ Tests for the main App component:
 
 ```bash
 # Run tests in watch mode (interactive)
-yarn test
+bun run test
 
 # Run tests once (CI mode)
-yarn test:run
+bun run test:run
 
 # Run tests with UI
-yarn test:ui
+bun run test:ui
 
 # Run tests with coverage report
-yarn test:coverage
+bun run test:coverage
 ```
 
 ## Rust Tests
@@ -230,7 +230,7 @@ To run all tests in CI:
 
 ```bash
 # Frontend tests
-yarn test:run
+bun run test:run
 
 # Rust tests
 cd src-tauri && cargo test --release
@@ -256,7 +256,7 @@ When adding new features:
 ## Troubleshooting
 
 ### Frontend Tests
-- If tests fail with "module not found", run `yarn install`
+- If tests fail with "module not found", run `bun install`
 - For timeout errors, increase timeout in test configuration
 - Clear node_modules and reinstall if seeing weird behavior
 
