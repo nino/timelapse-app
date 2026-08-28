@@ -3,6 +3,7 @@ import { renderHook, waitFor } from '@testing-library/react';
 import { useFolders, useFiles, useVideos } from './useFolders';
 import { BaseDirectory } from '@tauri-apps/api/path';
 import type { DirEntry } from '@tauri-apps/plugin-fs';
+import { TEST_ROOT } from '../test/setup';
 
 // Mock the Tauri plugin
 vi.mock('@tauri-apps/plugin-fs', () => ({
@@ -39,7 +40,7 @@ describe('useFolders', () => {
     });
 
     expect(result.current.foldersError).toBeNull();
-    expect(readDir).toHaveBeenCalledWith('Timelapse', {
+    expect(readDir).toHaveBeenCalledWith(TEST_ROOT, {
       baseDir: BaseDirectory.Home,
     });
   });
@@ -149,7 +150,7 @@ describe('useFiles', () => {
     });
 
     expect(result.current.filesError).toBeNull();
-    expect(readDir).toHaveBeenCalledWith('Timelapse/2025-01-15', {
+    expect(readDir).toHaveBeenCalledWith(`${TEST_ROOT}/2025-01-15`, {
       baseDir: BaseDirectory.Home,
     });
   });
@@ -171,9 +172,14 @@ describe('useFiles', () => {
 
     const { result } = renderHook(() => useFiles('2025-01-15'));
 
-    await waitFor(() => {
-      expect(result.current.filesError).toEqual(mockError);
-    });
+    // useFiles retries 5 times with a 500ms gap, so the error only surfaces
+    // after ~2s — well past waitFor's 1s default.
+    await waitFor(
+      () => {
+        expect(result.current.filesError).toEqual(mockError);
+      },
+      { timeout: 5000 },
+    );
 
     expect(result.current.files).toEqual([]);
   });
@@ -221,10 +227,10 @@ describe('useFiles', () => {
     });
 
     expect(readDir).toHaveBeenCalledTimes(2);
-    expect(readDir).toHaveBeenNthCalledWith(1, 'Timelapse/folder1', {
+    expect(readDir).toHaveBeenNthCalledWith(1, `${TEST_ROOT}/folder1`, {
       baseDir: BaseDirectory.Home,
     });
-    expect(readDir).toHaveBeenNthCalledWith(2, 'Timelapse/folder2', {
+    expect(readDir).toHaveBeenNthCalledWith(2, `${TEST_ROOT}/folder2`, {
       baseDir: BaseDirectory.Home,
     });
   });
@@ -265,13 +271,13 @@ describe('useVideos', () => {
 
     await waitFor(() => {
       expect(result.current.videos).toEqual([
-        '2025-01-16.mov',
         '2025-01-15.mov',
+        '2025-01-16.mov',
       ]);
     });
 
     expect(result.current.videosError).toBeNull();
-    expect(readDir).toHaveBeenCalledWith('Timelapse', {
+    expect(readDir).toHaveBeenCalledWith(TEST_ROOT, {
       baseDir: BaseDirectory.Home,
     });
   });
@@ -289,11 +295,11 @@ describe('useVideos', () => {
     const { result } = renderHook(() => useVideos());
 
     await waitFor(() => {
-      expect(result.current.videos).toEqual(['video4.mov', 'video1.mov']);
+      expect(result.current.videos).toEqual(['video1.mov', 'video4.mov']);
     });
   });
 
-  it('should sort videos in reverse order (most recent first)', async () => {
+  it('should sort videos chronologically (oldest first)', async () => {
     const mockEntries = [
       { name: 'a.mov', isDirectory: false, isFile: true },
       { name: 'b.mov', isDirectory: false, isFile: true },
@@ -305,7 +311,7 @@ describe('useVideos', () => {
     const { result } = renderHook(() => useVideos());
 
     await waitFor(() => {
-      expect(result.current.videos).toEqual(['c.mov', 'b.mov', 'a.mov']);
+      expect(result.current.videos).toEqual(['a.mov', 'b.mov', 'c.mov']);
     });
   });
 
@@ -343,7 +349,7 @@ describe('useVideos', () => {
     result.current.refreshVideos();
 
     await waitFor(() => {
-      expect(result.current.videos).toEqual(['video2.mov', 'video1.mov']);
+      expect(result.current.videos).toEqual(['video1.mov', 'video2.mov']);
     });
 
     expect(readDir).toHaveBeenCalledTimes(2);

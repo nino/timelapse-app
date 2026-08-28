@@ -2,6 +2,8 @@ import { BaseDirectory } from "@tauri-apps/api/path";
 import { readDir } from "@tauri-apps/plugin-fs";
 import React from "react";
 
+import { timelapseRoot } from "../timelapseRoot";
+
 function ensureError(val: unknown): Error {
   if (val instanceof Error) {
     return val;
@@ -20,7 +22,7 @@ export function useFolders(): {
   const loadFolders = React.useCallback(async (): Promise<void> => {
     try {
       setFoldersError(null);
-      const entries = await readDir("Timelapse", {
+      const entries = await readDir(timelapseRoot(), {
         baseDir: BaseDirectory.Home,
       });
       const folderList = entries
@@ -62,7 +64,7 @@ export function useFiles(folder: string | null): {
 
       for (let attempt = 0; attempt < maxRetries; attempt++) {
         try {
-          const entries = await readDir(`Timelapse/${folder}`, {
+          const entries = await readDir(`${timelapseRoot()}/${folder}`, {
             baseDir: BaseDirectory.Home,
           });
           const fileList = (entries)
@@ -121,7 +123,7 @@ export function useVideos(): {
   const loadVideos = React.useCallback(async (): Promise<void> => {
     try {
       setVideosError(null);
-      const entries = await readDir("Timelapse", {
+      const entries = await readDir(timelapseRoot(), {
         baseDir: BaseDirectory.Home,
       });
       const videoList = entries

@@ -61,12 +61,18 @@ pub struct Photographer {
 
 impl Photographer {
     pub fn new() -> Result<Photographer, Error> {
+        let timelapse_root_path =
+            crate::paths::timelapse_root().ok_or(Error::UnableToFindHomeDir)?;
+
+        Self::new_in(timelapse_root_path)
+    }
+
+    /// Build a photographer rooted at an arbitrary directory instead of
+    /// `~/Timelapse`. Tests use this so they never read or write the real
+    /// screenshot library.
+    pub fn new_in(timelapse_root_path: PathBuf) -> Result<Photographer, Error> {
         // Initialize MagickWand
         init_magick_wand();
-
-        let timelapse_root_path = dirs::home_dir()
-            .ok_or(Error::UnableToFindHomeDir)?
-            .join("Timelapse");
 
         // Create the Timelapse directory if it doesn't exist
         std::fs::create_dir_all(&timelapse_root_path)?;
@@ -442,17 +448,27 @@ mod tests {
 
     #[test]
     fn test_photographer_new() {
-        let photographer = Photographer::new();
+        let temp_dir = TempDir::new().unwrap();
+        let photographer = Photographer::new_in(temp_dir.path().to_path_buf());
         assert!(photographer.is_ok());
 
         let photographer = photographer.unwrap();
         assert!(!photographer.running.load(Ordering::SeqCst));
         assert_eq!(photographer.get_error_logs().len(), 0);
+        // The database is created eagerly under the given root.
+        assert!(temp_dir.path().join("screenshots.db").exists());
     }
 
-    #[test]
-    fn test_photographer_start_stop() {
-        let photographer = Photographer::new().unwrap();
+    // `start` calls `tokio::spawn`, which panics outside a runtime, so this
+    // needs a tokio test. What keeps the spawned capture loop from ever taking
+    // a screenshot is that `stop()` clears the `running` flag *before* this
+    // test reaches any yield point, so the loop's `while running` check fails
+    // the first time it is polled. Adding an `.await` between `start()` and
+    // `stop()` would let it capture the real screen — don't.
+    #[tokio::test]
+    async fn test_photographer_start_stop() {
+        let temp_dir = TempDir::new().unwrap();
+        let photographer = Photographer::new_in(temp_dir.path().to_path_buf()).unwrap();
 
         // Initially should not be running
         assert!(!photographer.running.load(Ordering::SeqCst));
@@ -468,7 +484,8 @@ mod tests {
 
     #[test]
     fn test_photographer_error_logs() {
-        let photographer = Photographer::new().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let photographer = Photographer::new_in(temp_dir.path().to_path_buf()).unwrap();
 
         // Initially should have no error logs
         assert_eq!(photographer.get_error_logs().len(), 0);
@@ -494,7 +511,8 @@ mod tests {
 
     #[test]
     fn test_photographer_error_logs_limit() {
-        let photographer = Photographer::new().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let photographer = Photographer::new_in(temp_dir.path().to_path_buf()).unwrap();
 
         // Add more than 10000 error logs
         {

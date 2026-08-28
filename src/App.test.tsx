@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, waitFor, fireEvent } from '@testing-library/react';
 import { App } from './App';
+import { TEST_ROOT } from './test/setup';
 
 // Mock the hooks
 vi.mock('./hooks/useFolders', () => ({
@@ -20,8 +21,23 @@ vi.mock('@tauri-apps/api/path', () => ({
   },
 }));
 
+vi.mock('@tauri-apps/api/core', () => ({
+  invoke: vi.fn(),
+}));
+
 const { useFolders, useFiles, useVideos } = await import('./hooks/useFolders');
 const { readFile } = await import('@tauri-apps/plugin-fs');
+const { invoke } = await import('@tauri-apps/api/core');
+
+// App calls useFiles twice per render — once for the selected day folder and
+// once for the extracted-frame cache folder — so video tests need the mock to
+// answer per path rather than returning one list for both.
+function mockFilesByFolder(byFolder: Record<string, Array<string>>): void {
+  vi.mocked(useFiles).mockImplementation((folder: string | null) => ({
+    files: folder === null ? [] : (byFolder[folder] ?? []),
+    filesError: null,
+  }));
+}
 
 describe('App', () => {
   beforeEach(() => {
@@ -212,7 +228,8 @@ describe('App', () => {
 
   describe('Video Selection', () => {
     it('should auto-select most recent video when switching to videos mode', async () => {
-      const videos = ['video2.mov', 'video1.mov'];
+      // useVideos returns chronological order, so the last entry is newest.
+      const videos = ['video1.mov', 'video2.mov'];
 
       vi.mocked(useFolders).mockReturnValue({
         folders: [],
@@ -224,12 +241,8 @@ describe('App', () => {
         videosError: null,
         refreshVideos: vi.fn(),
       });
-      vi.mocked(useFiles).mockReturnValue({
-        files: [],
-        filesError: null,
-      });
-
-      vi.mocked(readFile).mockResolvedValue(new Uint8Array([1, 2, 3]));
+      mockFilesByFolder({});
+      vi.mocked(invoke).mockResolvedValue('video2-cache');
 
       render(<App />);
 
@@ -239,10 +252,9 @@ describe('App', () => {
       }
 
       await waitFor(() => {
-        expect(readFile).toHaveBeenCalledWith(
-          'Timelapse/video2.mov',
-          expect.any(Object)
-        );
+        expect(invoke).toHaveBeenCalledWith('extract_video_frames', {
+          videoFilename: 'video2.mov',
+        });
       });
     });
   });
@@ -269,8 +281,13 @@ describe('App', () => {
 
       render(<App />);
 
+      // Assert the whole path, not just that readFile ran: this is what pins
+      // the library root and the "last image is selected first" index reset.
       await waitFor(() => {
-        expect(readFile).toHaveBeenCalled();
+        expect(readFile).toHaveBeenCalledWith(
+          `${TEST_ROOT}/2025-01-15/image2.jpg`,
+          expect.any(Object)
+        );
       });
 
       expect(URL.createObjectURL).toHaveBeenCalled();
@@ -309,11 +326,10 @@ describe('App', () => {
   });
 
   describe('Video Loading', () => {
-    it('should load video and create blob URL', async () => {
-      const mockVideoData = new Uint8Array([10, 20, 30, 40, 50]);
-      const mockBlobUrl = 'blob:mock-video-url';
+    const CACHE = 'test-video-cache';
+    const FRAMES = ['frame0001.jpg', 'frame0002.jpg'];
 
-      vi.mocked(URL.createObjectURL).mockReturnValue(mockBlobUrl);
+    function setupVideosMode(): void {
       vi.mocked(useFolders).mockReturnValue({
         folders: [],
         foldersError: null,
@@ -324,40 +340,48 @@ describe('App', () => {
         videosError: null,
         refreshVideos: vi.fn(),
       });
-      vi.mocked(useFiles).mockReturnValue({
-        files: [],
-        filesError: null,
-      });
-      vi.mocked(readFile).mockResolvedValue(mockVideoData);
+      mockFilesByFolder({ [`.cache/${CACHE}`]: FRAMES });
+      vi.mocked(invoke).mockResolvedValue(CACHE);
+    }
 
-      render(<App />);
-
-      // Switch to videos mode
-      const videosButton = screen.getAllByText(/Videos/i).find(el => el.tagName === 'BUTTON');
+    function clickVideosTab(): void {
+      const videosButton = screen
+        .getAllByText(/Videos/i)
+        .find(el => el.tagName === 'BUTTON');
       if (videosButton) {
         fireEvent.click(videosButton);
       }
+    }
 
-      // Wait for video to load
+    it('should extract frames and render the first frame', async () => {
+      const mockFrameData = new Uint8Array([10, 20, 30, 40, 50]);
+      const mockBlobUrl = 'blob:mock-frame-url';
+
+      vi.mocked(URL.createObjectURL).mockReturnValue(mockBlobUrl);
+      setupVideosMode();
+      vi.mocked(readFile).mockResolvedValue(mockFrameData);
+
+      render(<App />);
+      clickVideosTab();
+
+      // Frames are read out of the cache folder the Rust command reports.
       await waitFor(() => {
         expect(readFile).toHaveBeenCalledWith(
-          'Timelapse/test-video.mov',
+          `${TEST_ROOT}/.cache/${CACHE}/${FRAMES[0]}`,
           expect.any(Object)
         );
       });
 
-      // Verify blob URL was created
       expect(URL.createObjectURL).toHaveBeenCalled();
 
-      // Verify video element is rendered with correct src
       await waitFor(() => {
-        const videoElement = document.querySelector('video');
-        expect(videoElement).toBeTruthy();
-        expect(videoElement?.src).toBe(mockBlobUrl);
+        const img = document.querySelector('img');
+        expect(img).toBeTruthy();
+        expect(img?.getAttribute('src')).toBe(mockBlobUrl);
       });
     });
 
-    it('should show loading state while video is loading', async () => {
+    it('should show loading state while frames are being extracted', async () => {
       vi.mocked(useFolders).mockReturnValue({
         folders: [],
         foldersError: null,
@@ -368,39 +392,32 @@ describe('App', () => {
         videosError: null,
         refreshVideos: vi.fn(),
       });
-      vi.mocked(useFiles).mockReturnValue({
-        files: [],
-        filesError: null,
-      });
+      mockFilesByFolder({});
 
-      // Make readFile take a long time so we can see the loading state
-      let resolveRead: (value: Uint8Array<ArrayBuffer>) => void;
-      const readPromise = new Promise<Uint8Array<ArrayBuffer>>(resolve => {
-        resolveRead = resolve;
-      });
-      vi.mocked(readFile).mockReturnValue(readPromise);
+      // Hold extraction open so the interim state stays on screen.
+      let resolveExtract: (value: string) => void;
+      vi.mocked(invoke).mockReturnValue(
+        new Promise<string>(resolve => {
+          resolveExtract = resolve;
+        })
+      );
 
       render(<App />);
+      clickVideosTab();
 
-      // Switch to videos mode
-      const videosButton = screen.getAllByText(/Videos/i).find(el => el.tagName === 'BUTTON');
-      if (videosButton) {
-        fireEvent.click(videosButton);
-      }
-
-      // Should show loading message immediately
       await waitFor(() => {
-        expect(screen.getByText(/Loading video/i)).toBeInTheDocument();
+        expect(
+          screen.getByText(/Extracting frames from video/i)
+        ).toBeInTheDocument();
       });
-      // Video name appears in both the select dropdown and the loading message
+
       const videoTexts = screen.getAllByText(/slow-video.mov/i);
       expect(videoTexts.length).toBeGreaterThan(0);
 
-      // Resolve the read to clean up
-      resolveRead!(new Uint8Array([1, 2, 3]));
+      resolveExtract!(CACHE);
     });
 
-    it('should handle video loading errors', async () => {
+    it('should handle frame extraction errors', async () => {
       const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
 
       vi.mocked(useFolders).mockReturnValue({
@@ -413,36 +430,48 @@ describe('App', () => {
         videosError: null,
         refreshVideos: vi.fn(),
       });
-      vi.mocked(useFiles).mockReturnValue({
-        files: [],
-        filesError: null,
-      });
-      vi.mocked(readFile).mockRejectedValue(new Error('Video file not found'));
+      mockFilesByFolder({});
+      vi.mocked(invoke).mockRejectedValue(new Error('ffmpeg failed'));
 
       render(<App />);
-
-      // Switch to videos mode
-      const videosButton = screen.getAllByText(/Videos/i).find(el => el.tagName === 'BUTTON');
-      if (videosButton) {
-        fireEvent.click(videosButton);
-      }
+      clickVideosTab();
 
       await waitFor(() => {
         expect(consoleSpy).toHaveBeenCalledWith(
-          'Error loading video:',
+          'Error extracting frames:',
           expect.any(Error)
         );
       });
 
-      // Should show loading state (video failed to load)
+      // No cache folder means no frames, so the app falls back to the
+      // pre-extraction message rather than rendering an image.
       expect(screen.getByText(/Loading video/i)).toBeInTheDocument();
 
       consoleSpy.mockRestore();
     });
 
+    it('should handle frame read errors', async () => {
+      const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+      setupVideosMode();
+      vi.mocked(readFile).mockRejectedValue(new Error('Frame file not found'));
+
+      render(<App />);
+      clickVideosTab();
+
+      await waitFor(() => {
+        expect(consoleSpy).toHaveBeenCalledWith(
+          'Error loading frame:',
+          expect.any(Error)
+        );
+      });
+
+      expect(screen.getByText(/Loading frame/i)).toBeInTheDocument();
+
+      consoleSpy.mockRestore();
+    });
+
     it('should clean up blob URL when switching videos', async () => {
-      const mockVideoData1 = new Uint8Array([1, 2, 3]);
-      const mockVideoData2 = new Uint8Array([4, 5, 6]);
       const mockBlobUrl1 = 'blob:video-1';
       const mockBlobUrl2 = 'blob:video-2';
 
@@ -462,48 +491,52 @@ describe('App', () => {
         videosError: null,
         refreshVideos: vi.fn(),
       });
-      vi.mocked(useFiles).mockReturnValue({
-        files: [],
-        filesError: null,
+      // Each video extracts into its own cache folder.
+      mockFilesByFolder({
+        '.cache/cache-video1.mov': FRAMES,
+        '.cache/cache-video2.mov': FRAMES,
       });
-
-      let readFileCallCount = 0;
-      vi.mocked(readFile).mockImplementation(() => {
-        readFileCallCount++;
-        return Promise.resolve(readFileCallCount === 1 ? mockVideoData1 : mockVideoData2);
+      vi.mocked(invoke).mockImplementation(async (_cmd, args) => {
+        const { videoFilename } = args as { videoFilename: string };
+        return `cache-${videoFilename}`;
       });
+      vi.mocked(readFile).mockResolvedValue(new Uint8Array([1, 2, 3]));
 
       render(<App />);
+      clickVideosTab();
 
-      // Switch to videos mode
-      const videosButton = screen.getAllByText(/Videos/i).find(el => el.tagName === 'BUTTON');
-      if (videosButton) {
-        fireEvent.click(videosButton);
-      }
-
-      // Wait for first video to load
+      // video2.mov is auto-selected (chronologically last).
       await waitFor(() => {
-        expect(readFile).toHaveBeenCalledWith('Timelapse/video1.mov', expect.any(Object));
+        expect(readFile).toHaveBeenCalledWith(
+          `${TEST_ROOT}/.cache/cache-video2.mov/${FRAMES[0]}`,
+          expect.any(Object)
+        );
       });
 
-      // Switch to second video
-      const videoSelect = screen.getByRole('combobox', { name: '' });
-      fireEvent.change(videoSelect, { target: { value: 'video2.mov' } });
+      const videoSelect = screen.getByRole('combobox');
+      fireEvent.change(videoSelect, { target: { value: 'video1.mov' } });
 
-      // Wait for second video to load
       await waitFor(() => {
-        expect(readFile).toHaveBeenCalledWith('Timelapse/video2.mov', expect.any(Object));
+        expect(readFile).toHaveBeenCalledWith(
+          `${TEST_ROOT}/.cache/cache-video1.mov/${FRAMES[0]}`,
+          expect.any(Object)
+        );
       });
 
-      // First blob URL should have been revoked when switching videos
-      expect(URL.revokeObjectURL).toHaveBeenCalledWith(mockBlobUrl1);
+      await waitFor(() => {
+        expect(URL.revokeObjectURL).toHaveBeenCalledWith(mockBlobUrl1);
+      });
     });
 
     it('should clean up blob URL when switching away from video mode', async () => {
-      const mockVideoData = new Uint8Array([1, 2, 3]);
-      const mockBlobUrl = 'blob:video-url';
+      // Distinct URLs per blob: if the frame and the image shared one string,
+      // currentImageSrc would never change and the cleanup effect would not run.
+      const mockBlobUrl = 'blob:url-1';
+      let blobCounter = 0;
+      vi.mocked(URL.createObjectURL).mockImplementation(
+        () => `blob:url-${++blobCounter}`
+      );
 
-      vi.mocked(URL.createObjectURL).mockReturnValue(mockBlobUrl);
       vi.mocked(useFolders).mockReturnValue({
         folders: ['2025-01-15'],
         foldersError: null,
@@ -514,70 +547,48 @@ describe('App', () => {
         videosError: null,
         refreshVideos: vi.fn(),
       });
-      vi.mocked(useFiles).mockReturnValue({
-        files: ['image1.jpg'],
-        filesError: null,
+      mockFilesByFolder({
+        [`.cache/${CACHE}`]: FRAMES,
+        '2025-01-15': ['image1.jpg'],
       });
-      vi.mocked(readFile).mockResolvedValue(mockVideoData);
+      vi.mocked(invoke).mockResolvedValue(CACHE);
+      vi.mocked(readFile).mockResolvedValue(new Uint8Array([1, 2, 3]));
 
       render(<App />);
+      clickVideosTab();
 
-      // Switch to videos mode
-      const videosButton = screen.getAllByText(/Videos/i).find(el => el.tagName === 'BUTTON');
-      if (videosButton) {
-        fireEvent.click(videosButton);
-      }
-
-      // Wait for video to load
       await waitFor(() => {
         expect(URL.createObjectURL).toHaveBeenCalled();
       });
 
-      // Switch back to images mode
       const imagesButton = screen.getByText(/Images/i).closest('button');
       if (imagesButton) {
         fireEvent.click(imagesButton);
       }
 
-      // Blob URL should be revoked when switching away from videos
       await waitFor(() => {
         expect(URL.revokeObjectURL).toHaveBeenCalledWith(mockBlobUrl);
       });
     });
 
-    it('should show video controls', async () => {
-      const mockVideoData = new Uint8Array([1, 2, 3]);
-
-      vi.mocked(useFolders).mockReturnValue({
-        folders: [],
-        foldersError: null,
-        refreshFolders: vi.fn(),
-      });
-      vi.mocked(useVideos).mockReturnValue({
-        videos: ['test-video.mov'],
-        videosError: null,
-        refreshVideos: vi.fn(),
-      });
-      vi.mocked(useFiles).mockReturnValue({
-        files: [],
-        filesError: null,
-      });
-      vi.mocked(readFile).mockResolvedValue(mockVideoData);
+    it('should show frame count and an enabled scrubber', async () => {
+      setupVideosMode();
+      vi.mocked(readFile).mockResolvedValue(new Uint8Array([1, 2, 3]));
 
       render(<App />);
+      clickVideosTab();
 
-      // Switch to videos mode
-      const videosButton = screen.getAllByText(/Videos/i).find(el => el.tagName === 'BUTTON');
-      if (videosButton) {
-        fireEvent.click(videosButton);
-      }
-
-      // Wait for video element
       await waitFor(() => {
-        const videoElement = document.querySelector('video');
-        expect(videoElement).toBeTruthy();
-        expect(videoElement?.hasAttribute('controls')).toBe(true);
+        expect(screen.getByText(`${FRAMES.length} frames`)).toBeInTheDocument();
       });
+
+      expect(
+        screen.getByText(`Frame 1 / ${FRAMES.length}`)
+      ).toBeInTheDocument();
+
+      const scrubber = screen.getByRole('slider') as HTMLInputElement;
+      expect(scrubber.disabled).toBe(false);
+      expect(scrubber.max).toBe(String(FRAMES.length - 1));
     });
   });
 

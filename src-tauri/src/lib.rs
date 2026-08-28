@@ -1,5 +1,6 @@
 mod timelapse;
 mod database;
+mod paths;
 
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -15,12 +16,27 @@ fn greet(name: &str) -> String {
     format!("Hello, {}! You've been greeted from Rust!", name)
 }
 
+/// The directory under `$HOME` this build uses. Rust is the single source of
+/// truth for it: the frontend asks at startup rather than deriving its own
+/// answer, so the capture loop and the viewer can never disagree.
 #[tauri::command]
-async fn start_timelapse(state: State<'_, PhotographerState>) -> Result<String, String> {
+fn get_timelapse_root_name() -> String {
+    paths::TIMELAPSE_DIR_NAME.to_string()
+}
+
+// The state-backed commands below are thin shims over these functions.
+// `tauri::State` is a newtype around a private reference with no public
+// constructor, so it cannot be built outside a running Tauri app — keeping the
+// logic in plain functions is what makes it reachable from unit tests.
+
+fn start_timelapse_impl(
+    state: &PhotographerState,
+    make_photographer: impl FnOnce() -> Result<Photographer, String>,
+) -> Result<String, String> {
     let mut photographer_guard = state.lock().map_err(|e| e.to_string())?;
 
     if photographer_guard.is_none() {
-        let photographer = Photographer::new().map_err(|e| e.to_string())?;
+        let photographer = make_photographer()?;
         photographer.start();
         *photographer_guard = Some(photographer);
         Ok("Timelapse started successfully".to_string())
@@ -29,8 +45,7 @@ async fn start_timelapse(state: State<'_, PhotographerState>) -> Result<String, 
     }
 }
 
-#[tauri::command]
-async fn stop_timelapse(state: State<'_, PhotographerState>) -> Result<String, String> {
+fn stop_timelapse_impl(state: &PhotographerState) -> Result<String, String> {
     let mut photographer_guard = state.lock().map_err(|e| e.to_string())?;
 
     if let Some(photographer) = photographer_guard.take() {
@@ -41,15 +56,13 @@ async fn stop_timelapse(state: State<'_, PhotographerState>) -> Result<String, S
     }
 }
 
-#[tauri::command]
-async fn is_timelapse_running(state: State<'_, PhotographerState>) -> Result<bool, String> {
+fn is_timelapse_running_impl(state: &PhotographerState) -> Result<bool, String> {
     let photographer_guard = state.lock().map_err(|e| e.to_string())?;
     Ok(photographer_guard.is_some())
 }
 
-#[tauri::command]
-async fn get_error_logs(
-    state: State<'_, PhotographerState>,
+fn get_error_logs_impl(
+    state: &PhotographerState,
 ) -> Result<Vec<timelapse::ErrorLogEntry>, String> {
     let photographer_guard = state.lock().map_err(|e| e.to_string())?;
 
@@ -60,8 +73,7 @@ async fn get_error_logs(
     }
 }
 
-#[tauri::command]
-async fn clear_error_logs(state: State<'_, PhotographerState>) -> Result<String, String> {
+fn clear_error_logs_impl(state: &PhotographerState) -> Result<String, String> {
     let photographer_guard = state.lock().map_err(|e| e.to_string())?;
 
     if let Some(photographer) = &*photographer_guard {
@@ -72,13 +84,57 @@ async fn clear_error_logs(state: State<'_, PhotographerState>) -> Result<String,
     }
 }
 
+fn get_screenshot_metadata_impl(
+    state: &PhotographerState,
+    frame_number: u32,
+) -> Result<Option<(String, String)>, String> {
+    let photographer_guard = state.lock().map_err(|e| e.to_string())?;
+
+    if let Some(photographer) = &*photographer_guard {
+        photographer
+            .get_screenshot_metadata(frame_number)
+            .map_err(|e| e.to_string())
+    } else {
+        Err("Timelapse is not running".to_string())
+    }
+}
+
+#[tauri::command]
+async fn start_timelapse(state: State<'_, PhotographerState>) -> Result<String, String> {
+    start_timelapse_impl(state.inner(), || {
+        Photographer::new().map_err(|e| e.to_string())
+    })
+}
+
+#[tauri::command]
+async fn stop_timelapse(state: State<'_, PhotographerState>) -> Result<String, String> {
+    stop_timelapse_impl(state.inner())
+}
+
+#[tauri::command]
+async fn is_timelapse_running(state: State<'_, PhotographerState>) -> Result<bool, String> {
+    is_timelapse_running_impl(state.inner())
+}
+
+#[tauri::command]
+async fn get_error_logs(
+    state: State<'_, PhotographerState>,
+) -> Result<Vec<timelapse::ErrorLogEntry>, String> {
+    get_error_logs_impl(state.inner())
+}
+
+#[tauri::command]
+async fn clear_error_logs(state: State<'_, PhotographerState>) -> Result<String, String> {
+    clear_error_logs_impl(state.inner())
+}
+
 #[tauri::command]
 async fn extract_video_frames(video_filename: String) -> Result<String, String> {
-    let home_dir = dirs::home_dir().ok_or("Unable to find home directory")?;
-    let source_path = home_dir.join("Timelapse").join(&video_filename);
+    let timelapse_root = paths::timelapse_root().ok_or("Unable to find home directory")?;
+    let source_path = timelapse_root.join(&video_filename);
 
     // Create cache directory if it doesn't exist
-    let cache_dir = home_dir.join("Timelapse").join(".cache");
+    let cache_dir = timelapse_root.join(".cache");
     std::fs::create_dir_all(&cache_dir).map_err(|e| format!("Failed to create cache directory: {}", e))?;
 
     // Generate cache folder name (remove .mov extension)
@@ -132,21 +188,13 @@ async fn get_screenshot_metadata(
     state: State<'_, PhotographerState>,
     frame_number: u32,
 ) -> Result<Option<(String, String)>, String> {
-    let photographer_guard = state.lock().map_err(|e| e.to_string())?;
-
-    if let Some(photographer) = &*photographer_guard {
-        photographer
-            .get_screenshot_metadata(frame_number)
-            .map_err(|e| e.to_string())
-    } else {
-        Err("Timelapse is not running".to_string())
-    }
+    get_screenshot_metadata_impl(state.inner(), frame_number)
 }
 
 #[tauri::command]
 async fn evict_old_cache() -> Result<String, String> {
-    let home_dir = dirs::home_dir().ok_or("Unable to find home directory")?;
-    let cache_dir = home_dir.join("Timelapse").join(".cache");
+    let timelapse_root = paths::timelapse_root().ok_or("Unable to find home directory")?;
+    let cache_dir = timelapse_root.join(".cache");
 
     if !cache_dir.exists() {
         return Ok("Cache directory does not exist".to_string());
@@ -198,6 +246,20 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .manage(photographer_state)
         .setup(|app| {
+            // Create the library up front. The frontend calls readDir on it
+            // during its first render, which happens well before the delayed
+            // task below builds the Photographer — without this, a first run
+            // against a fresh library (every machine, the first time it uses
+            // the dev root) dead-ends on the "Error loading folders" screen.
+            match paths::timelapse_root() {
+                Some(root) => {
+                    if let Err(e) = std::fs::create_dir_all(&root) {
+                        eprintln!("Failed to create {:?}: {}", root, e);
+                    }
+                }
+                None => eprintln!("Unable to find home directory"),
+            }
+
             // Start timelapse automatically when app is ready
             let photographer_state = app.state::<PhotographerState>();
             let state_clone = Arc::clone(&photographer_state.inner());
@@ -228,6 +290,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             greet,
+            get_timelapse_root_name,
             start_timelapse,
             stop_timelapse,
             is_timelapse_running,
@@ -244,6 +307,26 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
+
+    /// A photographer rooted in a temp dir, so nothing here reads or writes the
+    /// real `~/Timelapse`. The `TempDir` is returned so the caller keeps it
+    /// alive for the duration of the test.
+    fn temp_photographer() -> (TempDir, Photographer) {
+        let temp_dir = TempDir::new().unwrap();
+        let photographer = Photographer::new_in(temp_dir.path().to_path_buf()).unwrap();
+        (temp_dir, photographer)
+    }
+
+    /// State holding an already-registered (but never started) photographer.
+    fn running_state() -> (TempDir, PhotographerState) {
+        let (temp_dir, photographer) = temp_photographer();
+        (temp_dir, Arc::new(Mutex::new(Some(photographer))))
+    }
+
+    fn idle_state() -> PhotographerState {
+        Arc::new(Mutex::new(None))
+    }
 
     #[test]
     fn test_greet() {
@@ -254,145 +337,133 @@ mod tests {
         assert_eq!(result, "Hello, Bob! You've been greeted from Rust!");
     }
 
+    // `start` calls `tokio::spawn`, which panics outside a runtime. What keeps
+    // the spawned capture loop from taking a screenshot is the
+    // `stop_timelapse_impl` below: it clears `running` before this test reaches
+    // any yield point, so the loop exits the first time it is polled. Do not
+    // add an `.await` between the start and the stop.
     #[tokio::test]
     async fn test_start_timelapse_success() {
-        let state: PhotographerState = Arc::new(Mutex::new(None));
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path().to_path_buf();
+        let state = idle_state();
 
-        // Create a mock State wrapper
-        let state_wrapper = State::from(&state);
+        let result = start_timelapse_impl(&state, || {
+            Photographer::new_in(root).map_err(|e| e.to_string())
+        });
 
-        let result = start_timelapse(state_wrapper).await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), "Timelapse started successfully");
 
         // Verify photographer was created
-        let guard = state.lock().unwrap();
-        assert!(guard.is_some());
+        assert!(state.lock().unwrap().is_some());
+
+        stop_timelapse_impl(&state).unwrap();
     }
 
-    #[tokio::test]
-    async fn test_start_timelapse_already_running() {
-        let state: PhotographerState = Arc::new(Mutex::new(None));
+    #[test]
+    fn test_start_timelapse_already_running() {
+        let (_temp_dir, state) = running_state();
 
-        // Start timelapse first time
-        let state_wrapper = State::from(&state);
-        let result = start_timelapse(state_wrapper).await;
-        assert!(result.is_ok());
+        // The factory must not run when one is already registered.
+        let result = start_timelapse_impl(&state, || {
+            panic!("should not build a second photographer");
+        });
 
-        // Try to start again - should fail
-        let state_wrapper = State::from(&state);
-        let result = start_timelapse(state_wrapper).await;
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), "Timelapse is already running");
     }
 
-    #[tokio::test]
-    async fn test_stop_timelapse_success() {
-        let state: PhotographerState = Arc::new(Mutex::new(None));
+    #[test]
+    fn test_stop_timelapse_success() {
+        let (_temp_dir, state) = running_state();
 
-        // Start timelapse first
-        let state_wrapper = State::from(&state);
-        let _ = start_timelapse(state_wrapper).await;
-
-        // Stop timelapse
-        let state_wrapper = State::from(&state);
-        let result = stop_timelapse(state_wrapper).await;
+        let result = stop_timelapse_impl(&state);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), "Timelapse stopped successfully");
 
         // Verify photographer was removed
-        let guard = state.lock().unwrap();
-        assert!(guard.is_none());
+        assert!(state.lock().unwrap().is_none());
     }
 
-    #[tokio::test]
-    async fn test_stop_timelapse_not_running() {
-        let state: PhotographerState = Arc::new(Mutex::new(None));
+    #[test]
+    fn test_stop_timelapse_not_running() {
+        let state = idle_state();
 
-        let state_wrapper = State::from(&state);
-        let result = stop_timelapse(state_wrapper).await;
+        let result = stop_timelapse_impl(&state);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), "Timelapse is not running");
     }
 
-    #[tokio::test]
-    async fn test_is_timelapse_running() {
-        let state: PhotographerState = Arc::new(Mutex::new(None));
+    #[test]
+    fn test_is_timelapse_running() {
+        let state = idle_state();
 
         // Initially not running
-        let state_wrapper = State::from(&state);
-        let result = is_timelapse_running(state_wrapper).await;
-        assert!(result.is_ok());
-        assert!(!result.unwrap());
+        assert!(!is_timelapse_running_impl(&state).unwrap());
 
-        // Start timelapse
-        let state_wrapper = State::from(&state);
-        let _ = start_timelapse(state_wrapper).await;
+        // Register a photographer
+        let (_temp_dir, photographer) = temp_photographer();
+        *state.lock().unwrap() = Some(photographer);
+        assert!(is_timelapse_running_impl(&state).unwrap());
 
-        // Now should be running
-        let state_wrapper = State::from(&state);
-        let result = is_timelapse_running(state_wrapper).await;
-        assert!(result.is_ok());
-        assert!(result.unwrap());
-
-        // Stop timelapse
-        let state_wrapper = State::from(&state);
-        let _ = stop_timelapse(state_wrapper).await;
-
-        // Should not be running again
-        let state_wrapper = State::from(&state);
-        let result = is_timelapse_running(state_wrapper).await;
-        assert!(result.is_ok());
-        assert!(!result.unwrap());
+        // Stop it again
+        stop_timelapse_impl(&state).unwrap();
+        assert!(!is_timelapse_running_impl(&state).unwrap());
     }
 
-    #[tokio::test]
-    async fn test_get_error_logs_when_running() {
-        let state: PhotographerState = Arc::new(Mutex::new(None));
+    #[test]
+    fn test_get_error_logs_when_running() {
+        let (_temp_dir, state) = running_state();
 
-        // Start timelapse
-        let state_wrapper = State::from(&state);
-        let _ = start_timelapse(state_wrapper).await;
-
-        // Get error logs
-        let state_wrapper = State::from(&state);
-        let result = get_error_logs(state_wrapper).await;
+        let result = get_error_logs_impl(&state);
         assert!(result.is_ok());
         assert_eq!(result.unwrap().len(), 0);
     }
 
-    #[tokio::test]
-    async fn test_get_error_logs_when_not_running() {
-        let state: PhotographerState = Arc::new(Mutex::new(None));
+    #[test]
+    fn test_get_error_logs_when_not_running() {
+        let state = idle_state();
 
-        let state_wrapper = State::from(&state);
-        let result = get_error_logs(state_wrapper).await;
+        let result = get_error_logs_impl(&state);
         assert!(result.is_ok());
         assert_eq!(result.unwrap().len(), 0);
     }
 
-    #[tokio::test]
-    async fn test_clear_error_logs_success() {
-        let state: PhotographerState = Arc::new(Mutex::new(None));
+    #[test]
+    fn test_clear_error_logs_success() {
+        let (_temp_dir, state) = running_state();
 
-        // Start timelapse
-        let state_wrapper = State::from(&state);
-        let _ = start_timelapse(state_wrapper).await;
-
-        // Clear error logs
-        let state_wrapper = State::from(&state);
-        let result = clear_error_logs(state_wrapper).await;
+        let result = clear_error_logs_impl(&state);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), "Error logs cleared successfully");
     }
 
-    #[tokio::test]
-    async fn test_clear_error_logs_not_running() {
-        let state: PhotographerState = Arc::new(Mutex::new(None));
+    #[test]
+    fn test_clear_error_logs_not_running() {
+        let state = idle_state();
 
-        let state_wrapper = State::from(&state);
-        let result = clear_error_logs(state_wrapper).await;
+        let result = clear_error_logs_impl(&state);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), "Timelapse is not running");
+    }
+
+    #[test]
+    fn test_get_screenshot_metadata_not_running() {
+        let state = idle_state();
+
+        let result = get_screenshot_metadata_impl(&state, 1);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "Timelapse is not running");
+    }
+
+    #[test]
+    fn test_get_screenshot_metadata_unknown_frame() {
+        let (_temp_dir, state) = running_state();
+
+        // Nothing has been captured into this temp library yet.
+        let result = get_screenshot_metadata_impl(&state, 1);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
     }
 }
