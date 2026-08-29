@@ -46,6 +46,15 @@ describe('App', () => {
     vi.mocked(URL.revokeObjectURL).mockImplementation(() => {});
   });
 
+  function clickVideosTab(): void {
+    const videosButton = screen
+      .getAllByText(/Videos/i)
+      .find(el => el.tagName === 'BUTTON');
+    if (videosButton) {
+      fireEvent.click(videosButton);
+    }
+  }
+
   describe('Error Handling', () => {
     it('should display folders error', () => {
       const mockError = new Error('Failed to load folders');
@@ -257,6 +266,41 @@ describe('App', () => {
         });
       });
     });
+
+    it('should list videos newest-first, like the date picker', async () => {
+      // useVideos returns chronological order; the dropdown reverses it so both
+      // view modes agree on which end of the list is "most recent".
+      vi.mocked(useFolders).mockReturnValue({
+        folders: [],
+        foldersError: null,
+        refreshFolders: vi.fn(),
+      });
+      vi.mocked(useVideos).mockReturnValue({
+        videos: ['2025-01-13.mov', '2025-01-14.mov', '2025-01-15.mov'],
+        videosError: null,
+        refreshVideos: vi.fn(),
+      });
+      mockFilesByFolder({});
+      vi.mocked(invoke).mockResolvedValue('2025-01-15');
+
+      render(<App />);
+      clickVideosTab();
+
+      await waitFor(() => {
+        expect(screen.getByRole('combobox')).toBeInTheDocument();
+      });
+
+      const options = Array.from(
+        screen.getByRole('combobox').querySelectorAll('option')
+      ).map((option) => option.textContent);
+
+      expect(options).toEqual([
+        'Select a video…',
+        '2025-01-15.mov',
+        '2025-01-14.mov',
+        '2025-01-13.mov',
+      ]);
+    });
   });
 
   describe('Image Loading', () => {
@@ -344,15 +388,6 @@ describe('App', () => {
       vi.mocked(invoke).mockResolvedValue(CACHE);
     }
 
-    function clickVideosTab(): void {
-      const videosButton = screen
-        .getAllByText(/Videos/i)
-        .find(el => el.tagName === 'BUTTON');
-      if (videosButton) {
-        fireEvent.click(videosButton);
-      }
-    }
-
     it('should extract frames and render the first frame', async () => {
       const mockFrameData = new Uint8Array([10, 20, 30, 40, 50]);
       const mockBlobUrl = 'blob:mock-frame-url';
@@ -417,6 +452,32 @@ describe('App', () => {
       resolveExtract!(CACHE);
     });
 
+    it('should say it is loading frames while the cache folder is listed', async () => {
+      // extract_video_frames has resolved, but useFiles is still retrying the
+      // freshly-created cache folder. That window used to report "Loading
+      // video…", which reads as though extraction had not started.
+      vi.mocked(useFolders).mockReturnValue({
+        folders: [],
+        foldersError: null,
+        refreshFolders: vi.fn(),
+      });
+      vi.mocked(useVideos).mockReturnValue({
+        videos: ['test-video.mov'],
+        videosError: null,
+        refreshVideos: vi.fn(),
+      });
+      mockFilesByFolder({}); // the cache folder lists no frames yet
+      vi.mocked(invoke).mockResolvedValue(CACHE);
+
+      render(<App />);
+      clickVideosTab();
+
+      await waitFor(() => {
+        expect(screen.getByText(/Loading frames/i)).toBeInTheDocument();
+      });
+      expect(screen.queryByText(/Loading video/i)).not.toBeInTheDocument();
+    });
+
     it('should handle frame extraction errors', async () => {
       const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
 
@@ -443,9 +504,13 @@ describe('App', () => {
         );
       });
 
-      // No cache folder means no frames, so the app falls back to the
-      // pre-extraction message rather than rendering an image.
-      expect(screen.getByText(/Loading video/i)).toBeInTheDocument();
+      // The failure has to reach the user: a missing ffmpeg must not be
+      // indistinguishable from a slow extraction.
+      expect(
+        screen.getByText(/Could not extract frames from this video/i)
+      ).toBeInTheDocument();
+      expect(screen.getByText('ffmpeg failed')).toBeInTheDocument();
+      expect(screen.queryByText(/Loading video/i)).not.toBeInTheDocument();
 
       consoleSpy.mockRestore();
     });

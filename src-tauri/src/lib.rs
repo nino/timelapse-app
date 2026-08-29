@@ -146,8 +146,9 @@ fn extract_video_frames_impl(root: &Path, video_filename: &str) -> Result<String
     let cache_folder_name = video_filename.trim_end_matches(".mov");
     let cache_folder_path = cache_dir.join(cache_folder_name);
 
-    // Check if frame sequence already exists
-    if cache_folder_path.exists() && cache_folder_path.is_dir() {
+    // Check if frame sequence already exists. The folder is only moved into
+    // place after ffmpeg has finished, so if it is here at all it is complete.
+    if cache_folder_path.is_dir() {
         let entries = std::fs::read_dir(&cache_folder_path)
             .map_err(|e| format!("Failed to read cache directory: {}", e))?;
         let has_frames = entries.count() > 0;
@@ -157,16 +158,24 @@ fn extract_video_frames_impl(root: &Path, video_filename: &str) -> Result<String
         }
     }
 
-    // Create the cache folder for this video
-    std::fs::create_dir_all(&cache_folder_path)
-        .map_err(|e| format!("Failed to create cache folder: {}", e))?;
+    // Extract into a staging folder and publish it under the real name only
+    // once ffmpeg has succeeded. Writing straight into the cache folder meant
+    // an interrupted run left a partial frame set that every later call read as
+    // a complete cache, with no way to recover but deleting it by hand.
+    let staging_path = cache_dir.join(format!(".{}.partial", cache_folder_name));
+    if staging_path.exists() {
+        std::fs::remove_dir_all(&staging_path)
+            .map_err(|e| format!("Failed to clear stale staging folder: {}", e))?;
+    }
+    std::fs::create_dir_all(&staging_path)
+        .map_err(|e| format!("Failed to create staging folder: {}", e))?;
 
-    println!("Extracting frames from video: {:?} -> {:?}", source_path, cache_folder_path);
+    println!("Extracting frames from video: {:?} -> {:?}", source_path, staging_path);
 
     // Run ffmpeg to extract frames as JPEG images
     // frame%06d.jpg creates frame000001.jpg, frame000002.jpg, etc.
-    let output_pattern = cache_folder_path.join("frame%06d.jpg");
-    let output = Command::new("ffmpeg")
+    let output_pattern = staging_path.join("frame%06d.jpg");
+    let spawned = Command::new("ffmpeg")
         .arg("-i")
         .arg(&source_path)
         .arg("-vf")
@@ -175,17 +184,58 @@ fn extract_video_frames_impl(root: &Path, video_filename: &str) -> Result<String
         .arg("2") // High quality JPEG (1-31, lower is better)
         .arg("-y")
         .arg(&output_pattern)
-        .output()
-        .map_err(|e| format!("Failed to execute ffmpeg: {}. Make sure ffmpeg is installed and in PATH.", e))?;
+        .output();
+
+    let output = match spawned {
+        Ok(output) => output,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&staging_path);
+            return Err(format!("Failed to execute ffmpeg: {}. Make sure ffmpeg is installed and in PATH.", e));
+        }
+    };
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        let _ = std::fs::remove_dir_all(&staging_path);
         return Err(format!("ffmpeg failed: {}", stderr));
     }
+
+    publish_staged_frames(&staging_path, &cache_folder_path, video_filename)?;
 
     println!("Frame extraction complete: {:?}", cache_folder_path);
 
     Ok(cache_folder_name.to_string())
+}
+
+/// Move a finished staging folder into the place the frontend reads from.
+///
+/// Split out of `extract_video_frames_impl` so the empty-output guard and the
+/// rename are reachable in tests: everything above the call site needs a real
+/// video and a working ffmpeg before it gets this far.
+fn publish_staged_frames(
+    staging_path: &Path,
+    cache_folder_path: &Path,
+    video_filename: &str,
+) -> Result<(), String> {
+    // ffmpeg can exit 0 having written nothing — a zero-length or unreadable
+    // stream does exactly that. Publishing that empty folder would count as a
+    // cache hit forever after, stranding the UI on "Loading frames…".
+    let frame_count = std::fs::read_dir(staging_path)
+        .map_err(|e| format!("Failed to read staging folder: {}", e))?
+        .count();
+    if frame_count == 0 {
+        let _ = std::fs::remove_dir_all(staging_path);
+        return Err(format!("ffmpeg produced no frames for {}", video_filename));
+    }
+
+    // An empty folder left by an older run would make the rename fail, so clear
+    // it first.
+    if cache_folder_path.exists() {
+        std::fs::remove_dir_all(cache_folder_path)
+            .map_err(|e| format!("Failed to clear incomplete cache folder: {}", e))?;
+    }
+    std::fs::rename(staging_path, cache_folder_path)
+        .map_err(|e| format!("Failed to publish extracted frames: {}", e))
 }
 
 #[tauri::command]
@@ -671,8 +721,104 @@ mod tests {
 
         assert!(result.is_err(), "there is no source video to extract");
         assert!(
-            temp_dir.path().join(".cache").join("2026-08-27").is_dir(),
-            "the cache folder should have been created before ffmpeg ran"
+            temp_dir.path().join(".cache").is_dir(),
+            "the cache directory should have been created before ffmpeg ran"
+        );
+    }
+
+    // Extraction stages into `.<name>.partial` and only renames it into place
+    // once ffmpeg succeeds, so a failed run must not leave anything behind that
+    // a later call would read back as a finished cache.
+    #[test]
+    fn test_extract_video_frames_publishes_nothing_when_ffmpeg_fails() {
+        let (temp_dir, cache_dir) = temp_library();
+
+        let result = extract_video_frames_impl(temp_dir.path(), "2026-08-27.mov");
+
+        assert!(result.is_err(), "there is no source video to extract");
+        assert!(
+            !cache_dir.join("2026-08-27").exists(),
+            "a failed extraction must not publish a cache folder"
+        );
+        assert!(
+            !cache_dir.join(".2026-08-27.partial").exists(),
+            "the staging folder should have been cleaned up"
+        );
+    }
+
+    // The regression this replaces: frames written directly into the cache
+    // folder made any interrupted run look like a complete one forever.
+    #[test]
+    fn test_extract_video_frames_reruns_after_a_partial_extraction() {
+        let (temp_dir, cache_dir) = temp_library();
+
+        // Simulate an interrupted run under the new scheme: frames are in
+        // staging, and nothing has been published.
+        let staging = cache_dir.join(".2026-08-27.partial");
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(staging.join("frame000001.jpg"), b"half a run").unwrap();
+
+        let result = extract_video_frames_impl(temp_dir.path(), "2026-08-27.mov");
+
+        assert!(
+            result.is_err(),
+            "a partial extraction must not count as cached; this should reach ffmpeg and fail"
+        );
+        assert!(
+            !cache_dir.join("2026-08-27").exists(),
+            "the partial frames must never be published under the real name"
+        );
+    }
+
+    #[test]
+    fn test_publish_staged_frames_moves_the_folder_into_place() {
+        let (_temp_dir, cache_dir) = temp_library();
+        let staging = cache_dir.join(".2026-08-27.partial");
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(staging.join("frame000001.jpg"), b"a frame").unwrap();
+        let published = cache_dir.join("2026-08-27");
+
+        publish_staged_frames(&staging, &published, "2026-08-27.mov").unwrap();
+
+        assert!(!staging.exists(), "staging should have been renamed away");
+        assert_eq!(
+            fs::read(published.join("frame000001.jpg")).unwrap(),
+            b"a frame"
+        );
+    }
+
+    // ffmpeg reports success on some inputs without writing a single frame.
+    // Publishing that would be a permanent empty cache hit.
+    #[test]
+    fn test_publish_staged_frames_rejects_an_empty_staging_folder() {
+        let (_temp_dir, cache_dir) = temp_library();
+        let staging = cache_dir.join(".2026-08-27.partial");
+        fs::create_dir_all(&staging).unwrap();
+        let published = cache_dir.join("2026-08-27");
+
+        let result = publish_staged_frames(&staging, &published, "2026-08-27.mov");
+
+        assert!(result.is_err(), "an empty extraction must not be published");
+        assert!(!published.exists(), "nothing should have been published");
+        assert!(!staging.exists(), "the empty staging folder should be gone");
+    }
+
+    #[test]
+    fn test_publish_staged_frames_replaces_an_empty_leftover_folder() {
+        let (_temp_dir, cache_dir) = temp_library();
+        let staging = cache_dir.join(".2026-08-27.partial");
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(staging.join("frame000001.jpg"), b"a frame").unwrap();
+
+        // An earlier version created this eagerly and left it behind on failure.
+        let published = cache_dir.join("2026-08-27");
+        fs::create_dir_all(&published).unwrap();
+
+        publish_staged_frames(&staging, &published, "2026-08-27.mov").unwrap();
+
+        assert_eq!(
+            fs::read(published.join("frame000001.jpg")).unwrap(),
+            b"a frame"
         );
     }
 }

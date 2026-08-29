@@ -172,8 +172,23 @@ describe('useFiles', () => {
 
     const { result } = renderHook(() => useFiles('2025-01-15'));
 
-    // useFiles retries 5 times with a 500ms gap, so the error only surfaces
-    // after ~2s — well past waitFor's 1s default.
+    // A date folder is not retried, so the error surfaces on the first attempt.
+    // The default 1s waitFor timeout is the assertion: the ~2s cache-folder
+    // retry loop must not run here.
+    await waitFor(() => {
+      expect(result.current.filesError).toEqual(mockError);
+    });
+
+    expect(result.current.files).toEqual([]);
+    expect(readDir).toHaveBeenCalledTimes(1);
+  });
+
+  it('should retry a cache folder before surfacing an error', async () => {
+    const mockError = new Error('Failed to read files');
+    vi.mocked(readDir).mockRejectedValue(mockError);
+
+    const { result } = renderHook(() => useFiles('.cache/2025-01-15'));
+
     await waitFor(
       () => {
         expect(result.current.filesError).toEqual(mockError);
@@ -181,7 +196,9 @@ describe('useFiles', () => {
       { timeout: 5000 },
     );
 
-    expect(result.current.files).toEqual([]);
+    // Frames appear asynchronously while ffmpeg writes, so a cache folder is
+    // worth retrying — five attempts before giving up.
+    expect(readDir).toHaveBeenCalledTimes(5);
   });
 
   it('should filter out directories and only return files', async () => {
