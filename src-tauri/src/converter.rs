@@ -7,9 +7,10 @@
 //! the machine is on AC power, and an encode in progress is killed if the
 //! power is unplugged.
 //!
-//! Unlike the scripts, this never deletes screenshots: the PNGs stay the
-//! full-resolution record, and the video is an extra. The video's file name is
-//! what marks an hour as done — an hour whose video exists is skipped.
+//! An hour whose video exists counts as converted. Its PNGs are deleted, as
+//! the scripts did, but only once `DeleteCheck` agrees: the PNGs have to be
+//! read by OCR first, and nothing marks that yet, so for now the default check
+//! keeps every PNG.
 //!
 //! A batch is converted like this:
 //! 1. Hard-link its PNGs into `.cache/.convert-<video>/` as a gapless
@@ -53,9 +54,9 @@ const ENCODE_POWER_CHECK: Duration = Duration::from_secs(30);
 /// Prefix of the staging folders under `.cache`.
 const STAGING_PREFIX: &str = ".convert-";
 
-/// Decides whether a batch may be converted yet. Returning `false` holds the
-/// batch back until a later pass.
-pub type ReadyCheck = Arc<dyn Fn(&HourBatch) -> bool + Send + Sync>;
+/// Decides whether a converted batch's PNGs may be deleted. Every part of an
+/// hour has to pass before any of that hour's PNGs go.
+pub type DeleteCheck = Arc<dyn Fn(&HourBatch) -> bool + Send + Sync>;
 
 /// One clock hour of screenshots from one day folder.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,7 +146,62 @@ fn frame_number(file_name: &str) -> Option<u32> {
 /// An hour is ready once it has ended (`now` is past the end of that hour) and
 /// its video does not exist yet.
 pub fn find_ready_batches(root: &Path, now: DateTime<Local>) -> std::io::Result<Vec<HourBatch>> {
-    let mut batches = Vec::new();
+    Ok(find_ended_hours(root, now)?
+        .into_iter()
+        .flat_map(|hour| hour.parts)
+        .filter(|batch| !root.join(batch.video_name()).exists())
+        .collect())
+}
+
+/// Find every hour whose PNGs may be deleted, oldest first, as the batches
+/// that make it up.
+///
+/// That is an hour that has ended, has a video for every part, and passes
+/// `may_delete` for every part. In today's folder the hour holding the
+/// highest-numbered frame is kept regardless: `next_filename` numbers new
+/// screenshots as `max + 1`, so deleting the newest frame would restart
+/// today's numbering at `00001`.
+pub fn find_deletable_hours(
+    root: &Path,
+    now: DateTime<Local>,
+    may_delete: &DeleteCheck,
+) -> std::io::Result<Vec<Vec<HourBatch>>> {
+    Ok(find_ended_hours(root, now)?
+        .into_iter()
+        .filter(|hour| !hour.holds_todays_newest_frame)
+        .filter(|hour| {
+            hour.parts
+                .iter()
+                .all(|batch| root.join(batch.video_name()).exists() && may_delete(batch))
+        })
+        .map(|hour| hour.parts)
+        .collect())
+}
+
+/// Delete the PNGs of a converted hour, and return how many went.
+pub fn delete_frames(parts: &[HourBatch]) -> usize {
+    let mut deleted = 0;
+    for frame in parts.iter().flat_map(|batch| &batch.frames) {
+        match std::fs::remove_file(frame) {
+            Ok(()) => deleted += 1,
+            Err(e) => eprintln!("Could not delete converted frame {:?}: {}", frame, e),
+        }
+    }
+    deleted
+}
+
+/// One ended clock hour of one day folder.
+struct EndedHour {
+    /// The hour's batches, split at `MAX_FRAMES_PER_BATCH`.
+    parts: Vec<HourBatch>,
+    /// Whether this hour holds the highest-numbered frame of today's folder.
+    holds_todays_newest_frame: bool,
+}
+
+/// Every hour that has ended, oldest first.
+fn find_ended_hours(root: &Path, now: DateTime<Local>) -> std::io::Result<Vec<EndedHour>> {
+    let today = now.format("%Y-%m-%d").to_string();
+    let mut hours = Vec::new();
 
     let mut day_names: Vec<String> = std::fs::read_dir(root)?
         .filter_map(|entry| entry.ok())
@@ -179,6 +235,12 @@ pub fn find_ready_batches(root: &Path, now: DateTime<Local>) -> std::io::Result<
         }
         frames.sort_by_key(|(number, _, _)| *number);
 
+        let todays_newest = if day == today {
+            frames.last().map(|(number, _, _)| *number)
+        } else {
+            None
+        };
+
         let mut by_hour: BTreeMap<DateTime<Local>, Vec<(u32, PathBuf)>> = BTreeMap::new();
         for (number, path, hour_start) in frames {
             by_hour.entry(hour_start).or_default().push((number, path));
@@ -188,22 +250,27 @@ pub fn find_ready_batches(root: &Path, now: DateTime<Local>) -> std::io::Result<
             if hour_start + chrono::Duration::hours(1) > now {
                 continue;
             }
+            let holds_todays_newest_frame =
+                todays_newest.is_some_and(|newest| hour_frames.iter().any(|(n, _)| *n == newest));
             let paths: Vec<PathBuf> = hour_frames.into_iter().map(|(_, path)| path).collect();
-            for (part, chunk) in paths.chunks(MAX_FRAMES_PER_BATCH).enumerate() {
-                let batch = HourBatch {
+            let parts = paths
+                .chunks(MAX_FRAMES_PER_BATCH)
+                .enumerate()
+                .map(|(part, chunk)| HourBatch {
                     day: day.clone(),
                     hour: hour_start.hour(),
                     part,
                     frames: chunk.to_vec(),
-                };
-                if !root.join(batch.video_name()).exists() {
-                    batches.push(batch);
-                }
-            }
+                })
+                .collect();
+            hours.push(EndedHour {
+                parts,
+                holds_todays_newest_frame,
+            });
         }
     }
 
-    Ok(batches)
+    Ok(hours)
 }
 
 /// Remove day folders that are empty, except today's, which the photographer
@@ -389,19 +456,22 @@ fn encode_with_ffmpeg(frames_dir: &Path, output: &Path, running: &AtomicBool) ->
 pub struct Converter {
     root: PathBuf,
     running: Arc<AtomicBool>,
-    ready: ReadyCheck,
+    may_delete: DeleteCheck,
 }
 
 impl Converter {
+    /// A converter that keeps every PNG. Screenshots must be OCR'd before
+    /// they are deleted, and until OCR records which hours it has read there
+    /// is nothing to check against, so nothing is deleted.
     pub fn new_in(root: PathBuf) -> Self {
-        Self::with_ready_check(root, Arc::new(|_| true))
+        Self::with_delete_check(root, Arc::new(|_| false))
     }
 
-    pub fn with_ready_check(root: PathBuf, ready: ReadyCheck) -> Self {
+    pub fn with_delete_check(root: PathBuf, may_delete: DeleteCheck) -> Self {
         Converter {
             root,
             running: Arc::new(AtomicBool::new(false)),
-            ready,
+            may_delete,
         }
     }
 
@@ -412,7 +482,7 @@ impl Converter {
         self.running.store(true, Ordering::SeqCst);
         let root = self.root.clone();
         let running = Arc::clone(&self.running);
-        let ready = Arc::clone(&self.ready);
+        let may_delete = Arc::clone(&self.may_delete);
 
         tokio::spawn(async move {
             println!("Starting video conversion background task...");
@@ -421,7 +491,7 @@ impl Converter {
             }
 
             while running.load(Ordering::SeqCst) {
-                let wait = Self::run_once(&root, &running, &ready).await;
+                let wait = Self::run_once(&root, &running, &may_delete).await;
                 tokio::time::sleep(wait).await;
             }
 
@@ -437,16 +507,27 @@ impl Converter {
         self.running.store(false, Ordering::SeqCst);
     }
 
-    /// Convert at most one batch, and return how long to wait before the next
-    /// attempt.
-    async fn run_once(root: &Path, running: &Arc<AtomicBool>, ready: &ReadyCheck) -> Duration {
-        if !on_ac_power() {
-            return ON_BATTERY_POLL;
-        }
-
+    /// Delete the PNGs of every hour that may go, convert at most one batch,
+    /// and return how long to wait before the next attempt.
+    async fn run_once(root: &Path, running: &Arc<AtomicBool>, may_delete: &DeleteCheck) -> Duration {
         let now = Local::now();
+
+        // Deleting is cheap, so it does not wait for AC power.
+        match find_deletable_hours(root, now, may_delete) {
+            Ok(hours) => {
+                for parts in hours {
+                    let deleted = delete_frames(&parts);
+                    println!("Deleted {} converted frames from {} {:02}:00", deleted, parts[0].day, parts[0].hour);
+                }
+            }
+            Err(e) => eprintln!("Failed to scan for converted screenshots: {}", e),
+        }
         if let Err(e) = remove_empty_day_folders(root, now) {
             eprintln!("Failed to remove empty day folders: {}", e);
+        }
+
+        if !on_ac_power() {
+            return ON_BATTERY_POLL;
         }
 
         let batches = match find_ready_batches(root, now) {
@@ -456,7 +537,7 @@ impl Converter {
                 return IDLE_POLL;
             }
         };
-        let Some(batch) = batches.into_iter().find(|batch| ready(batch)) else {
+        let Some(batch) = batches.into_iter().next() else {
             return IDLE_POLL;
         };
 
@@ -578,6 +659,74 @@ mod tests {
         assert_eq!(hours, vec![9]);
     }
 
+    fn always(answer: bool) -> DeleteCheck {
+        Arc::new(move |_| answer)
+    }
+
+    #[test]
+    fn deletes_only_converted_hours_that_pass_the_check() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        let converted = frame(root, "2026-10-01", 1, at("2026-10-01", 8, 0));
+        frame(root, "2026-10-01", 2, at("2026-10-01", 9, 0));
+        fs::write(root.join("2026-10-01--08-00-00.mov"), b"video").unwrap();
+        let now = at("2026-10-02", 0, 0);
+
+        assert!(
+            find_deletable_hours(root, now, &always(false)).unwrap().is_empty(),
+            "nothing goes until the check agrees"
+        );
+
+        let hours = find_deletable_hours(root, now, &always(true)).unwrap();
+        assert_eq!(hours.len(), 1, "09:00 has no video yet");
+        assert_eq!(delete_frames(&hours[0]), 1);
+        assert!(!converted.exists());
+        assert!(
+            find_ready_batches(root, now).unwrap().iter().all(|b| b.hour != 8),
+            "a deleted hour is not converted again"
+        );
+    }
+
+    #[test]
+    fn keeps_the_hour_with_todays_newest_frame() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        frame(root, "2026-10-04", 1, at("2026-10-04", 8, 0));
+        frame(root, "2026-10-04", 2, at("2026-10-04", 9, 0));
+        fs::write(root.join("2026-10-04--08-00-00.mov"), b"video").unwrap();
+        fs::write(root.join("2026-10-04--09-00-00.mov"), b"video").unwrap();
+
+        // Both hours are converted, but deleting 00002.png would make the next
+        // screenshot 00001.png again.
+        let hours = find_deletable_hours(root, at("2026-10-04", 12, 0), &always(true)).unwrap();
+        let deletable: Vec<u32> = hours.iter().map(|parts| parts[0].hour).collect();
+        assert_eq!(deletable, vec![8]);
+
+        // The same layout on a past day can go entirely.
+        let hours = find_deletable_hours(root, at("2026-10-05", 12, 0), &always(true)).unwrap();
+        let deletable: Vec<u32> = hours.iter().map(|parts| parts[0].hour).collect();
+        assert_eq!(deletable, vec![8, 9]);
+    }
+
+    #[test]
+    fn an_oversized_hour_is_deleted_only_once_every_part_is_converted() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        let when = at("2026-10-01", 9, 0);
+        for n in 1..=(MAX_FRAMES_PER_BATCH as u32 + 1) {
+            frame(root, "2026-10-01", n, when);
+        }
+        fs::write(root.join("2026-10-01--09-00-00.mov"), b"part 1").unwrap();
+        let now = at("2026-10-02", 0, 0);
+
+        assert!(find_deletable_hours(root, now, &always(true)).unwrap().is_empty());
+
+        fs::write(root.join("2026-10-01--09-00-00-2.mov"), b"part 2").unwrap();
+        let hours = find_deletable_hours(root, now, &always(true)).unwrap();
+        assert_eq!(hours.len(), 1);
+        assert_eq!(hours[0].len(), 2);
+    }
+
     #[test]
     fn orders_frames_by_number_and_ignores_other_files() {
         let temp = TempDir::new().unwrap();
@@ -628,7 +777,7 @@ mod tests {
         assert_eq!(name, "2026-10-01--09-00-00.mov");
         assert_eq!(seen, 2, "the gap between 1 and 7 should be closed up");
         assert_eq!(fs::read(root.join(&name)).unwrap(), b"video");
-        assert_eq!(fs::read(&a).unwrap(), b"frame 1", "screenshots are never deleted");
+        assert_eq!(fs::read(&a).unwrap(), b"frame 1", "converting never deletes frames");
         assert_eq!(fs::read(&b).unwrap(), b"frame 7");
         assert!(keep.exists());
         assert!(
