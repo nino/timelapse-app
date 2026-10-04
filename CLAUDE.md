@@ -53,6 +53,13 @@ Two consequences worth remembering: `cargo test --release` compiles with `debug_
 
 
 **Test isolation seams.** `Photographer::new()` resolves the profile's library root and delegates to `Photographer::new_in(root)`; tests always use `new_in` with a `TempDir` so `cargo test` never reads, writes, or captures into a real library, in either profile. `Photographer::start()` calls `tokio::spawn`, so anything touching it needs `#[tokio::test]`, and the test must call `stop()` before its first yield point — that is what makes the capture loop exit on its first poll. An `.await` between start and stop lets it capture the real screen.
+## Releases
+
+`.github/workflows/release.yml` builds, signs (Developer ID, hardened runtime), notarises and staples the app and a DMG on every push to `main`, and republishes them as the rolling `latest` GitHub release; pushing the `beta` tag publishes a prerelease instead. It follows nino/worktree-manager's release workflow and uses the same secret names. The released version is `<major>.<minor>.<commit count>`, with major/minor from `tauri.conf.json`, so it always grows, which is what a future Tauri updater needs; nothing is committed back.
+
+- **The build is Apple Silicon only and needs Homebrew ImageMagick on the user's Mac.** `magick_rust` links `libMagickWand` dynamically from `/opt/homebrew`. `src-tauri/Entitlements.plist` turns off library validation so the hardened runtime will load that unsigned-by-us dylib; removing the entitlement makes the signed app crash at launch.
+- **A Finder-launched app gets launchd's `PATH`**, which has no Homebrew `bin`. `run()` appends it (`paths::path_with_homebrew`) so `ffmpeg` resolves; dev builds started from a shell never showed the problem.
+
 ## Conventions (enforced by oxlint — see `.oxlintrc.json`)
 
 - `@typescript-eslint/explicit-function-return-type: error` — every function (including arrow callbacks) needs an explicit return type

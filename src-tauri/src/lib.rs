@@ -311,6 +311,10 @@ async fn evict_old_cache() -> Result<String, String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Before anything spawns a thread, so nothing reads PATH while it changes.
+    let path = std::env::var("PATH").unwrap_or_default();
+    std::env::set_var("PATH", paths::path_with_homebrew(&path));
+
     let photographer_state: PhotographerState = Arc::new(Mutex::new(None));
 
     tauri::Builder::default()
