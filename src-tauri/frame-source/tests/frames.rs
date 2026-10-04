@@ -100,15 +100,47 @@ fn serves_exact_frames_across_chunks_and_videos() {
     assert!(source.frame("2024-12-20", 240).is_err());
 }
 
+/// A screenshots.db holding `times` (local ISO times) as frames 1, 2, ….
+fn write_db(root: &Path, times: &[&str]) {
+    let conn = rusqlite::Connection::open(root.join("screenshots.db")).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE screenshots (id INTEGER PRIMARY KEY, frame_number INTEGER, local_time TEXT)",
+    )
+    .unwrap();
+    for (n, time) in times.iter().enumerate() {
+        conn.execute(
+            "INSERT INTO screenshots (frame_number, local_time) VALUES (?1, ?2)",
+            rusqlite::params![n + 1, time],
+        )
+        .unwrap();
+    }
+}
+
 #[test]
-fn estimates_video_times_from_the_file_name() {
+fn times_legacy_videos_from_the_database_not_the_file_name() {
     let lib = Library::new();
-    make_video(&lib.root.path().join("2024-12-20--09-00-00.mov"), 10, 0);
+    // Named after when the old script ran, not when the frames were taken.
+    make_video(&lib.root.path().join("2025-12-01--09-00-00.mov"), 2, 0);
+    make_video(&lib.root.path().join("2025-12-01--09-30-00.mov"), 1, 0);
+    make_video(&lib.root.path().join("2025-12-02--09-00-00.mov"), 2, 0);
+    write_db(
+        lib.root.path(),
+        &[
+            "2025-12-01T19:54:11+00:00",
+            "2025-12-01T19:54:12+00:00",
+            "2025-12-01T20:01:00+00:00",
+            // 2025-12-02 has one row for two frames: no way to line them up.
+            "2025-12-02T10:00:00+00:00",
+        ],
+    );
     let source = lib.source(u64::MAX);
 
-    let time = source.frame_time("2024-12-20", 5).unwrap().unwrap();
-    assert_eq!(time.local_time, "2024-12-20T09:00:05");
-    assert!(!time.exact);
+    let time = source.frame_time("2025-12-01", 2).unwrap().unwrap();
+    assert_eq!((time.local_time.as_str(), time.exact), ("2025-12-01T20:01:00+00:00", true));
+    assert_eq!(source.frame_time("2025-12-02", 0).unwrap(), None);
+    // Before the database existed there is nothing to go on.
+    make_video(&lib.root.path().join("2024-12-20--09-00-00.mov"), 2, 0);
+    assert_eq!(source.frame_time("2024-12-20", 0).unwrap(), None);
 }
 
 #[test]

@@ -119,6 +119,9 @@ pub struct FrameSource {
     /// Screenshot listings keyed by day, valid while the folder's mtime
     /// matches. Today's folder changes every second; older ones never do.
     screenshots: Mutex<HashMap<NaiveDate, (SystemTime, Arc<Vec<Shot>>)>>,
+    /// Every capture time the database has for a day, in frame-number order.
+    /// Only asked for days served from legacy videos, which never change.
+    day_times: Mutex<HashMap<NaiveDate, Arc<Vec<String>>>>,
 }
 
 impl FrameSource {
@@ -140,6 +143,7 @@ impl FrameSource {
             cache: ChunkCache::open(cache_dir, cache_cap_bytes)?,
             probes: Mutex::new(HashMap::new()),
             screenshots: Mutex::new(HashMap::new()),
+            day_times: Mutex::new(HashMap::new()),
         })
     }
 
@@ -220,7 +224,8 @@ impl FrameSource {
     }
 
     pub fn frame_time(&self, date: &str, index: usize) -> Result<Option<FrameTime>, Error> {
-        let segments = self.plan(parse_date(date)?)?;
+        let day = parse_date(date)?;
+        let segments = self.plan(day)?;
         let Ok((segment, local)) = locate(&segments, date, index) else {
             return Ok(None);
         };
@@ -238,9 +243,23 @@ impl FrameSource {
                     exact: true,
                 }))
             }
+            Segment::Video { file, .. } if file.kind == VideoKind::Legacy => {
+                // The old script named its videos after the capture day and the
+                // time *it ran*, so the name says nothing about when frames
+                // were taken. It did encode every screenshot of the day in
+                // frame-number order, so when the database has exactly as many
+                // rows for the day as the videos have frames, row N is frame N.
+                let times = self.day_times(day)?;
+                let total: usize = segments.iter().map(Segment::len).sum();
+                Ok((times.len() == total).then(|| FrameTime {
+                    local_time: times[index].clone(),
+                    exact: true,
+                }))
+            }
             Segment::Video { file, .. } => {
-                // One capture per second is the norm, but black frames and
-                // pauses leave gaps a video can't record.
+                // An hourly video is named after its first frame. One capture
+                // per second is the norm, but black frames and pauses leave
+                // gaps a video can't record.
                 let estimate = file.start + Duration::seconds(local as i64);
                 Ok(Some(FrameTime {
                     local_time: estimate.format("%Y-%m-%dT%H:%M:%S").to_string(),
@@ -342,15 +361,37 @@ impl FrameSource {
         Ok(probe)
     }
 
-    fn db_time(&self, date: &str, frame_number: u32) -> Result<Option<String>, Error> {
+    fn day_times(&self, day: NaiveDate) -> Result<Arc<Vec<String>>, Error> {
+        if let Some(times) = self.day_times.lock().unwrap().get(&day) {
+            return Ok(times.clone());
+        }
+        let Some(conn) = self.open_db()? else { return Ok(Arc::default()) };
+        let mut statement = conn.prepare(
+            "SELECT local_time FROM screenshots
+             WHERE substr(local_time, 1, 10) = ?1
+             ORDER BY frame_number, id",
+        )?;
+        let times = statement
+            .query_map([day.format("%Y-%m-%d").to_string()], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        let times = Arc::new(times);
+        self.day_times.lock().unwrap().insert(day, times.clone());
+        Ok(times)
+    }
+
+    fn open_db(&self) -> Result<Option<rusqlite::Connection>, Error> {
         let db = self.root.join("screenshots.db");
         if !db.is_file() {
             return Ok(None);
         }
-        let conn = rusqlite::Connection::open_with_flags(
+        Ok(Some(rusqlite::Connection::open_with_flags(
             &db,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?;
+        )?))
+    }
+
+    fn db_time(&self, date: &str, frame_number: u32) -> Result<Option<String>, Error> {
+        let Some(conn) = self.open_db()? else { return Ok(None) };
         // Frame numbers restart every day, so the date has to be part of the
         // key. `local_time` is ISO 8601 in local time, so its first ten
         // characters are the day folder's name.
