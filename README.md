@@ -11,7 +11,7 @@ bun install        # install dependencies
 bun run dev        # Vite dev server on :1420
 bun run tauri dev  # run the desktop app
 bun run lint       # oxlint
-bun run test:run   # Vitest
+bun test           # frontend tests (Bun's test runner)
 ```
 
 Rust tests live in `src-tauri`: `cd src-tauri && cargo test`.

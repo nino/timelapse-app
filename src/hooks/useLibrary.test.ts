@@ -1,20 +1,14 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { beforeEach, describe, expect, it, mock } from 'bun:test';
+import { invoke } from '@tauri-apps/api/core';
+import { watch } from '@tauri-apps/plugin-fs';
 import { act, renderHook, waitFor } from '@testing-library/react';
 
+import type { Day } from '../frames';
+import { mocked } from '../test/mocked';
 import { TEST_ROOT } from '../test/setup';
 import { useDay, useDays } from './useLibrary';
-import type { Day } from '../frames';
 
-vi.mock('@tauri-apps/api/core', () => ({
-  invoke: vi.fn(),
-}));
-
-vi.mock('@tauri-apps/plugin-fs', () => ({
-  watch: vi.fn(),
-}));
-
-const { invoke } = await import('@tauri-apps/api/core');
-const { watch } = await import('@tauri-apps/plugin-fs');
+// invoke and watch are replaced with mocks in src/test/setup.ts.
 
 // Every path the hooks watch, so a test can play the filesystem.
 const watchers = new Map<string, Array<() => void>>();
@@ -30,9 +24,10 @@ function day(date: string, frameCount: number): Day {
 }
 
 beforeEach(() => {
-  vi.clearAllMocks();
+  mock.clearAllMocks();
+  mocked(invoke).mockReset();
   watchers.clear();
-  vi.mocked(watch).mockImplementation(async (path, callback) => {
+  mocked(watch).mockImplementation(async (path, callback) => {
     const key = String(path);
     watchers.set(key, [
       ...(watchers.get(key) ?? []),
@@ -44,12 +39,12 @@ beforeEach(() => {
 
 describe('useDays', () => {
   it('lists days and picks up new ones when the library root changes', async () => {
-    vi.mocked(invoke).mockResolvedValueOnce(['2024-12-20']);
+    mocked(invoke).mockResolvedValueOnce(['2024-12-20']);
     const { result } = renderHook(() => useDays());
     await waitFor(() => expect(result.current.days).toEqual(['2024-12-20']));
     expect(invoke).toHaveBeenCalledWith('list_days');
 
-    vi.mocked(invoke).mockResolvedValueOnce(['2024-12-20', '2026-10-04']);
+    mocked(invoke).mockResolvedValueOnce(['2024-12-20', '2026-10-04']);
     await waitFor(() => expect(watchers.has(TEST_ROOT)).toBe(true));
     fireChange(TEST_ROOT);
 
@@ -59,7 +54,7 @@ describe('useDays', () => {
   });
 
   it('keeps the same array when nothing changed', async () => {
-    vi.mocked(invoke).mockResolvedValue(['2024-12-20']);
+    mocked(invoke).mockResolvedValue(['2024-12-20']);
     const { result } = renderHook(() => useDays());
     await waitFor(() => expect(result.current.days).toEqual(['2024-12-20']));
     const first = result.current.days;
@@ -72,11 +67,11 @@ describe('useDays', () => {
   });
 
   it('reports errors and clears them on a successful reload', async () => {
-    vi.mocked(invoke).mockRejectedValueOnce('library missing');
+    mocked(invoke).mockRejectedValueOnce('library missing');
     const { result } = renderHook(() => useDays());
     await waitFor(() => expect(result.current.daysError?.message).toBe('library missing'));
 
-    vi.mocked(invoke).mockResolvedValueOnce(['2024-12-20']);
+    mocked(invoke).mockResolvedValueOnce(['2024-12-20']);
     await waitFor(() => expect(watchers.has(TEST_ROOT)).toBe(true));
     fireChange(TEST_ROOT);
     await waitFor(() => expect(result.current.daysError).toBeNull());
@@ -85,12 +80,12 @@ describe('useDays', () => {
 
 describe('useDay', () => {
   it('loads the day and follows new captures in its folder', async () => {
-    vi.mocked(invoke).mockResolvedValueOnce(day('2026-10-04', 10));
+    mocked(invoke).mockResolvedValueOnce(day('2026-10-04', 10));
     const { result } = renderHook(() => useDay('2026-10-04'));
     await waitFor(() => expect(result.current.day?.frameCount).toBe(10));
     expect(invoke).toHaveBeenCalledWith('get_day', { date: '2026-10-04' });
 
-    vi.mocked(invoke).mockResolvedValueOnce(day('2026-10-04', 11));
+    mocked(invoke).mockResolvedValueOnce(day('2026-10-04', 11));
     const folder = `${TEST_ROOT}/2026-10-04`;
     await waitFor(() => expect(watchers.has(folder)).toBe(true));
     fireChange(folder);
@@ -105,9 +100,9 @@ describe('useDay', () => {
   });
 
   it('never shows the previous day while a new one loads', async () => {
-    vi.mocked(invoke).mockResolvedValueOnce(day('2026-10-03', 5));
+    mocked(invoke).mockResolvedValueOnce(day('2026-10-03', 5));
     let resolveNew: (value: Day) => void = () => {};
-    vi.mocked(invoke).mockReturnValueOnce(
+    mocked(invoke).mockReturnValueOnce(
       new Promise((resolve) => {
         resolveNew = resolve;
       }),
@@ -127,12 +122,12 @@ describe('useDay', () => {
 
   it('ignores a slow answer for a day that is no longer selected', async () => {
     let resolveOld: (value: Day) => void = () => {};
-    vi.mocked(invoke).mockReturnValueOnce(
+    mocked(invoke).mockReturnValueOnce(
       new Promise((resolve) => {
         resolveOld = resolve;
       }),
     );
-    vi.mocked(invoke).mockResolvedValueOnce(day('2026-10-04', 7));
+    mocked(invoke).mockResolvedValueOnce(day('2026-10-04', 7));
 
     const { result, rerender } = renderHook(({ date }: { date: string }) => useDay(date), {
       initialProps: { date: '2026-10-03' },

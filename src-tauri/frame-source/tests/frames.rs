@@ -151,6 +151,67 @@ fn prefers_screenshots_and_tracks_new_ones() {
     assert!(source.frame_time("2026-10-04", 0).unwrap().unwrap().exact);
 }
 
+/// Write a screenshot whose mtime (its capture time) is `time` local.
+fn write_shot(dir: &Path, name: &str, body: &[u8], time: &str) {
+    let path = dir.join(name);
+    fs::write(&path, body).unwrap();
+    let local = chrono::NaiveDateTime::parse_from_str(time, "%Y-%m-%d %H:%M:%S")
+        .unwrap()
+        .and_local_timezone(chrono::Local)
+        .unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(local.into())
+        .unwrap();
+}
+
+#[test]
+fn stitches_converted_hours_and_remaining_screenshots_in_time_order() {
+    let lib = Library::new();
+    let root = lib.root.path();
+    let day_dir = root.join("2026-10-04");
+    fs::create_dir(&day_dir).unwrap();
+    // 09:00 was converted in two parts and its screenshots deleted.
+    make_video(&root.join("2026-10-04--09-40-00--hourly-2.mov"), 2, 100);
+    make_video(&root.join("2026-10-04--09-00-05--hourly.mov"), 3, 0);
+    // 10:00 was converted but its screenshots are still here: they win.
+    make_video(&root.join("2026-10-04--10-00-00--hourly.mov"), 2, 50);
+    write_shot(&day_dir, "07201.png", b"ten", "2026-10-04 10:00:00");
+    write_shot(&day_dir, "07202.png", b"ten-oh-one", "2026-10-04 10:00:01");
+    // 11:00 is converted and gone again.
+    make_video(&root.join("2026-10-04--11-00-00--hourly.mov"), 1, 200);
+    let source = lib.source(u64::MAX);
+
+    let day = source.day("2026-10-04").unwrap();
+    assert_eq!((day.frame_count, day.source), (8, Source::Mixed));
+    let scratch = lib.scratch.path();
+    assert_frame(&source, "2026-10-04", 0, 0, scratch);
+    assert_frame(&source, "2026-10-04", 2, 2 * LEVEL_STEP, scratch);
+    assert_frame(&source, "2026-10-04", 3, 100, scratch);
+    assert_eq!(source.frame("2026-10-04", 6).unwrap().bytes, b"ten-oh-one");
+    assert_frame(&source, "2026-10-04", 7, 200, scratch);
+    assert!(source.frame("2026-10-04", 8).is_err());
+
+    let time = |index| source.frame_time("2026-10-04", index).unwrap().unwrap();
+    assert_eq!((time(1).local_time.as_str(), time(1).exact), ("2026-10-04T09:00:06", false));
+    assert_eq!((time(6).local_time.as_str(), time(6).exact), ("2026-10-04T10:00:01", true));
+}
+
+#[test]
+fn serves_a_fully_converted_day_from_its_hourly_videos() {
+    let lib = Library::new();
+    make_video(&lib.root.path().join("2026-10-01--09-10-00--hourly.mov"), 2, 0);
+    // An old whole-day render of the same day is ignored once hourly videos exist.
+    make_video(&lib.root.path().join("2026-10-01--23-00-00.mov"), 5, 0);
+    let source = lib.source(u64::MAX);
+
+    assert_eq!(source.days().unwrap(), vec!["2026-10-01"]);
+    let day = source.day("2026-10-01").unwrap();
+    assert_eq!((day.frame_count, day.source), (2, Source::Video));
+}
+
 #[test]
 fn lists_days_and_rejects_paths_that_are_not_days() {
     let lib = Library::new();

@@ -1,3 +1,4 @@
+mod converter;
 mod timelapse;
 mod database;
 mod paths;
@@ -347,6 +348,14 @@ pub fn run() {
                     Err(e) => {
                         eprintln!("Failed to start timelapse automatically: {}", e);
                     }
+                }
+
+                // Turn finished hours of screenshots into videos while on AC
+                // power. It runs for the life of the app, independently of the
+                // photographer, so it has no state or commands of its own yet.
+                match paths::timelapse_root() {
+                    Some(root) => converter::Converter::new_in(root).start(),
+                    None => eprintln!("Unable to find home directory; video conversion is off"),
                 }
             });
 

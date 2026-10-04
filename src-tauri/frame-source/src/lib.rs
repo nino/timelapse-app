@@ -1,15 +1,16 @@
 //! Answers "frame N of day D" for a timelapse library.
 //!
-//! Callers never learn where a frame comes from. A day is served from its
-//! screenshots (`<root>/YYYY-MM-DD/NNNNN.png`) when it has any, and otherwise
-//! from its videos (`YYYY-MM-DD--HH-MM-SS.mov|mp4`, in the root or the day
-//! folder), played back to back in start order. Video frames are decoded a
-//! chunk at a time into a size-capped LRU cache, so scrubbing through a long
-//! day only decodes the stretches actually looked at.
+//! Callers never learn where a frame comes from. A day is assembled hour by
+//! hour: an hour that still has screenshots (`<root>/YYYY-MM-DD/NNNNN.png`) is
+//! served from them, and an hour whose screenshots the converter has deleted
+//! is served from its hourly video (`YYYY-MM-DD--HH-MM-SS--hourly[-N].mov`).
+//! A day with neither falls back to the old script's whole-day videos
+//! (`YYYY-MM-DD--HH-MM-SS.mov|mp4`), played back to back. Video frames are
+//! decoded a chunk at a time into a size-capped LRU cache, so scrubbing
+//! through a long day only decodes the stretches actually looked at.
 //!
-//! Screenshots are preferred because they are never deleted (videos made from
-//! them are copies), and because they are the only source for a day still
-//! being captured.
+//! Screenshots win when both exist because they are the originals, and the
+//! only source for the hour still being captured.
 
 mod cache;
 mod library;
@@ -21,11 +22,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
-use chrono::{DateTime, Duration, Local, NaiveDate};
+use chrono::{Duration, NaiveDate};
 use serde::Serialize;
 
 use cache::ChunkCache;
-use library::VideoFile;
+use library::{Shot, VideoFile, VideoKind};
 pub use video::Tools;
 use video::VideoInfo;
 
@@ -55,6 +56,8 @@ pub enum Error {
 pub enum Source {
     Screenshots,
     Video,
+    /// Some hours from screenshots, some from converted video.
+    Mixed,
     Empty,
 }
 
@@ -91,9 +94,20 @@ struct Probe {
     info: Option<VideoInfo>,
 }
 
-enum Plan {
-    Screenshots(Arc<Vec<String>>),
-    Videos(Vec<(VideoFile, VideoInfo)>),
+/// One run of a day's frames from a single source.
+enum Segment {
+    /// `shots[range]`, all from one clock hour.
+    Screenshots { shots: Arc<Vec<Shot>>, range: std::ops::Range<usize> },
+    Video { file: VideoFile, info: VideoInfo },
+}
+
+impl Segment {
+    fn len(&self) -> usize {
+        match self {
+            Segment::Screenshots { range, .. } => range.len(),
+            Segment::Video { info, .. } => info.frame_count,
+        }
+    }
 }
 
 pub struct FrameSource {
@@ -104,7 +118,7 @@ pub struct FrameSource {
     probes: Mutex<HashMap<PathBuf, Probe>>,
     /// Screenshot listings keyed by day, valid while the folder's mtime
     /// matches. Today's folder changes every second; older ones never do.
-    screenshots: Mutex<HashMap<NaiveDate, (SystemTime, Arc<Vec<String>>)>>,
+    screenshots: Mutex<HashMap<NaiveDate, (SystemTime, Arc<Vec<Shot>>)>>,
 }
 
 impl FrameSource {
@@ -140,42 +154,42 @@ impl FrameSource {
     }
 
     pub fn day(&self, date: &str) -> Result<DaySummary, Error> {
-        let (frame_count, source) = match self.plan(parse_date(date)?)? {
-            Plan::Screenshots(files) => (files.len(), Source::Screenshots),
-            Plan::Videos(videos) if videos.is_empty() => (0, Source::Empty),
-            Plan::Videos(videos) => (
-                videos.iter().map(|(_, info)| info.frame_count).sum(),
-                Source::Video,
-            ),
+        let segments = self.plan(parse_date(date)?)?;
+        let has = |video: bool| {
+            segments.iter().any(|s| matches!(s, Segment::Video { .. }) == video)
         };
-        Ok(DaySummary { date: date.to_owned(), frame_count, source })
+        let source = match (has(false), has(true)) {
+            (false, false) => Source::Empty,
+            (true, false) => Source::Screenshots,
+            (false, true) => Source::Video,
+            (true, true) => Source::Mixed,
+        };
+        Ok(DaySummary {
+            date: date.to_owned(),
+            frame_count: segments.iter().map(Segment::len).sum(),
+            source,
+        })
     }
 
     pub fn frame(&self, date: &str, index: usize) -> Result<Frame, Error> {
         let day = parse_date(date)?;
-        match self.plan(day)? {
-            Plan::Screenshots(files) => {
-                let name = files.get(index).ok_or(Error::OutOfRange {
-                    day: date.to_owned(),
-                    index,
-                    count: files.len(),
-                })?;
-                Ok(Frame {
-                    bytes: fs::read(self.day_dir(day).join(name))?,
-                    mime: "image/png",
-                })
-            }
-            Plan::Videos(videos) => {
-                let (video, info, local) = locate(&videos, date, index)?;
+        let segments = self.plan(day)?;
+        let (segment, local) = locate(&segments, date, index)?;
+        match segment {
+            Segment::Screenshots { shots, range } => Ok(Frame {
+                bytes: fs::read(self.day_dir(day).join(&shots[range.start + local].name))?,
+                mime: "image/png",
+            }),
+            Segment::Video { file, info } => {
                 let chunk = local / CHUNK_FRAMES;
-                let file = format!("{:04}.jpg", local % CHUNK_FRAMES + 1);
-                let key = cache_key(video)?;
+                let name = format!("{:04}.jpg", local % CHUNK_FRAMES + 1);
+                let key = cache_key(file)?;
                 let chunk_dir = || {
                     self.cache.get_or_fill(&key, chunk, |out| {
                         video::extract_frames(
                             &self.tools,
-                            &video.path,
-                            info,
+                            &file.path,
+                            *info,
                             chunk * CHUNK_FRAMES,
                             CHUNK_FRAMES,
                             out,
@@ -184,7 +198,7 @@ impl FrameSource {
                     })
                 };
                 let dir = chunk_dir()?;
-                let bytes = match fs::read(dir.join(&file)) {
+                let bytes = match fs::read(dir.join(&name)) {
                     Ok(bytes) => bytes,
                     Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
                     // The chunk is whole but shorter than the container's frame
@@ -193,12 +207,12 @@ impl FrameSource {
                         return Err(Error::OutOfRange {
                             day: date.to_owned(),
                             index,
-                            count: videos.iter().map(|(_, i)| i.frame_count).sum(),
+                            count: segments.iter().map(Segment::len).sum(),
                         })
                     }
                     // Evicted between being handed out and being read: decode
                     // it again.
-                    Err(_) => fs::read(chunk_dir()?.join(&file))?,
+                    Err(_) => fs::read(chunk_dir()?.join(&name))?,
                 };
                 Ok(Frame { bytes, mime: "image/jpeg" })
             }
@@ -206,29 +220,28 @@ impl FrameSource {
     }
 
     pub fn frame_time(&self, date: &str, index: usize) -> Result<Option<FrameTime>, Error> {
-        let day = parse_date(date)?;
-        match self.plan(day)? {
-            Plan::Screenshots(files) => {
-                let Some(name) = files.get(index) else { return Ok(None) };
-                if let Some(number) = library::parse_screenshot_name(name) {
-                    if let Some(local_time) = self.db_time(date, number)? {
-                        return Ok(Some(FrameTime { local_time, exact: true }));
-                    }
+        let segments = self.plan(parse_date(date)?)?;
+        let Ok((segment, local)) = locate(&segments, date, index) else {
+            return Ok(None);
+        };
+        match segment {
+            Segment::Screenshots { shots, range } => {
+                let shot = &shots[range.start + local];
+                if let Some(local_time) = self.db_time(date, shot.number)? {
+                    return Ok(Some(FrameTime { local_time, exact: true }));
                 }
                 // Not in the database (it only goes back to late 2025): the
                 // file's mtime is when it was written, which is when it was
                 // captured.
-                let modified = fs::metadata(self.day_dir(day).join(name))?.modified()?;
                 Ok(Some(FrameTime {
-                    local_time: DateTime::<Local>::from(modified).to_rfc3339(),
+                    local_time: shot.modified.format("%Y-%m-%dT%H:%M:%S").to_string(),
                     exact: true,
                 }))
             }
-            Plan::Videos(videos) => {
-                let Ok((video, _, local)) = locate(&videos, date, index) else {
-                    return Ok(None);
-                };
-                let estimate = video.start + Duration::seconds(local as i64);
+            Segment::Video { file, .. } => {
+                // One capture per second is the norm, but black frames and
+                // pauses leave gaps a video can't record.
+                let estimate = file.start + Duration::seconds(local as i64);
                 Ok(Some(FrameTime {
                     local_time: estimate.format("%Y-%m-%dT%H:%M:%S").to_string(),
                     exact: false,
@@ -241,40 +254,74 @@ impl FrameSource {
         self.root.join(day.format("%Y-%m-%d").to_string())
     }
 
-    fn plan(&self, day: NaiveDate) -> Result<Plan, Error> {
+    /// The day's frames as an ordered list of segments. See the module docs
+    /// for which source wins.
+    fn plan(&self, day: NaiveDate) -> Result<Vec<Segment>, Error> {
         let shots = self.list_screenshots(day)?;
-        if !shots.is_empty() {
-            return Ok(Plan::Screenshots(shots));
-        }
+
         let mut videos = Vec::new();
         let mut seen = Vec::new();
-        for video in library::list_videos(&self.root, day)? {
-            let probe = self.probe(&video.path)?;
+        for file in library::list_videos(&self.root, day)? {
+            let probe = self.probe(&file.path)?;
             let Some(info) = probe.info else { continue };
             if seen.contains(&probe.fingerprint) {
                 continue;
             }
             seen.push(probe.fingerprint);
-            videos.push((video, info));
+            videos.push((file, info));
         }
-        Ok(Plan::Videos(videos))
+
+        // (hour, start, segment): sorted by hour, then by when it starts, so
+        // the parts of a split hour stay in order.
+        let mut timeline = Vec::new();
+        let mut start = 0;
+        while start < shots.len() {
+            let hour = shots[start].hour();
+            let mut end = start + 1;
+            while end < shots.len() && shots[end].hour() == hour {
+                end += 1;
+            }
+            timeline.push((
+                hour,
+                shots[start].modified,
+                Segment::Screenshots { shots: shots.clone(), range: start..end },
+            ));
+            start = end;
+        }
+        let hours_with_shots: Vec<_> = timeline.iter().map(|(hour, _, _)| *hour).collect();
+        let mut legacy = Vec::new();
+        for (file, info) in videos {
+            match file.kind {
+                VideoKind::Hourly { .. } if !hours_with_shots.contains(&file.hour()) => {
+                    timeline.push((file.hour(), file.start, Segment::Video { file, info }));
+                }
+                VideoKind::Hourly { .. } => {} // its screenshots are still here
+                VideoKind::Legacy => legacy.push(Segment::Video { file, info }),
+            }
+        }
+        if timeline.is_empty() {
+            // Only the old script's videos: they are already in start order.
+            return Ok(legacy);
+        }
+        timeline.sort_by_key(|(hour, start, _)| (*hour, *start));
+        Ok(timeline.into_iter().map(|(_, _, segment)| segment).collect())
     }
 
-    fn list_screenshots(&self, day: NaiveDate) -> Result<Arc<Vec<String>>, Error> {
+    fn list_screenshots(&self, day: NaiveDate) -> Result<Arc<Vec<Shot>>, Error> {
         let dir = self.day_dir(day);
         let modified = match fs::metadata(&dir) {
             Ok(meta) => meta.modified()?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Arc::default()),
             Err(e) => return Err(e.into()),
         };
-        if let Some((stamp, files)) = self.screenshots.lock().unwrap().get(&day) {
+        if let Some((stamp, shots)) = self.screenshots.lock().unwrap().get(&day) {
             if *stamp == modified {
-                return Ok(files.clone());
+                return Ok(shots.clone());
             }
         }
-        let files = Arc::new(library::list_screenshots(&dir)?);
-        self.screenshots.lock().unwrap().insert(day, (modified, files.clone()));
-        Ok(files)
+        let shots = Arc::new(library::list_screenshots(&dir)?);
+        self.screenshots.lock().unwrap().insert(day, (modified, shots.clone()));
+        Ok(shots)
     }
 
     fn probe(&self, path: &Path) -> Result<Probe, Error> {
@@ -326,23 +373,19 @@ fn parse_date(date: &str) -> Result<NaiveDate, Error> {
     library::parse_day(date).ok_or_else(|| Error::NotADay(date.to_owned()))
 }
 
-/// The video holding day-wide frame `index`, and the index within it.
-fn locate<'a>(
-    videos: &'a [(VideoFile, VideoInfo)],
-    date: &str,
-    index: usize,
-) -> Result<(&'a VideoFile, VideoInfo, usize), Error> {
+/// The segment holding day-wide frame `index`, and the index within it.
+fn locate<'a>(segments: &'a [Segment], date: &str, index: usize) -> Result<(&'a Segment, usize), Error> {
     let mut local = index;
-    for (video, info) in videos {
-        if local < info.frame_count {
-            return Ok((video, *info, local));
+    for segment in segments {
+        if local < segment.len() {
+            return Ok((segment, local));
         }
-        local -= info.frame_count;
+        local -= segment.len();
     }
     Err(Error::OutOfRange {
         day: date.to_owned(),
         index,
-        count: videos.iter().map(|(_, i)| i.frame_count).sum(),
+        count: segments.iter().map(Segment::len).sum(),
     })
 }
 

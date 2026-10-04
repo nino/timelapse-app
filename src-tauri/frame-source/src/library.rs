@@ -5,14 +5,54 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use chrono::{NaiveDate, NaiveDateTime};
+use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, Timelike};
 
-/// A video named `YYYY-MM-DD--HH-MM-SS.<mov|mp4>`, where the time is that of
-/// its first frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VideoKind {
+    /// `YYYY-MM-DD--HH-MM-SS.mov` from the old `all-timelapses-to-video`
+    /// script: a whole day (or what was left of it), named after when the
+    /// script ran. Its screenshots are gone.
+    Legacy,
+    /// `YYYY-MM-DD--HH-MM-SS--hourly[-N].mov` from the app's converter: one
+    /// clock hour of screenshots (part N of it, if the hour was split), named
+    /// after its first frame. The screenshots may or may not still exist.
+    Hourly { part: u32 },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VideoFile {
     pub path: PathBuf,
     pub start: NaiveDateTime,
+    pub kind: VideoKind,
+}
+
+impl VideoFile {
+    /// The clock hour an hourly video covers: its day plus the hour of its
+    /// first frame, which is how `converter.rs` buckets screenshots.
+    pub fn hour(&self) -> NaiveDateTime {
+        truncate_to_hour(self.start)
+    }
+}
+
+/// A screenshot in a day folder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Shot {
+    pub name: String,
+    pub number: u32,
+    /// Local modification time, which is when it was captured.
+    pub modified: NaiveDateTime,
+}
+
+impl Shot {
+    /// The clock hour this screenshot belongs to, the same way `converter.rs`
+    /// decides which hourly video it goes into.
+    pub fn hour(&self) -> NaiveDateTime {
+        truncate_to_hour(self.modified)
+    }
+}
+
+fn truncate_to_hour(time: NaiveDateTime) -> NaiveDateTime {
+    time.date().and_hms_opt(time.hour(), 0, 0).unwrap_or(time)
 }
 
 /// `2024-12-20` for a day folder name, `None` for anything else (including
@@ -24,14 +64,28 @@ pub fn parse_day(name: &str) -> Option<NaiveDate> {
     NaiveDate::parse_from_str(name, "%Y-%m-%d").ok()
 }
 
-/// The start time encoded in a video file name, if it follows the
-/// `YYYY-MM-DD--HH-MM-SS.<ext>` convention.
-pub fn parse_video_name(name: &str) -> Option<NaiveDateTime> {
+/// The start time and kind encoded in a video file name:
+/// `YYYY-MM-DD--HH-MM-SS.<mov|mp4>` (legacy) or
+/// `YYYY-MM-DD--HH-MM-SS--hourly[-N].mov` (converter).
+pub fn parse_video_name(name: &str) -> Option<(NaiveDateTime, VideoKind)> {
     let (stem, ext) = name.rsplit_once('.')?;
-    if !matches!(ext.to_ascii_lowercase().as_str(), "mov" | "mp4") || stem.len() != 20 {
+    if !matches!(ext.to_ascii_lowercase().as_str(), "mov" | "mp4") || !stem.is_char_boundary(20) {
         return None;
     }
-    NaiveDateTime::parse_from_str(stem, "%Y-%m-%d--%H-%M-%S").ok()
+    let (time, tag) = stem.split_at(20);
+    let start = NaiveDateTime::parse_from_str(time, "%Y-%m-%d--%H-%M-%S").ok()?;
+    let kind = match tag {
+        "" => VideoKind::Legacy,
+        "--hourly" => VideoKind::Hourly { part: 1 },
+        _ => {
+            let part: u32 = tag.strip_prefix("--hourly-")?.parse().ok()?;
+            if part < 2 {
+                return None;
+            }
+            VideoKind::Hourly { part }
+        }
+    };
+    Some((start, kind))
 }
 
 /// The frame number of a screenshot named `NNNNN.png`.
@@ -55,31 +109,33 @@ pub fn list_days(root: &Path) -> std::io::Result<Vec<NaiveDate>> {
             if let Some(day) = parse_day(name) {
                 days.insert(day);
             }
-        } else if let Some(start) = parse_video_name(name) {
+        } else if let Some((start, _)) = parse_video_name(name) {
             days.insert(start.date());
         }
     }
     Ok(days.into_iter().collect())
 }
 
-/// Screenshot file names in a day folder, in capture order. A missing folder is
-/// an empty day, not an error.
-pub fn list_screenshots(day_dir: &Path) -> std::io::Result<Vec<String>> {
+/// Screenshots in a day folder, in frame-number order. A missing folder is an
+/// empty day, not an error.
+pub fn list_screenshots(day_dir: &Path) -> std::io::Result<Vec<Shot>> {
     let entries = match fs::read_dir(day_dir) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(e),
     };
-    let mut shots: Vec<(u32, String)> = Vec::new();
+    let mut shots = Vec::new();
     for entry in entries {
         let entry = entry?;
         let Ok(name) = entry.file_name().into_string() else { continue };
-        if let Some(number) = parse_screenshot_name(&name) {
-            shots.push((number, name));
-        }
+        let Some(number) = parse_screenshot_name(&name) else { continue };
+        // The converter may delete it between the listing and the stat.
+        let Ok(modified) = entry.metadata().and_then(|m| m.modified()) else { continue };
+        let modified = DateTime::<Local>::from(modified).naive_local();
+        shots.push(Shot { name, number, modified });
     }
-    shots.sort();
-    Ok(shots.into_iter().map(|(_, name)| name).collect())
+    shots.sort_by_key(|shot| shot.number);
+    Ok(shots)
 }
 
 /// Videos for `day`, from the library root and from the day folder, in start
@@ -96,9 +152,9 @@ pub fn list_videos(root: &Path, day: NaiveDate) -> std::io::Result<Vec<VideoFile
         for entry in entries {
             let entry = entry?;
             let Ok(name) = entry.file_name().into_string() else { continue };
-            let Some(start) = parse_video_name(&name) else { continue };
+            let Some((start, kind)) = parse_video_name(&name) else { continue };
             if start.date() == day && entry.file_type()?.is_file() {
-                videos.push(VideoFile { path: entry.path(), start });
+                videos.push(VideoFile { path: entry.path(), start, kind });
             }
         }
     }
@@ -133,13 +189,25 @@ mod tests {
         assert_eq!(parse_day(".cache"), None);
         assert_eq!(parse_day("2024-12-20--12-48-38.mov"), None);
 
+        let at = |h, m, s| NaiveDate::from_ymd_opt(2024, 12, 20).unwrap().and_hms_opt(h, m, s).unwrap();
         assert_eq!(
             parse_video_name("2024-12-20--12-48-38.mov"),
-            NaiveDate::from_ymd_opt(2024, 12, 20).unwrap().and_hms_opt(12, 48, 38)
+            Some((at(12, 48, 38), VideoKind::Legacy))
         );
         assert!(parse_video_name("2025-10-20--09-03-51.mp4").is_some());
+        assert_eq!(
+            parse_video_name("2024-12-20--09-10-00--hourly.mov"),
+            Some((at(9, 10, 0), VideoKind::Hourly { part: 1 }))
+        );
+        assert_eq!(
+            parse_video_name("2024-12-20--09-40-00--hourly-2.mov"),
+            Some((at(9, 40, 0), VideoKind::Hourly { part: 2 }))
+        );
+        assert_eq!(parse_video_name("2024-12-20--09-40-00--hourly-1.mov"), None);
+        assert_eq!(parse_video_name("2024-12-20--09-40-00--daily.mov"), None);
         assert_eq!(parse_video_name("2024-12-20--12-48-38.mov.partial"), None);
         assert_eq!(parse_video_name("holiday.mov"), None);
+        assert_eq!(parse_video_name("é.mov"), None);
 
         assert_eq!(parse_screenshot_name("00042.png"), Some(42));
         assert_eq!(parse_screenshot_name("thumb.png"), None);
@@ -153,6 +221,8 @@ mod tests {
         fs::create_dir(dir.path().join(".cache")).unwrap();
         fs::write(dir.path().join("2024-12-20--12-48-38.mov"), b"a").unwrap();
         fs::write(dir.path().join("2024-12-20--17-05-22.mov"), b"b").unwrap();
+        // A day whose screenshots were all converted and deleted.
+        fs::write(dir.path().join("2026-10-01--09-10-00--hourly.mov"), b"c").unwrap();
         fs::write(dir.path().join("screenshots.db"), b"").unwrap();
 
         let days = list_days(dir.path()).unwrap();
@@ -160,6 +230,7 @@ mod tests {
             days,
             vec![
                 NaiveDate::from_ymd_opt(2024, 12, 20).unwrap(),
+                NaiveDate::from_ymd_opt(2026, 10, 1).unwrap(),
                 NaiveDate::from_ymd_opt(2026, 10, 4).unwrap(),
             ]
         );
@@ -171,10 +242,9 @@ mod tests {
         for name in ["00010.png", "00002.png", "100000.png", ".DS_Store", "notes.txt"] {
             fs::write(dir.path().join(name), b"").unwrap();
         }
-        assert_eq!(
-            list_screenshots(dir.path()).unwrap(),
-            vec!["00002.png", "00010.png", "100000.png"]
-        );
+        let names: Vec<_> =
+            list_screenshots(dir.path()).unwrap().into_iter().map(|s| s.name).collect();
+        assert_eq!(names, vec!["00002.png", "00010.png", "100000.png"]);
         assert!(list_screenshots(&dir.path().join("missing")).unwrap().is_empty());
     }
 

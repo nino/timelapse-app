@@ -5,7 +5,7 @@ export type Day = {
   date: string;
   frameCount: number;
   /** Where the frames come from. Informational only: fetching is the same either way. */
-  source: "screenshots" | "video" | "empty";
+  source: "screenshots" | "video" | "mixed" | "empty";
 };
 
 /** Mirrors `FrameTime` in Rust. */

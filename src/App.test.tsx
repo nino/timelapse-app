@@ -1,26 +1,28 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { afterAll, beforeEach, describe, expect, it, mock, spyOn } from 'bun:test';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 
 import { App } from './App';
+import * as frames from './frames';
 import { frameUrl, type Day } from './frames';
+import * as library from './hooks/useLibrary';
 
-vi.mock('./hooks/useLibrary', () => ({
-  useDays: vi.fn(),
-  useDay: vi.fn(),
-}));
+// Spied on rather than replaced with `mock.module`: Bun runs every test file in
+// one process, and a module mock would also replace the real hooks and
+// helpers that useLibrary.test.ts and frames.test.ts are testing.
+const useDays = spyOn(library, 'useDays');
+const useDay = spyOn(library, 'useDay');
+const getFrameTime = spyOn(frames, 'getFrameTime');
 
-vi.mock('./frames', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('./frames')>()),
-  getFrameTime: vi.fn(),
-}));
-
-const { useDays, useDay } = await import('./hooks/useLibrary');
-const { getFrameTime } = await import('./frames');
+afterAll(() => {
+  useDays.mockRestore();
+  useDay.mockRestore();
+  getFrameTime.mockRestore();
+});
 
 /** Pretend the library holds `counts[date]` frames for each day. */
 function mockLibrary(counts: Record<string, number>, source: Day['source'] = 'screenshots'): void {
-  vi.mocked(useDays).mockReturnValue({ days: Object.keys(counts).sort(), daysError: null });
-  vi.mocked(useDay).mockImplementation((date: string | null) => ({
+  useDays.mockReturnValue({ days: Object.keys(counts).sort(), daysError: null });
+  useDay.mockImplementation((date: string | null) => ({
     day: date === null ? null : { date, frameCount: counts[date] ?? 0, source },
     dayError: null,
   }));
@@ -48,21 +50,21 @@ function today(): string {
 
 describe('App', () => {
   beforeEach(() => {
-    vi.clearAllMocks();
-    vi.mocked(getFrameTime).mockResolvedValue(null);
+    mock.clearAllMocks();
+    getFrameTime.mockResolvedValue(null);
   });
 
   describe('Library states', () => {
     it('shows a library error', () => {
-      vi.mocked(useDays).mockReturnValue({ days: [], daysError: new Error('no access') });
-      vi.mocked(useDay).mockReturnValue({ day: null, dayError: null });
+      useDays.mockReturnValue({ days: [], daysError: new Error('no access') });
+      useDay.mockReturnValue({ day: null, dayError: null });
       render(<App />);
       expect(screen.getByText(/Could not load the timelapse library: no access/)).toBeInTheDocument();
     });
 
     it('shows a day error', () => {
-      vi.mocked(useDays).mockReturnValue({ days: ['2026-10-04'], daysError: null });
-      vi.mocked(useDay).mockReturnValue({ day: null, dayError: new Error('ffprobe missing') });
+      useDays.mockReturnValue({ days: ['2026-10-04'], daysError: null });
+      useDay.mockReturnValue({ day: null, dayError: new Error('ffprobe missing') });
       render(<App />);
       expect(screen.getByText(/ffprobe missing/)).toBeInTheDocument();
     });
@@ -189,7 +191,7 @@ describe('App', () => {
 
   describe('Frame times', () => {
     it('shows the capture time', async () => {
-      vi.mocked(getFrameTime).mockResolvedValue({
+      getFrameTime.mockResolvedValue({
         localTime: '2026-10-04T14:05:09+01:00',
         exact: true,
       });
@@ -202,7 +204,7 @@ describe('App', () => {
     });
 
     it('marks estimated times', async () => {
-      vi.mocked(getFrameTime).mockResolvedValue({ localTime: '2024-12-20T12:48:38', exact: false });
+      getFrameTime.mockResolvedValue({ localTime: '2024-12-20T12:48:38', exact: false });
       mockLibrary({ '2024-12-20': 3 }, 'video');
       render(<App />);
       await waitFor(() => expect(screen.getByText('~12:48')).toBeInTheDocument());

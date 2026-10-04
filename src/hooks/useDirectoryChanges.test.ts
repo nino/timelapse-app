@@ -1,31 +1,31 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { act, renderHook } from '@testing-library/react';
+import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from 'bun:test';
 import { BaseDirectory } from '@tauri-apps/api/path';
+import { watch } from '@tauri-apps/plugin-fs';
+import { act, renderHook } from '@testing-library/react';
 
+import { mocked } from '../test/mocked';
 import { useDirectoryChanges, useLatestLoad } from './useDirectoryChanges';
 
-vi.mock('@tauri-apps/plugin-fs', () => ({
-  watch: vi.fn(),
-}));
-
-const { watch } = await import('@tauri-apps/plugin-fs');
+// watch is replaced with a mock in src/test/setup.ts.
 
 describe('useDirectoryChanges', () => {
   beforeEach(() => {
-    vi.clearAllMocks();
+    mock.clearAllMocks();
+    mocked(watch).mockReset();
   });
 
+  const spies: Array<{ mockRestore: () => void }> = [];
   afterEach(() => {
-    vi.useRealTimers();
+    spies.splice(0).forEach((spy) => spy.mockRestore());
   });
 
   it('calls back when the watcher reports a change', async () => {
     let fire: () => void = () => {};
-    vi.mocked(watch).mockImplementation(async (_path, callback) => {
+    mocked(watch).mockImplementation(async (_path, callback) => {
       fire = (): void => callback({ type: 'any', paths: [], attrs: null });
       return (): void => {};
     });
-    const onChange = vi.fn();
+    const onChange = mock();
 
     renderHook(() => useDirectoryChanges('Timelapse/2026-10-04', onChange));
     await act(async () => {});
@@ -39,20 +39,20 @@ describe('useDirectoryChanges', () => {
   });
 
   it('does not watch when there is no path', () => {
-    renderHook(() => useDirectoryChanges(null, vi.fn()));
+    renderHook(() => useDirectoryChanges(null, mock()));
     expect(watch).not.toHaveBeenCalled();
   });
 
   it('stops watching on unmount, even if the watcher arrives late', async () => {
-    const unwatch = vi.fn();
+    const unwatch = mock();
     let resolve: (stop: () => void) => void = () => {};
-    vi.mocked(watch).mockReturnValue(
+    mocked(watch).mockReturnValue(
       new Promise((r) => {
         resolve = r;
       }),
     );
 
-    const { unmount } = renderHook(() => useDirectoryChanges('Timelapse', vi.fn()));
+    const { unmount } = renderHook(() => useDirectoryChanges('Timelapse', mock()));
     unmount();
     await act(async () => resolve(unwatch));
 
@@ -60,20 +60,24 @@ describe('useDirectoryChanges', () => {
   });
 
   it('falls back to polling when the watcher cannot be created', async () => {
-    vi.useFakeTimers();
-    vi.spyOn(console, 'warn').mockImplementation(() => {});
-    vi.mocked(watch).mockRejectedValue(new Error('fs.watch not allowed'));
-    const onChange = vi.fn();
+    // Bun has no fake timers here, so catch the interval instead of waiting 3s.
+    let poll: () => void = () => {};
+    const setInterval = spyOn(globalThis, 'setInterval').mockImplementation(((
+      callback: () => void,
+    ): number => {
+      poll = callback;
+      return 1;
+    }) as unknown as typeof globalThis.setInterval);
+    spies.push(setInterval, spyOn(console, 'warn').mockImplementation(() => {}));
+    mocked(watch).mockRejectedValue(new Error('fs.watch not allowed'));
+    const onChange = mock();
 
     renderHook(() => useDirectoryChanges('Timelapse', onChange));
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(0);
-    });
+    await act(async () => {});
+    expect(setInterval).toHaveBeenCalledWith(expect.any(Function), 3000);
     expect(onChange).not.toHaveBeenCalled();
 
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(3000);
-    });
+    act(() => poll());
     expect(onChange).toHaveBeenCalledTimes(1);
   });
 });
