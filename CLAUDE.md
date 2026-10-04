@@ -18,11 +18,15 @@ Frontend / build:
 - `bun run version:bump [major|minor|patch]` — updates **both** `package.json` and `src-tauri/tauri.conf.json` in lockstep; always use this rather than editing versions by hand. Bun runs the TypeScript file directly, so there is no `tsx`/`ts-node` step.
 
 Tests:
-- `bun run test` (watch) / `bun run test:run` (CI) / `bun run test:ui` / `bun run test:coverage` — Vitest with happy-dom; Tauri APIs are mocked in tests
+- `bun test` (also `bun run test`) / `bun run test:watch` / `bun run test:coverage` — Bun's own test runner, with happy-dom registered as the DOM; Tauri APIs are mocked in tests. Filter with `bun test <path>` or `bun test -t <name>`
 - `cd src-tauri && cargo test` — Rust unit + Tauri command tests (uses `tempfile` for filesystem isolation)
 - Single Rust test: `cargo test <test_name>` from `src-tauri/`
 
-Note: the scripts run Vitest/Vite/oxlint under **Node**, not the Bun runtime — Bun is the package manager and script runner here. `bun run test:run` is not the same thing as `bun test` (Bun's own test runner), which this project does not use.
+Note: Vite and oxlint run under **Node**; the frontend tests run under the **Bun** runtime via `bun test`. There is no Vitest.
+
+**Frontend test setup.** `bunfig.toml` preloads `src/test/happydom.ts` (registers happy-dom globals; must load first) and then `src/test/setup.ts` (jest-dom matchers, Tauri mocks, `URL.createObjectURL` stubs, `cleanup`). Import test APIs from `bun:test`. Two Bun-specific rules:
+- **`mock.module` is process-wide.** Bun runs every test file in one process, so a module mocked in one file is mocked for all of them. The Tauri modules (`@tauri-apps/plugin-fs`, `@tauri-apps/api/core`) are therefore mocked once, in `setup.ts`, with every export any test needs — add new exports there rather than calling `mock.module` in a test file. To fake one of the app's own modules, use `spyOn(namespace, 'fn')` and `mockRestore()` it in `afterAll`, as `App.test.tsx` does for the folder hooks; a `mock.module` there would replace the real hooks under `useFolders.test.ts`.
+- **No `vi.mocked`.** Use `mocked(fn)` from `src/test/mocked.ts`, a type-only cast to Bun's `Mock<T>`.
 
 ## Architecture
 
