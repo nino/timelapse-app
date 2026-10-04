@@ -22,7 +22,7 @@ Tests:
 - `cd src-tauri && cargo test` — Rust unit + Tauri command tests (uses `tempfile` for filesystem isolation)
 - Single Rust test: `cargo test <test_name>` from `src-tauri/`
 
-Note: the scripts run Vitest/Vite/oxlint under **Node**, not the Bun runtime — Bun is the package manager and script runner here. `bun run test:run` is not the same thing as `bun test` (Bun's own test runner), which this project does not use.
+Note: the scripts run Vitest/Vite/oxlint under **Node**, not the Bun runtime — Bun is the package manager and script runner here. `bun run test:run` is not the same thing as `bun test` (Bun's own test runner), which cannot run these Vitest tests. `bunfig.toml` preloads `scripts/bun-test-uses-vitest.ts` into `bun test`, which runs the full Vitest suite instead and exits with its status; Bun does not pass its CLI arguments to a preload, so use `bun run test:run <args>` to filter.
 
 ## Architecture
 
