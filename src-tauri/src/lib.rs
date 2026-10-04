@@ -1,3 +1,4 @@
+mod converter;
 mod timelapse;
 mod database;
 mod ocr;
@@ -372,12 +373,26 @@ pub fn run() {
                     }
                 }
 
-                // OCR runs for the life of the app, after the Photographer
-                // has created the library and migrated the database.
-                match paths::timelapse_root().map(ocr::start_background_ocr) {
-                    Some(true) => println!("OCR started"),
-                    Some(false) => println!("OCR is not available on this platform"),
-                    None => eprintln!("OCR not started: unable to find home directory"),
+                // Turn finished hours of screenshots into videos while on AC
+                // power, deleting an hour's PNGs only once OCR has read them.
+                // Both run for the life of the app, independently of the
+                // photographer, so they have no state or commands of their
+                // own yet.
+                match paths::timelapse_root() {
+                    Some(root) => {
+                        converter::Converter::with_delete_check(
+                            root.clone(),
+                            ocr::delete_check(&root),
+                        )
+                        .start();
+
+                        if ocr::start_background_ocr(root) {
+                            println!("OCR started");
+                        } else {
+                            println!("OCR is not available on this platform");
+                        }
+                    }
+                    None => eprintln!("Unable to find home directory; video conversion and OCR are off"),
                 }
             });
 

@@ -6,16 +6,18 @@
 //! that day's progress mark forward (see `ScreenshotDatabase::record_ocr_frame`).
 //! It only works while the machine is on AC power, like the video converter,
 //! and the converter in turn only deletes PNGs that the progress mark covers
-//! (`ocr_covers`).
+//! (`delete_check`).
 //!
 //! Recognition itself is Apple's Vision framework, so the worker only runs on
 //! macOS; everything else here is platform-independent and tested with a fake
 //! recognizer.
 
+use crate::converter::{is_day_folder_name, on_ac_power, DeleteCheck, HourBatch};
 use crate::database::ScreenshotDatabase;
 use magick_rust::{FilterType, MagickWand};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 /// How long to wait before looking again when there is nothing to read.
@@ -78,7 +80,6 @@ pub fn system_recognizer() -> Option<Box<dyn TextRecognizer>> {
 /// Whether OCR has handled every one of `frame_numbers` in `day`. This is the
 /// check the video converter makes before deleting an hour's PNGs; an unknown
 /// day, or a database error, reads as "not yet".
-#[allow(dead_code)] // Wired into the converter's DeleteCheck once both land.
 pub fn ocr_covers(
     db: &ScreenshotDatabase,
     day: &str,
@@ -90,26 +91,36 @@ pub fn ocr_covers(
     }
 }
 
-/// Whether the machine is drawing from AC power. On macOS this asks `pmset`,
-/// and anything it cannot read counts as battery. Other platforms report AC.
-///
-/// The video converter has the same check; whichever lands second should
-/// share one copy.
-pub fn on_ac_power() -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        std::process::Command::new("pmset")
-            .args(["-g", "ps"])
-            .output()
-            .ok()
-            .filter(|output| output.status.success())
-            .map(|output| String::from_utf8_lossy(&output.stdout).contains("'AC Power'"))
+/// The video converter's `DeleteCheck`: an hour's PNGs may go once OCR has
+/// handled every one of them. It keeps its own connection to the library's
+/// database; if that cannot be opened, nothing is deleted.
+pub fn delete_check(root: &Path) -> DeleteCheck {
+    let db = match ScreenshotDatabase::new(root.join("screenshots.db")) {
+        Ok(db) => Mutex::new(db),
+        Err(error) => {
+            eprintln!("OCR: cannot open database for the delete check: {}", error);
+            return Arc::new(|_| false);
+        }
+    };
+
+    Arc::new(move |batch: &HourBatch| {
+        let Some(frame_numbers) = batch
+            .frames
+            .iter()
+            .map(|path| frame_number(path))
+            .collect::<Option<Vec<u32>>>()
+        else {
+            return false;
+        };
+        db.lock()
+            .map(|db| ocr_covers(&db, &batch.day, frame_numbers))
             .unwrap_or(false)
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        true
-    }
+    })
+}
+
+/// The number in an `NNNNN.png` path.
+fn frame_number(path: &Path) -> Option<u32> {
+    path.file_name()?.to_str()?.strip_suffix(".png")?.parse().ok()
 }
 
 /// A greyscale thumbnail used to decide whether the screen changed.
@@ -315,10 +326,6 @@ fn run_forever(worker: &mut OcrWorker) {
     }
 }
 
-fn is_day_folder_name(name: &str) -> bool {
-    chrono::NaiveDate::parse_from_str(name, "%Y-%m-%d").is_ok()
-}
-
 /// Day folder names under `root`, oldest first.
 fn day_folders(root: &Path) -> std::io::Result<Vec<String>> {
     let mut days: Vec<String> = std::fs::read_dir(root)?
@@ -335,11 +342,7 @@ fn day_folders(root: &Path) -> std::io::Result<Vec<String>> {
 fn frames_after(day_dir: &Path, done_through: u32) -> std::io::Result<Vec<(u32, PathBuf)>> {
     let mut frames: Vec<(u32, PathBuf)> = std::fs::read_dir(day_dir)?
         .filter_map(|entry| entry.ok())
-        .filter_map(|entry| {
-            let name = entry.file_name().into_string().ok()?;
-            let number = name.strip_suffix(".png")?.parse::<u32>().ok()?;
-            Some((number, entry.path()))
-        })
+        .filter_map(|entry| Some((frame_number(&entry.path())?, entry.path())))
         .filter(|(number, _)| *number > done_through)
         .collect();
     frames.sort();
@@ -673,6 +676,30 @@ mod tests {
         assert!(ocr_covers(&db, DAY_1, [3, 7, 10]));
         assert!(!ocr_covers(&db, DAY_1, [9, 10, 11]));
         assert!(!ocr_covers(&db, DAY_2, [1]));
+    }
+
+    #[test]
+    fn delete_check_waits_for_ocr() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        let check = delete_check(root);
+        let batch = |frames: &[&str]| HourBatch {
+            day: DAY_1.to_string(),
+            hour: 9,
+            start: chrono::Local::now(),
+            part: 0,
+            frames: frames.iter().map(|name| root.join(DAY_1).join(name)).collect(),
+        };
+
+        assert!(!check(&batch(&["00001.png", "00002.png"])));
+
+        // OCR's own connection records progress; the check sees it.
+        let db = ScreenshotDatabase::new(root.join("screenshots.db")).unwrap();
+        db.record_ocr_frame(DAY_1, 2, None).unwrap();
+
+        assert!(check(&batch(&["00001.png", "00002.png"])));
+        assert!(!check(&batch(&["00002.png", "00003.png"])));
+        assert!(!check(&batch(&["00001.png", "notes.png"])));
     }
 
     /// Runs the real Vision recognizer on a capture named by `OCR_TEST_IMAGE`:
