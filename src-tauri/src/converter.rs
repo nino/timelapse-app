@@ -7,6 +7,10 @@
 //! the machine is on AC power, and an encode in progress is killed if the
 //! power is unplugged.
 //!
+//! Unlike the scripts, this never deletes screenshots: the PNGs stay the
+//! full-resolution record, and the video is an extra. The video's file name is
+//! what marks an hour as done — an hour whose video exists is skipped.
+//!
 //! A batch is converted like this:
 //! 1. Hard-link its PNGs into `.cache/.convert-<video>/` as a gapless
 //!    `00001.png, 00002.png, …` sequence. Screenshot numbering has gaps (black
@@ -14,10 +18,9 @@
 //! 2. Encode that folder into `.cache/.convert-<video>/out.mov`.
 //! 3. Rename the finished video into the library root, where `useVideos`
 //!    lists it.
-//! 4. Only then delete the source PNGs, and the day folder if that emptied it.
 //!
-//! An interrupted batch leaves its source PNGs in place and only a staging
-//! folder behind, which the next run clears.
+//! An interrupted batch leaves only a staging folder behind, which the next
+//! run clears.
 
 use chrono::{DateTime, Local, NaiveDate, Timelike};
 use std::collections::BTreeMap;
@@ -50,9 +53,8 @@ const ENCODE_POWER_CHECK: Duration = Duration::from_secs(30);
 /// Prefix of the staging folders under `.cache`.
 const STAGING_PREFIX: &str = ".convert-";
 
-/// Decides whether a batch may be converted yet. The converter deletes the
-/// source PNGs once the video exists, so anything else that needs the PNGs
-/// first (an OCR pass, say) can hold a batch back by returning `false` here.
+/// Decides whether a batch may be converted yet. Returning `false` holds the
+/// batch back until a later pass.
 pub type ReadyCheck = Arc<dyn Fn(&HourBatch) -> bool + Send + Sync>;
 
 /// One clock hour of screenshots from one day folder.
@@ -62,16 +64,23 @@ pub struct HourBatch {
     pub day: String,
     /// Local hour of the frames' modification times, 0–23.
     pub hour: u32,
+    /// Which slice of the hour this is, from 0. Only non-zero when the hour
+    /// has more than `MAX_FRAMES_PER_BATCH` frames.
+    pub part: usize,
     /// The PNGs, in frame-number order.
     pub frames: Vec<PathBuf>,
 }
 
 impl HourBatch {
-    /// Base name of the video, `YYYY-MM-DD--HH-00-00`. This keeps the shape of
-    /// the names `timelapse-to-video` produced, so old and new videos sort
-    /// together in the dropdown.
-    pub fn video_stem(&self) -> String {
-        format!("{}--{:02}-00-00", self.day, self.hour)
+    /// File name of the video, `YYYY-MM-DD--HH-00-00.mov`, with `-2`, `-3`, …
+    /// before the extension for later parts of an oversized hour. This keeps
+    /// the shape of the names `timelapse-to-video` produced, so old and new
+    /// videos sort together in the dropdown.
+    pub fn video_name(&self) -> String {
+        match self.part {
+            0 => format!("{}--{:02}-00-00.mov", self.day, self.hour),
+            n => format!("{}--{:02}-00-00-{}.mov", self.day, self.hour, n + 1),
+        }
     }
 }
 
@@ -133,12 +142,9 @@ fn frame_number(file_name: &str) -> Option<u32> {
 
 /// Find every hour that is ready to convert, oldest first.
 ///
-/// An hour is ready once it has ended (`now` is past the end of that hour).
-/// In today's folder an hour is also held back while it contains the
-/// highest-numbered frame: `next_filename` numbers new screenshots as
-/// `max + 1`, so deleting the newest frame would restart today's numbering.
+/// An hour is ready once it has ended (`now` is past the end of that hour) and
+/// its video does not exist yet.
 pub fn find_ready_batches(root: &Path, now: DateTime<Local>) -> std::io::Result<Vec<HourBatch>> {
-    let today = now.format("%Y-%m-%d").to_string();
     let mut batches = Vec::new();
 
     let mut day_names: Vec<String> = std::fs::read_dir(root)?
@@ -173,12 +179,6 @@ pub fn find_ready_batches(root: &Path, now: DateTime<Local>) -> std::io::Result<
         }
         frames.sort_by_key(|(number, _, _)| *number);
 
-        let newest_frame = if day == today {
-            frames.last().map(|(number, _, _)| *number)
-        } else {
-            None
-        };
-
         let mut by_hour: BTreeMap<DateTime<Local>, Vec<(u32, PathBuf)>> = BTreeMap::new();
         for (number, path, hour_start) in frames {
             by_hour.entry(hour_start).or_default().push((number, path));
@@ -188,16 +188,17 @@ pub fn find_ready_batches(root: &Path, now: DateTime<Local>) -> std::io::Result<
             if hour_start + chrono::Duration::hours(1) > now {
                 continue;
             }
-            if newest_frame.is_some_and(|newest| hour_frames.iter().any(|(n, _)| *n == newest)) {
-                continue;
-            }
             let paths: Vec<PathBuf> = hour_frames.into_iter().map(|(_, path)| path).collect();
-            for chunk in paths.chunks(MAX_FRAMES_PER_BATCH) {
-                batches.push(HourBatch {
+            for (part, chunk) in paths.chunks(MAX_FRAMES_PER_BATCH).enumerate() {
+                let batch = HourBatch {
                     day: day.clone(),
                     hour: hour_start.hour(),
+                    part,
                     frames: chunk.to_vec(),
-                });
+                };
+                if !root.join(batch.video_name()).exists() {
+                    batches.push(batch);
+                }
             }
         }
     }
@@ -243,30 +244,12 @@ fn clear_stale_staging(root: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// A file name in the library root for `stem` that is not taken yet:
-/// `<stem>.mov`, else `<stem>-2.mov`, `<stem>-3.mov`, …
-///
-/// A collision means a video for this hour already exists, for instance when a
-/// previous run published its video but was killed before deleting the frames.
-/// Writing alongside it rather than over it means a collision can never lose
-/// footage.
-fn free_video_name(root: &Path, stem: &str) -> String {
-    let first = format!("{}.mov", stem);
-    if !root.join(&first).exists() {
-        return first;
-    }
-    (2..)
-        .map(|n| format!("{}-{}.mov", stem, n))
-        .find(|name| !root.join(name).exists())
-        .expect("an unbounded range always yields a free name")
-}
-
 /// Convert one batch. `encode` turns a folder of gapless `%05d.png` frames
 /// into the video at the given path; it is a parameter so tests can run the
 /// publishing and cleanup steps without ffmpeg.
 ///
-/// Returns the published video's file name. On any error the source frames
-/// are left where they were.
+/// Returns the published video's file name. The source frames are never
+/// modified.
 pub fn convert_batch(
     root: &Path,
     batch: &HourBatch,
@@ -274,7 +257,8 @@ pub fn convert_batch(
 ) -> Result<String, ConvertError> {
     let failed = |what: &str, e: std::io::Error| ConvertError::Failed(format!("{}: {}", what, e));
 
-    let stem = batch.video_stem();
+    let video_name = batch.video_name();
+    let stem = video_name.trim_end_matches(".mov");
     let staging = root.join(".cache").join(format!("{}{}", STAGING_PREFIX, stem));
     if staging.exists() {
         std::fs::remove_dir_all(&staging).map_err(|e| failed("Failed to clear staging folder", e))?;
@@ -303,23 +287,19 @@ pub fn convert_batch(
             )));
         }
 
-        let video_name = free_video_name(root, &stem);
-        std::fs::rename(&staged_video, root.join(&video_name))
+        // `rename` replaces an existing file, and a video already at this
+        // name may be one nothing else can regenerate.
+        let published = root.join(&video_name);
+        if published.exists() {
+            return Err(ConvertError::Failed(format!("{} already exists", video_name)));
+        }
+        std::fs::rename(&staged_video, &published)
             .map_err(|e| failed("Failed to publish video", e))?;
-        Ok(video_name)
+        Ok(video_name.clone())
     })();
 
     let _ = std::fs::remove_dir_all(&staging);
-    let video_name = result?;
-
-    // The video is in place, so the frames can go.
-    for frame in &batch.frames {
-        if let Err(e) = std::fs::remove_file(frame) {
-            eprintln!("Converted {} but could not delete {:?}: {}", video_name, frame, e);
-        }
-    }
-
-    Ok(video_name)
+    result
 }
 
 /// The ffmpeg invocation from `timelapse-to-video`, reading `frames_dir` and
@@ -581,26 +561,21 @@ mod tests {
         // Hours that ended convert; 11:00 is still going.
         let summary: Vec<(u32, usize)> = batches.iter().map(|b| (b.hour, b.frames.len())).collect();
         assert_eq!(summary, vec![(9, 2), (10, 1)]);
-        assert_eq!(batches[0].video_stem(), "2026-10-01--09-00-00");
+        assert_eq!(batches[0].video_name(), "2026-10-01--09-00-00.mov");
     }
 
     #[test]
-    fn holds_back_the_hour_with_todays_newest_frame() {
+    fn skips_hours_that_already_have_a_video() {
         let temp = TempDir::new().unwrap();
         let root = temp.path();
         frame(root, "2026-10-04", 1, at("2026-10-04", 8, 0));
         frame(root, "2026-10-04", 2, at("2026-10-04", 9, 0));
+        fs::write(root.join("2026-10-04--08-00-00.mov"), b"done").unwrap();
 
-        // Both hours are over, but deleting 00002.png would make the next
-        // screenshot 00001.png again.
         let batches = find_ready_batches(root, at("2026-10-04", 12, 0)).unwrap();
-        let hours: Vec<u32> = batches.iter().map(|b| b.hour).collect();
-        assert_eq!(hours, vec![8]);
 
-        // The same layout on a past day converts fully.
-        let batches = find_ready_batches(root, at("2026-10-05", 12, 0)).unwrap();
         let hours: Vec<u32> = batches.iter().map(|b| b.hour).collect();
-        assert_eq!(hours, vec![8, 9]);
+        assert_eq!(hours, vec![9]);
     }
 
     #[test]
@@ -634,10 +609,12 @@ mod tests {
 
         let sizes: Vec<usize> = batches.iter().map(|b| b.frames.len()).collect();
         assert_eq!(sizes, vec![MAX_FRAMES_PER_BATCH, 5]);
+        let names: Vec<String> = batches.iter().map(HourBatch::video_name).collect();
+        assert_eq!(names, vec!["2026-10-01--09-00-00.mov", "2026-10-01--09-00-00-2.mov"]);
     }
 
     #[test]
-    fn converting_publishes_the_video_then_deletes_the_frames() {
+    fn converting_publishes_the_video_and_keeps_the_frames() {
         let temp = TempDir::new().unwrap();
         let root = temp.path();
         let a = frame(root, "2026-10-01", 1, at("2026-10-01", 9, 0));
@@ -651,8 +628,13 @@ mod tests {
         assert_eq!(name, "2026-10-01--09-00-00.mov");
         assert_eq!(seen, 2, "the gap between 1 and 7 should be closed up");
         assert_eq!(fs::read(root.join(&name)).unwrap(), b"video");
-        assert!(!a.exists() && !b.exists(), "converted frames are deleted");
-        assert!(keep.exists(), "frames from other hours are left alone");
+        assert_eq!(fs::read(&a).unwrap(), b"frame 1", "screenshots are never deleted");
+        assert_eq!(fs::read(&b).unwrap(), b"frame 7");
+        assert!(keep.exists());
+        assert!(
+            find_ready_batches(root, at("2026-10-02", 0, 0)).unwrap().iter().all(|b| b.hour != 9),
+            "a converted hour is not offered again"
+        );
         assert!(
             fs::read_dir(root.join(".cache")).unwrap().next().is_none(),
             "the staging folder is cleaned up"
@@ -695,14 +677,15 @@ mod tests {
     fn an_existing_video_is_never_overwritten() {
         let temp = TempDir::new().unwrap();
         let root = temp.path();
-        fs::write(root.join("2026-10-01--09-00-00.mov"), b"earlier").unwrap();
         frame(root, "2026-10-01", 1, at("2026-10-01", 9, 0));
         let batch = find_ready_batches(root, at("2026-10-02", 0, 0)).unwrap().remove(0);
+        // Appears while the batch is encoding.
+        fs::write(root.join("2026-10-01--09-00-00.mov"), b"earlier").unwrap();
 
         let mut seen = 0;
-        let name = convert_batch(root, &batch, fake_encode(&mut seen)).unwrap();
+        let result = convert_batch(root, &batch, fake_encode(&mut seen));
 
-        assert_eq!(name, "2026-10-01--09-00-00-2.mov");
+        assert!(matches!(result, Err(ConvertError::Failed(_))));
         assert_eq!(fs::read(root.join("2026-10-01--09-00-00.mov")).unwrap(), b"earlier");
     }
 
@@ -805,6 +788,6 @@ mod tests {
             .unwrap();
         let probe = String::from_utf8_lossy(&probe.stdout);
         assert_eq!(probe.trim(), "hevc,1800,1124,5", "all five frames, gap closed");
-        assert!(fs::read_dir(&day_dir).unwrap().next().is_none());
+        assert_eq!(fs::read_dir(&day_dir).unwrap().count(), 5, "the PNGs are kept");
     }
 }
