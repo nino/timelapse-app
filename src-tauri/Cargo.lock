@@ -1275,6 +1275,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "frame_source"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "rusqlite",
+ "serde",
+ "tempfile",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "fsevent-sys"
 version = "4.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4285,6 +4296,7 @@ dependencies = [
  "active-win-pos-rs",
  "chrono",
  "dirs 5.0.1",
+ "frame_source",
  "magick_rust",
  "rusqlite",
  "screenshots",

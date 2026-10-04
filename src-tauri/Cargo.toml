@@ -31,6 +31,12 @@ magick_rust = "1.0.0"
 screenshots = "0.5"
 active-win-pos-rs = "0.8"
 rusqlite = { version = "0.32", features = ["bundled"] }
+frame_source = { path = "frame-source" }
 
 [dev-dependencies]
 tempfile = "3.17"
+
+# The frame source is its own crate so it can be built and tested without the
+# capture stack (MagickWand, screen capture): `cargo test -p frame_source`.
+[workspace]
+members = ["frame-source"]
