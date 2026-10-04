@@ -1,17 +1,15 @@
-import { describe, it, expect, vi, afterEach } from 'vitest';
+import { afterEach, describe, expect, it } from 'bun:test';
+import { invoke } from '@tauri-apps/api/core';
 
 import {
   initTimelapseRoot,
   setTimelapseRootForTests,
   timelapseRoot,
 } from './timelapseRoot';
+import { mocked } from './test/mocked';
 import { TEST_ROOT } from './test/setup';
 
-vi.mock('@tauri-apps/api/core', () => ({
-  invoke: vi.fn(),
-}));
-
-const { invoke } = await import('@tauri-apps/api/core');
+// invoke is replaced with a mock in src/test/setup.ts.
 
 afterEach(() => {
   // Restore what src/test/setup.ts established for the rest of the suite.
@@ -29,7 +27,7 @@ describe('timelapseRoot', () => {
 
   it('takes the root from Rust, not from the bundler environment', async () => {
     setTimelapseRootForTests(null);
-    vi.mocked(invoke).mockResolvedValue('Timelapse_from_rust');
+    mocked(invoke).mockResolvedValue('Timelapse_from_rust');
 
     await initTimelapseRoot();
 

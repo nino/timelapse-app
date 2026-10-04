@@ -1,2 +1,4 @@
 [test]
-preload = ["./scripts/bun-test-uses-vitest.ts"]
+# happydom.ts must load first: it installs `window`/`document`, which
+# @testing-library/react expects to find when setup.ts imports it.
+preload = ["./src/test/happydom.ts", "./src/test/setup.ts"]

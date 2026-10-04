@@ -21,9 +21,9 @@ directory and confirming nothing is created inside it.
 ## Frontend Tests
 
 ### Technology Stack
-- **Test Runner**: Vitest 4.0
+- **Test Runner**: `bun test` (Bun's built-in runner)
 - **Testing Library**: @testing-library/react 16.3
-- **Environment**: happy-dom (modern, faster alternative to jsdom)
+- **Environment**: happy-dom, registered globally by `@happy-dom/global-registrator`
 - **Assertions**: @testing-library/jest-dom matchers
 
 ### Test Files
@@ -113,14 +113,15 @@ literal fails the suite instead of passing silently.
 ### Running Frontend Tests
 
 ```bash
-# Run tests in watch mode (interactive)
-bun run test
+# Run tests once
+bun test
 
-# Run tests once (CI mode)
-bun run test:run
+# Run one file, or tests whose name matches a pattern
+bun test src/hooks/useFolders.test.ts
+bun test -t "useVideos"
 
-# Run tests with UI
-bun run test:ui
+# Run tests in watch mode
+bun run test:watch
 
 # Run tests with coverage report
 bun run test:coverage
@@ -238,26 +239,23 @@ cargo tarpaulin --out Html
 
 ## Test Configuration
 
-### Vitest Configuration (`vitest.config.ts`)
-```typescript
-export default defineConfig({
-  plugins: [react()],
-  test: {
-    globals: true,
-    environment: 'happy-dom',
-    setupFiles: ['./src/test/setup.ts'],
-    coverage: {
-      provider: 'v8',
-      reporter: ['text', 'json', 'html'],
-    },
-  },
-});
+### Bun Configuration (`bunfig.toml`)
+```toml
+[test]
+preload = ["./src/test/happydom.ts", "./src/test/setup.ts"]
 ```
 
-### Test Setup (`src/test/setup.ts`)
-- Extends Vitest expect with jest-dom matchers
-- Mocks URL.createObjectURL and URL.revokeObjectURL
-- Automatic cleanup after each test
+### Test Setup
+- `src/test/happydom.ts` registers happy-dom's `window`/`document` globals. It
+  loads first because React Testing Library needs them at import time.
+- `src/test/setup.ts`:
+  - Extends Bun's expect with jest-dom matchers (typed in `src/test/jest-dom.d.ts`)
+  - Mocks the Tauri modules (`readDir`, `readFile`, `invoke`) once for the whole
+    run. `mock.module` in Bun is process-wide, so test files must not re-mock
+    them with a different shape.
+  - Mocks URL.createObjectURL and URL.revokeObjectURL
+  - Automatic cleanup after each test
+- `src/test/mocked.ts` exports `mocked(fn)`, the replacement for `vi.mocked`.
 
 ## Key Testing Patterns
 
@@ -279,7 +277,7 @@ To run all tests in CI:
 
 ```bash
 # Frontend tests
-bun run test:run
+bun test
 
 # Rust tests
 cd src-tauri && cargo test --release
@@ -316,7 +314,7 @@ When adding new features:
 
 ## Resources
 
-- [Vitest Documentation](https://vitest.dev/)
+- [Bun test runner](https://bun.sh/docs/cli/test)
 - [React Testing Library](https://testing-library.com/react)
 - [Rust Testing Guide](https://doc.rust-lang.org/book/ch11-00-testing.html)
 - [Tauri Testing](https://tauri.app/develop/tests/)
