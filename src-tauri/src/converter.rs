@@ -65,6 +65,8 @@ pub struct HourBatch {
     pub day: String,
     /// Local hour of the frames' modification times, 0–23.
     pub hour: u32,
+    /// Modification time of the first frame.
+    pub start: DateTime<Local>,
     /// Which slice of the hour this is, from 0. Only non-zero when the hour
     /// has more than `MAX_FRAMES_PER_BATCH` frames.
     pub part: usize,
@@ -73,14 +75,20 @@ pub struct HourBatch {
 }
 
 impl HourBatch {
-    /// File name of the video, `YYYY-MM-DD--HH-00-00.mov`, with `-2`, `-3`, …
-    /// before the extension for later parts of an oversized hour. This keeps
-    /// the shape of the names `timelapse-to-video` produced, so old and new
-    /// videos sort together in the dropdown.
+    /// File name of the video: `YYYY-MM-DD--HH-MM-SS--hourly.mov`, where the
+    /// time is the first frame's, with `-2`, `-3`, … after `hourly` for later
+    /// parts of an oversized hour.
+    ///
+    /// The viewer reads the leading date and time as the video's start, and
+    /// sorts these alongside the old script's `YYYY-MM-DD--HH-MM-SS.mov`
+    /// videos. The `--hourly` tag is what tells the two apart: the old names
+    /// carry the time the script ran, which can be any time of day, so a bare
+    /// `YYYY-MM-DD--HH-…` name cannot say whether this hour was converted.
     pub fn video_name(&self) -> String {
+        let start = self.start.format("%H-%M-%S");
         match self.part {
-            0 => format!("{}--{:02}-00-00.mov", self.day, self.hour),
-            n => format!("{}--{:02}-00-00-{}.mov", self.day, self.hour, n + 1),
+            0 => format!("{}--{}--hourly.mov", self.day, start),
+            n => format!("{}--{}--hourly-{}.mov", self.day, start, n + 1),
         }
     }
 }
@@ -190,6 +198,9 @@ pub fn delete_frames(parts: &[HourBatch]) -> usize {
     deleted
 }
 
+/// A screenshot's frame number, path and modification time.
+type Frame = (u32, PathBuf, DateTime<Local>);
+
 /// One ended clock hour of one day folder.
 struct EndedHour {
     /// The hour's batches, split at `MAX_FRAMES_PER_BATCH`.
@@ -214,8 +225,8 @@ fn find_ended_hours(root: &Path, now: DateTime<Local>) -> std::io::Result<Vec<En
     for day in day_names {
         let day_dir = root.join(&day);
 
-        // (frame number, path, hour start) for every screenshot in the folder.
-        let mut frames: Vec<(u32, PathBuf, DateTime<Local>)> = Vec::new();
+        // (frame number, path, mtime, hour start) for every screenshot.
+        let mut frames: Vec<(u32, PathBuf, DateTime<Local>, DateTime<Local>)> = Vec::new();
         for entry in std::fs::read_dir(&day_dir)?.filter_map(|entry| entry.ok()) {
             let Some(number) = entry.file_name().to_str().and_then(frame_number) else {
                 continue;
@@ -231,19 +242,19 @@ fn find_ended_hours(root: &Path, now: DateTime<Local>) -> std::io::Result<Vec<En
             else {
                 continue;
             };
-            frames.push((number, entry.path(), hour_start));
+            frames.push((number, entry.path(), modified, hour_start));
         }
-        frames.sort_by_key(|(number, _, _)| *number);
+        frames.sort_by_key(|(number, _, _, _)| *number);
 
         let todays_newest = if day == today {
-            frames.last().map(|(number, _, _)| *number)
+            frames.last().map(|(number, _, _, _)| *number)
         } else {
             None
         };
 
-        let mut by_hour: BTreeMap<DateTime<Local>, Vec<(u32, PathBuf)>> = BTreeMap::new();
-        for (number, path, hour_start) in frames {
-            by_hour.entry(hour_start).or_default().push((number, path));
+        let mut by_hour: BTreeMap<DateTime<Local>, Vec<Frame>> = BTreeMap::new();
+        for (number, path, modified, hour_start) in frames {
+            by_hour.entry(hour_start).or_default().push((number, path, modified));
         }
 
         for (hour_start, hour_frames) in by_hour {
@@ -251,16 +262,16 @@ fn find_ended_hours(root: &Path, now: DateTime<Local>) -> std::io::Result<Vec<En
                 continue;
             }
             let holds_todays_newest_frame =
-                todays_newest.is_some_and(|newest| hour_frames.iter().any(|(n, _)| *n == newest));
-            let paths: Vec<PathBuf> = hour_frames.into_iter().map(|(_, path)| path).collect();
-            let parts = paths
+                todays_newest.is_some_and(|newest| hour_frames.iter().any(|(n, _, _)| *n == newest));
+            let parts = hour_frames
                 .chunks(MAX_FRAMES_PER_BATCH)
                 .enumerate()
                 .map(|(part, chunk)| HourBatch {
                     day: day.clone(),
                     hour: hour_start.hour(),
+                    start: chunk[0].2,
                     part,
-                    frames: chunk.to_vec(),
+                    frames: chunk.iter().map(|(_, path, _)| path.clone()).collect(),
                 })
                 .collect();
             hours.push(EndedHour {
@@ -642,7 +653,7 @@ mod tests {
         // Hours that ended convert; 11:00 is still going.
         let summary: Vec<(u32, usize)> = batches.iter().map(|b| (b.hour, b.frames.len())).collect();
         assert_eq!(summary, vec![(9, 2), (10, 1)]);
-        assert_eq!(batches[0].video_name(), "2026-10-01--09-00-00.mov");
+        assert_eq!(batches[0].video_name(), "2026-10-01--09-10-00--hourly.mov");
     }
 
     #[test]
@@ -651,12 +662,26 @@ mod tests {
         let root = temp.path();
         frame(root, "2026-10-04", 1, at("2026-10-04", 8, 0));
         frame(root, "2026-10-04", 2, at("2026-10-04", 9, 0));
-        fs::write(root.join("2026-10-04--08-00-00.mov"), b"done").unwrap();
+        fs::write(root.join("2026-10-04--08-00-00--hourly.mov"), b"done").unwrap();
 
         let batches = find_ready_batches(root, at("2026-10-04", 12, 0)).unwrap();
 
         let hours: Vec<u32> = batches.iter().map(|b| b.hour).collect();
         assert_eq!(hours, vec![9]);
+    }
+
+    // The old script named a whole day's video after the time it ran, so
+    // `2026-10-01--09-…` from it says nothing about 09:00 of that day.
+    #[test]
+    fn a_legacy_video_does_not_mark_an_hour_converted() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        frame(root, "2026-10-01", 1, at("2026-10-01", 9, 0));
+        fs::write(root.join("2026-10-01--09-00-00.mov"), b"whole day").unwrap();
+        let now = at("2026-10-02", 0, 0);
+
+        assert_eq!(find_ready_batches(root, now).unwrap().len(), 1);
+        assert!(find_deletable_hours(root, now, &always(true)).unwrap().is_empty());
     }
 
     fn always(answer: bool) -> DeleteCheck {
@@ -669,7 +694,7 @@ mod tests {
         let root = temp.path();
         let converted = frame(root, "2026-10-01", 1, at("2026-10-01", 8, 0));
         frame(root, "2026-10-01", 2, at("2026-10-01", 9, 0));
-        fs::write(root.join("2026-10-01--08-00-00.mov"), b"video").unwrap();
+        fs::write(root.join("2026-10-01--08-00-00--hourly.mov"), b"video").unwrap();
         let now = at("2026-10-02", 0, 0);
 
         assert!(
@@ -693,8 +718,8 @@ mod tests {
         let root = temp.path();
         frame(root, "2026-10-04", 1, at("2026-10-04", 8, 0));
         frame(root, "2026-10-04", 2, at("2026-10-04", 9, 0));
-        fs::write(root.join("2026-10-04--08-00-00.mov"), b"video").unwrap();
-        fs::write(root.join("2026-10-04--09-00-00.mov"), b"video").unwrap();
+        fs::write(root.join("2026-10-04--08-00-00--hourly.mov"), b"video").unwrap();
+        fs::write(root.join("2026-10-04--09-00-00--hourly.mov"), b"video").unwrap();
 
         // Both hours are converted, but deleting 00002.png would make the next
         // screenshot 00001.png again.
@@ -716,12 +741,12 @@ mod tests {
         for n in 1..=(MAX_FRAMES_PER_BATCH as u32 + 1) {
             frame(root, "2026-10-01", n, when);
         }
-        fs::write(root.join("2026-10-01--09-00-00.mov"), b"part 1").unwrap();
+        fs::write(root.join("2026-10-01--09-00-00--hourly.mov"), b"part 1").unwrap();
         let now = at("2026-10-02", 0, 0);
 
         assert!(find_deletable_hours(root, now, &always(true)).unwrap().is_empty());
 
-        fs::write(root.join("2026-10-01--09-00-00-2.mov"), b"part 2").unwrap();
+        fs::write(root.join("2026-10-01--09-00-00--hourly-2.mov"), b"part 2").unwrap();
         let hours = find_deletable_hours(root, now, &always(true)).unwrap();
         assert_eq!(hours.len(), 1);
         assert_eq!(hours[0].len(), 2);
@@ -759,7 +784,7 @@ mod tests {
         let sizes: Vec<usize> = batches.iter().map(|b| b.frames.len()).collect();
         assert_eq!(sizes, vec![MAX_FRAMES_PER_BATCH, 5]);
         let names: Vec<String> = batches.iter().map(HourBatch::video_name).collect();
-        assert_eq!(names, vec!["2026-10-01--09-00-00.mov", "2026-10-01--09-00-00-2.mov"]);
+        assert_eq!(names, vec!["2026-10-01--09-00-00--hourly.mov", "2026-10-01--09-00-00--hourly-2.mov"]);
     }
 
     #[test]
@@ -774,7 +799,7 @@ mod tests {
         let mut seen = 0;
         let name = convert_batch(root, &batch, fake_encode(&mut seen)).unwrap();
 
-        assert_eq!(name, "2026-10-01--09-00-00.mov");
+        assert_eq!(name, "2026-10-01--09-00-00--hourly.mov");
         assert_eq!(seen, 2, "the gap between 1 and 7 should be closed up");
         assert_eq!(fs::read(root.join(&name)).unwrap(), b"video");
         assert_eq!(fs::read(&a).unwrap(), b"frame 1", "converting never deletes frames");
@@ -801,7 +826,7 @@ mod tests {
 
         assert_eq!(result, Err(ConvertError::Interrupted));
         assert!(a.exists());
-        assert!(!root.join("2026-10-01--09-00-00.mov").exists());
+        assert!(!root.join("2026-10-01--09-00-00--hourly.mov").exists());
         assert!(fs::read_dir(root.join(".cache")).unwrap().next().is_none());
     }
 
@@ -819,7 +844,7 @@ mod tests {
 
         assert!(matches!(result, Err(ConvertError::Failed(_))));
         assert!(a.exists());
-        assert!(!root.join("2026-10-01--09-00-00.mov").exists());
+        assert!(!root.join("2026-10-01--09-00-00--hourly.mov").exists());
     }
 
     #[test]
@@ -829,13 +854,13 @@ mod tests {
         frame(root, "2026-10-01", 1, at("2026-10-01", 9, 0));
         let batch = find_ready_batches(root, at("2026-10-02", 0, 0)).unwrap().remove(0);
         // Appears while the batch is encoding.
-        fs::write(root.join("2026-10-01--09-00-00.mov"), b"earlier").unwrap();
+        fs::write(root.join("2026-10-01--09-00-00--hourly.mov"), b"earlier").unwrap();
 
         let mut seen = 0;
         let result = convert_batch(root, &batch, fake_encode(&mut seen));
 
         assert!(matches!(result, Err(ConvertError::Failed(_))));
-        assert_eq!(fs::read(root.join("2026-10-01--09-00-00.mov")).unwrap(), b"earlier");
+        assert_eq!(fs::read(root.join("2026-10-01--09-00-00--hourly.mov")).unwrap(), b"earlier");
     }
 
     #[test]
