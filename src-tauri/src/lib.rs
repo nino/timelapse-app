@@ -1,11 +1,13 @@
 mod timelapse;
 mod database;
+mod ocr;
 mod paths;
 
 use std::path::Path;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use tauri::{Manager, State};
+use database::{OcrHit, ScreenshotDatabase};
 use timelapse::Photographer;
 
 // Shared state to manage the timelapse photographer
@@ -88,12 +90,13 @@ fn clear_error_logs_impl(state: &PhotographerState) -> Result<String, String> {
 fn get_screenshot_metadata_impl(
     state: &PhotographerState,
     frame_number: u32,
+    day: Option<&str>,
 ) -> Result<Option<(String, String)>, String> {
     let photographer_guard = state.lock().map_err(|e| e.to_string())?;
 
     if let Some(photographer) = &*photographer_guard {
         photographer
-            .get_screenshot_metadata(frame_number)
+            .get_screenshot_metadata(frame_number, day)
             .map_err(|e| e.to_string())
     } else {
         Err("Timelapse is not running".to_string())
@@ -248,8 +251,21 @@ async fn extract_video_frames(video_filename: String) -> Result<String, String> 
 async fn get_screenshot_metadata(
     state: State<'_, PhotographerState>,
     frame_number: u32,
+    day: Option<String>,
 ) -> Result<Option<(String, String)>, String> {
-    get_screenshot_metadata_impl(state.inner(), frame_number)
+    get_screenshot_metadata_impl(state.inner(), frame_number, day.as_deref())
+}
+
+/// Search the OCR text of every screenshot in `<root>`, newest first.
+fn search_ocr_impl(root: &Path, query: &str, limit: u32) -> Result<Vec<OcrHit>, String> {
+    let db = ScreenshotDatabase::new(root.join("screenshots.db")).map_err(|e| e.to_string())?;
+    db.search_ocr(query, limit).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn search_ocr(query: String, limit: Option<u32>) -> Result<Vec<OcrHit>, String> {
+    let timelapse_root = paths::timelapse_root().ok_or("Unable to find home directory")?;
+    search_ocr_impl(&timelapse_root, &query, limit.unwrap_or(100))
 }
 
 /// Delete every directory directly under `<root>/.cache` whose mtime is more
@@ -355,6 +371,14 @@ pub fn run() {
                         eprintln!("Failed to start timelapse automatically: {}", e);
                     }
                 }
+
+                // OCR runs for the life of the app, after the Photographer
+                // has created the library and migrated the database.
+                match paths::timelapse_root().map(ocr::start_background_ocr) {
+                    Some(true) => println!("OCR started"),
+                    Some(false) => println!("OCR is not available on this platform"),
+                    None => eprintln!("OCR not started: unable to find home directory"),
+                }
             });
 
             Ok(())
@@ -369,7 +393,8 @@ pub fn run() {
             clear_error_logs,
             extract_video_frames,
             evict_old_cache,
-            get_screenshot_metadata
+            get_screenshot_metadata,
+            search_ocr
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -528,7 +553,7 @@ mod tests {
     fn test_get_screenshot_metadata_not_running() {
         let state = idle_state();
 
-        let result = get_screenshot_metadata_impl(&state, 1);
+        let result = get_screenshot_metadata_impl(&state, 1, None);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), "Timelapse is not running");
     }
@@ -538,7 +563,7 @@ mod tests {
         let (_temp_dir, state) = running_state();
 
         // Nothing has been captured into this temp library yet.
-        let result = get_screenshot_metadata_impl(&state, 1);
+        let result = get_screenshot_metadata_impl(&state, 1, None);
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
     }
@@ -820,5 +845,18 @@ mod tests {
             fs::read(published.join("frame000001.jpg")).unwrap(),
             b"a frame"
         );
+    }
+
+    #[test]
+    fn test_search_ocr_reads_the_library_database() {
+        let temp_dir = TempDir::new().unwrap();
+        let db = ScreenshotDatabase::new(temp_dir.path().join("screenshots.db")).unwrap();
+        db.record_ocr_frame("2024-01-01", 4, Some(("cargo test", "[]"))).unwrap();
+
+        let hits = search_ocr_impl(temp_dir.path(), "cargo", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!((hits[0].day.as_str(), hits[0].frame_number), ("2024-01-01", 4));
+
+        assert!(search_ocr_impl(temp_dir.path(), "nothing", 10).unwrap().is_empty());
     }
 }

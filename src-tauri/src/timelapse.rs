@@ -16,7 +16,7 @@ use crate::database::ScreenshotDatabase;
 // Ensure MagickWand is initialized only once
 static MAGICK_WAND_GENESIS: Once = Once::new();
 
-fn init_magick_wand() {
+pub(crate) fn init_magick_wand() {
     MAGICK_WAND_GENESIS.call_once(|| {
         magick_wand_genesis();
     });
@@ -156,26 +156,31 @@ impl Photographer {
         }
     }
 
-    pub fn get_screenshot_metadata(&self, frame_number: u32) -> Result<Option<(String, String)>, Error> {
+    pub fn get_screenshot_metadata(
+        &self,
+        frame_number: u32,
+        day: Option<&str>,
+    ) -> Result<Option<(String, String)>, Error> {
         if let Ok(db_guard) = self.db.lock() {
-            Ok(db_guard.get_screenshot_by_frame(frame_number)?)
+            Ok(db_guard.get_screenshot_by_frame(frame_number, day)?)
         } else {
             Err(Error::DatabaseError(rusqlite::Error::InvalidQuery))
         }
     }
 
-    fn create_day_dir_if_needed(timelapse_root_path: &PathBuf) -> Result<PathBuf, Error> {
+    /// Create today's folder if needed, and return its name and path.
+    fn create_day_dir_if_needed(timelapse_root_path: &PathBuf) -> Result<(String, PathBuf), Error> {
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
         let day_dir = timelapse_root_path.join(&today);
         std::fs::create_dir_all(&day_dir)?;
-        Ok(day_dir)
+        Ok((today, day_dir))
     }
 
     async fn do_screenshot(
         timelapse_root_path: &PathBuf,
         db: &Arc<Mutex<ScreenshotDatabase>>,
     ) -> Result<bool, Error> {
-        let day_dir = Self::create_day_dir_if_needed(timelapse_root_path)?;
+        let (day, day_dir) = Self::create_day_dir_if_needed(timelapse_root_path)?;
         let filename = next_filename(&day_dir)?;
         let screenshot_path = String::from(
             day_dir
@@ -203,7 +208,7 @@ impl Photographer {
             let created_at = Utc::now();
             let local_time = Local::now();
             if let Ok(db_guard) = db.lock() {
-                db_guard.insert_screenshot(frame_number, created_at, local_time)?;
+                db_guard.insert_screenshot(&day, frame_number, created_at, local_time)?;
             }
 
             Ok(false) // Return false for normal screenshots
@@ -545,12 +550,13 @@ mod tests {
         let result = Photographer::create_day_dir_if_needed(&timelapse_root);
         assert!(result.is_ok());
 
-        let day_dir = result.unwrap();
+        let (day, day_dir) = result.unwrap();
         assert!(day_dir.exists());
         assert!(day_dir.is_dir());
 
         // Verify the directory name format (YYYY-MM-DD)
         let dir_name = day_dir.file_name().unwrap().to_str().unwrap();
+        assert_eq!(dir_name, day);
         assert_eq!(dir_name.len(), 10); // YYYY-MM-DD is 10 characters
         assert_eq!(&dir_name[4..5], "-");
         assert_eq!(&dir_name[7..8], "-");
