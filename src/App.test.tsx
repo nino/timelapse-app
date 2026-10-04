@@ -61,12 +61,10 @@ describe('App', () => {
       vi.mocked(useFolders).mockReturnValue({
         folders: [],
         foldersError: mockError,
-        refreshFolders: vi.fn(),
       });
       vi.mocked(useVideos).mockReturnValue({
         videos: [],
         videosError: null,
-        refreshVideos: vi.fn(),
       });
       vi.mocked(useFiles).mockReturnValue({
         files: [],
@@ -84,12 +82,10 @@ describe('App', () => {
       vi.mocked(useFolders).mockReturnValue({
         folders: ['2025-01-15'],
         foldersError: null,
-        refreshFolders: vi.fn(),
       });
       vi.mocked(useVideos).mockReturnValue({
         videos: [],
         videosError: null,
-        refreshVideos: vi.fn(),
       });
       vi.mocked(useFiles).mockReturnValue({
         files: [],
@@ -107,12 +103,10 @@ describe('App', () => {
       vi.mocked(useFolders).mockReturnValue({
         folders: [],
         foldersError: null,
-        refreshFolders: vi.fn(),
       });
       vi.mocked(useVideos).mockReturnValue({
         videos: [],
         videosError: mockError,
-        refreshVideos: vi.fn(),
       });
       vi.mocked(useFiles).mockReturnValue({
         files: [],
@@ -131,12 +125,10 @@ describe('App', () => {
       vi.mocked(useFolders).mockReturnValue({
         folders: ['2025-01-15'],
         foldersError: null,
-        refreshFolders: vi.fn(),
       });
       vi.mocked(useVideos).mockReturnValue({
         videos: [],
         videosError: null,
-        refreshVideos: vi.fn(),
       });
       vi.mocked(useFiles).mockReturnValue({
         files: [],
@@ -153,12 +145,10 @@ describe('App', () => {
       vi.mocked(useFolders).mockReturnValue({
         folders: [],
         foldersError: null,
-        refreshFolders: vi.fn(),
       });
       vi.mocked(useVideos).mockReturnValue({
         videos: ['video1.mov'],
         videosError: null,
-        refreshVideos: vi.fn(),
       });
       vi.mocked(useFiles).mockReturnValue({
         files: [],
@@ -184,18 +174,18 @@ describe('App', () => {
 
   describe('Folder Selection', () => {
     it('should auto-select today\'s folder if it exists', async () => {
-      const today = new Date().toISOString().split('T')[0];
+      const now = new Date();
+      // Local date, matching how Rust names the day folders.
+      const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
       const folders = [today, '2025-01-14', '2025-01-13'];
 
       vi.mocked(useFolders).mockReturnValue({
         folders,
         foldersError: null,
-        refreshFolders: vi.fn(),
       });
       vi.mocked(useVideos).mockReturnValue({
         videos: [],
         videosError: null,
-        refreshVideos: vi.fn(),
       });
       vi.mocked(useFiles).mockReturnValue({
         files: [],
@@ -215,12 +205,10 @@ describe('App', () => {
       vi.mocked(useFolders).mockReturnValue({
         folders,
         foldersError: null,
-        refreshFolders: vi.fn(),
       });
       vi.mocked(useVideos).mockReturnValue({
         videos: [],
         videosError: null,
-        refreshVideos: vi.fn(),
       });
       vi.mocked(useFiles).mockReturnValue({
         files: [],
@@ -243,12 +231,10 @@ describe('App', () => {
       vi.mocked(useFolders).mockReturnValue({
         folders: [],
         foldersError: null,
-        refreshFolders: vi.fn(),
       });
       vi.mocked(useVideos).mockReturnValue({
         videos,
         videosError: null,
-        refreshVideos: vi.fn(),
       });
       mockFilesByFolder({});
       vi.mocked(invoke).mockResolvedValue('video2-cache');
@@ -273,12 +259,10 @@ describe('App', () => {
       vi.mocked(useFolders).mockReturnValue({
         folders: [],
         foldersError: null,
-        refreshFolders: vi.fn(),
       });
       vi.mocked(useVideos).mockReturnValue({
         videos: ['2025-01-13.mov', '2025-01-14.mov', '2025-01-15.mov'],
         videosError: null,
-        refreshVideos: vi.fn(),
       });
       mockFilesByFolder({});
       vi.mocked(invoke).mockResolvedValue('2025-01-15');
@@ -310,12 +294,10 @@ describe('App', () => {
       vi.mocked(useFolders).mockReturnValue({
         folders: ['2025-01-15'],
         foldersError: null,
-        refreshFolders: vi.fn(),
       });
       vi.mocked(useVideos).mockReturnValue({
         videos: [],
         videosError: null,
-        refreshVideos: vi.fn(),
       });
       vi.mocked(useFiles).mockReturnValue({
         files: ['image1.jpg', 'image2.jpg'],
@@ -343,12 +325,10 @@ describe('App', () => {
       vi.mocked(useFolders).mockReturnValue({
         folders: ['2025-01-15'],
         foldersError: null,
-        refreshFolders: vi.fn(),
       });
       vi.mocked(useVideos).mockReturnValue({
         videos: [],
         videosError: null,
-        refreshVideos: vi.fn(),
       });
       vi.mocked(useFiles).mockReturnValue({
         files: ['image1.jpg'],
@@ -377,12 +357,10 @@ describe('App', () => {
       vi.mocked(useFolders).mockReturnValue({
         folders: [],
         foldersError: null,
-        refreshFolders: vi.fn(),
       });
       vi.mocked(useVideos).mockReturnValue({
         videos: ['test-video.mov'],
         videosError: null,
-        refreshVideos: vi.fn(),
       });
       mockFilesByFolder({ [`.cache/${CACHE}`]: FRAMES });
       vi.mocked(invoke).mockResolvedValue(CACHE);
@@ -420,12 +398,10 @@ describe('App', () => {
       vi.mocked(useFolders).mockReturnValue({
         folders: [],
         foldersError: null,
-        refreshFolders: vi.fn(),
       });
       vi.mocked(useVideos).mockReturnValue({
         videos: ['slow-video.mov'],
         videosError: null,
-        refreshVideos: vi.fn(),
       });
       mockFilesByFolder({});
 
@@ -459,12 +435,10 @@ describe('App', () => {
       vi.mocked(useFolders).mockReturnValue({
         folders: [],
         foldersError: null,
-        refreshFolders: vi.fn(),
       });
       vi.mocked(useVideos).mockReturnValue({
         videos: ['test-video.mov'],
         videosError: null,
-        refreshVideos: vi.fn(),
       });
       mockFilesByFolder({}); // the cache folder lists no frames yet
       vi.mocked(invoke).mockResolvedValue(CACHE);
@@ -484,12 +458,10 @@ describe('App', () => {
       vi.mocked(useFolders).mockReturnValue({
         folders: [],
         foldersError: null,
-        refreshFolders: vi.fn(),
       });
       vi.mocked(useVideos).mockReturnValue({
         videos: ['broken-video.mov'],
         videosError: null,
-        refreshVideos: vi.fn(),
       });
       mockFilesByFolder({});
       vi.mocked(invoke).mockRejectedValue(new Error('ffmpeg failed'));
@@ -549,12 +521,10 @@ describe('App', () => {
       vi.mocked(useFolders).mockReturnValue({
         folders: [],
         foldersError: null,
-        refreshFolders: vi.fn(),
       });
       vi.mocked(useVideos).mockReturnValue({
         videos: ['video1.mov', 'video2.mov'],
         videosError: null,
-        refreshVideos: vi.fn(),
       });
       // Each video extracts into its own cache folder.
       mockFilesByFolder({
@@ -605,12 +575,10 @@ describe('App', () => {
       vi.mocked(useFolders).mockReturnValue({
         folders: ['2025-01-15'],
         foldersError: null,
-        refreshFolders: vi.fn(),
       });
       vi.mocked(useVideos).mockReturnValue({
         videos: ['test-video.mov'],
         videosError: null,
-        refreshVideos: vi.fn(),
       });
       mockFilesByFolder({
         [`.cache/${CACHE}`]: FRAMES,
@@ -666,12 +634,10 @@ describe('App', () => {
       vi.mocked(useFolders).mockReturnValue({
         folders: ['2025-01-15'],
         foldersError: null,
-        refreshFolders: vi.fn(),
       });
       vi.mocked(useVideos).mockReturnValue({
         videos: [],
         videosError: null,
-        refreshVideos: vi.fn(),
       });
       vi.mocked(useFiles).mockReturnValue({
         files: ['image1.jpg'],
@@ -696,12 +662,10 @@ describe('App', () => {
       vi.mocked(useFolders).mockReturnValue({
         folders: ['2025-01-15'],
         foldersError: null,
-        refreshFolders: vi.fn(),
       });
       vi.mocked(useVideos).mockReturnValue({
         videos: [],
         videosError: null,
-        refreshVideos: vi.fn(),
       });
       vi.mocked(useFiles).mockReturnValue({
         files: Array(7200).fill('image.jpg'), // 2 hours worth
@@ -716,68 +680,131 @@ describe('App', () => {
     });
   });
 
-  describe('Refresh Functionality', () => {
-    it('should call refreshFolders when refresh button is clicked in images mode', async () => {
-      const mockRefreshFolders = vi.fn();
-      const mockRefreshVideos = vi.fn();
-
-      vi.mocked(useFolders).mockReturnValue({
-        folders: ['2025-01-15'],
-        foldersError: null,
-        refreshFolders: mockRefreshFolders,
-      });
-      vi.mocked(useVideos).mockReturnValue({
-        videos: [],
-        videosError: null,
-        refreshVideos: mockRefreshVideos,
-      });
-      vi.mocked(useFiles).mockReturnValue({
-        files: [],
+  describe('Live updates', () => {
+    function mockLibrary(folders: Array<string>, files: Array<string>): void {
+      vi.mocked(useFolders).mockReturnValue({ folders, foldersError: null });
+      vi.mocked(useVideos).mockReturnValue({ videos: [], videosError: null });
+      vi.mocked(useFiles).mockImplementation((folder: string | null) => ({
+        files: folder === null ? [] : files,
         filesError: null,
-      });
+      }));
+    }
 
-      render(<App />);
+    function frames(count: number): Array<string> {
+      return Array.from({ length: count }, (_, i) =>
+        `${String(i + 1).padStart(5, '0')}.png`,
+      );
+    }
 
-      const refreshButton = screen.getByText(/Refresh/i);
-      fireEvent.click(refreshButton);
-
-      expect(mockRefreshFolders).toHaveBeenCalled();
-      expect(mockRefreshVideos).not.toHaveBeenCalled();
+    beforeEach(() => {
+      vi.mocked(readFile).mockResolvedValue(new Uint8Array([1, 2, 3]));
+      vi.mocked(invoke).mockResolvedValue(null);
     });
 
-    it('should call refreshVideos when refresh button is clicked in videos mode', async () => {
-      const mockRefreshFolders = vi.fn();
-      const mockRefreshVideos = vi.fn();
-
-      vi.mocked(useFolders).mockReturnValue({
-        folders: [],
-        foldersError: null,
-        refreshFolders: mockRefreshFolders,
-      });
-      vi.mocked(useVideos).mockReturnValue({
-        videos: ['video1.mov'],
-        videosError: null,
-        refreshVideos: mockRefreshVideos,
-      });
-      vi.mocked(useFiles).mockReturnValue({
-        files: [],
-        filesError: null,
-      });
-
+    it('should not render a manual refresh button', () => {
+      mockLibrary(['2025-01-15'], frames(3));
       render(<App />);
+      expect(screen.queryByText(/Refresh/i)).not.toBeInTheDocument();
+    });
 
-      // Switch to videos mode
-      const videosButton = screen.getByText(/Videos/i).closest('button');
-      if (videosButton) {
-        fireEvent.click(videosButton);
-      }
+    it('should follow new captures while on the newest frame', async () => {
+      mockLibrary(['2025-01-15'], frames(3));
+      const { rerender } = render(<App />);
+      await waitFor(() => {
+        expect(screen.getByText('Frame 3 / 3')).toBeInTheDocument();
+      });
+
+      mockLibrary(['2025-01-15'], frames(4));
+      rerender(<App />);
 
       await waitFor(() => {
-        const refreshButton = screen.getByText(/Refresh/i);
-        fireEvent.click(refreshButton);
+        expect(screen.getByText('Frame 4 / 4')).toBeInTheDocument();
+      });
+      expect(readFile).toHaveBeenLastCalledWith(
+        `${TEST_ROOT}/2025-01-15/00004.png`,
+        { baseDir: 'HOME' },
+      );
+    });
+
+    it('should stay on a scrubbed-back frame when new captures arrive', async () => {
+      mockLibrary(['2025-01-15'], frames(10));
+      const { rerender } = render(<App />);
+      await waitFor(() => {
+        expect(screen.getByText('Frame 10 / 10')).toBeInTheDocument();
       });
 
-      expect(mockRefreshVideos).toHaveBeenCalled();
+      fireEvent.change(screen.getByRole('slider'), { target: { value: '2' } });
+      await waitFor(() => {
+        expect(screen.getByText('Frame 3 / 10')).toBeInTheDocument();
+      });
+      const readsBefore = vi.mocked(readFile).mock.calls.length;
+
+      mockLibrary(['2025-01-15'], frames(11));
+      rerender(<App />);
+
+      await waitFor(() => {
+        expect(screen.getByText('Frame 3 / 11')).toBeInTheDocument();
+      });
+      // Same frame on screen, so it isn't re-read just because the list grew.
+      expect(vi.mocked(readFile).mock.calls.length).toBe(readsBefore);
+    });
+
+    it('should return to the newest frame after visiting the videos tab', async () => {
+      mockLibrary(['2025-01-15'], frames(5));
+      vi.mocked(useVideos).mockReturnValue({ videos: ['v.mov'], videosError: null });
+      mockFilesByFolder({ '2025-01-15': frames(5), '.cache/v': frames(3) });
+      vi.mocked(invoke).mockImplementation(async (command: string) =>
+        command === 'extract_video_frames' ? 'v' : null,
+      );
+      render(<App />);
+      await waitFor(() => {
+        expect(screen.getByText('Frame 5 / 5')).toBeInTheDocument();
+      });
+
+      clickVideosTab();
+      // Video frames start from the first one.
+      await waitFor(() => {
+        expect(screen.getByText('Frame 1 / 3')).toBeInTheDocument();
+      });
+      fireEvent.click(screen.getByText(/Images/i).closest('button') as HTMLElement);
+
+      await waitFor(() => {
+        expect(screen.getByText('Frame 5 / 5')).toBeInTheDocument();
+      });
+    });
+
+    it('should move to a new day folder at midnight when following the live edge', async () => {
+      mockLibrary(['2025-01-15'], frames(3));
+      const { rerender } = render(<App />);
+      await waitFor(() => {
+        expect(screen.getByRole('combobox')).toHaveValue('2025-01-15');
+      });
+
+      mockLibrary(['2025-01-15', '2025-01-16'], frames(3));
+      rerender(<App />);
+
+      await waitFor(() => {
+        expect(screen.getByRole('combobox')).toHaveValue('2025-01-16');
+      });
+    });
+
+    it('should stay on an older day when a new day folder appears', async () => {
+      mockLibrary(['2025-01-14', '2025-01-15'], frames(3));
+      const { rerender } = render(<App />);
+      await waitFor(() => {
+        expect(screen.getByRole('combobox')).toHaveValue('2025-01-15');
+      });
+      fireEvent.change(screen.getByRole('combobox'), {
+        target: { value: '2025-01-14' },
+      });
+
+      mockLibrary(['2025-01-14', '2025-01-15', '2025-01-16'], frames(3));
+      rerender(<App />);
+
+      await waitFor(() => {
+        expect(screen.getByRole('option', { name: /2025-01-16/ })).toBeInTheDocument();
+      });
+      expect(screen.getByRole('combobox')).toHaveValue('2025-01-14');
     });
   });
 
@@ -786,12 +813,10 @@ describe('App', () => {
       vi.mocked(useFolders).mockReturnValue({
         folders: [],
         foldersError: null,
-        refreshFolders: vi.fn(),
       });
       vi.mocked(useVideos).mockReturnValue({
         videos: [],
         videosError: null,
-        refreshVideos: vi.fn(),
       });
       vi.mocked(useFiles).mockReturnValue({
         files: [],
@@ -807,12 +832,10 @@ describe('App', () => {
       vi.mocked(useFolders).mockReturnValue({
         folders: ['2025-01-15'],
         foldersError: null,
-        refreshFolders: vi.fn(),
       });
       vi.mocked(useVideos).mockReturnValue({
         videos: [],
         videosError: null,
-        refreshVideos: vi.fn(),
       });
       vi.mocked(useFiles).mockReturnValue({
         files: [],

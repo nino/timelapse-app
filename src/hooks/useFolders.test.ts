@@ -1,5 +1,5 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { renderHook, waitFor } from '@testing-library/react';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { act, renderHook, waitFor } from '@testing-library/react';
 import { useFolders, useFiles, useVideos } from './useFolders';
 import { BaseDirectory } from '@tauri-apps/api/path';
 import type { DirEntry } from '@tauri-apps/plugin-fs';
@@ -8,9 +8,33 @@ import { TEST_ROOT } from '../test/setup';
 // Mock the Tauri plugin
 vi.mock('@tauri-apps/plugin-fs', () => ({
   readDir: vi.fn(),
+  watch: vi.fn(),
 }));
 
-const { readDir } = await import('@tauri-apps/plugin-fs');
+const { readDir, watch } = await import('@tauri-apps/plugin-fs');
+
+// Every watcher the hooks register, keyed by path, so a test can play the part
+// of the filesystem and announce a change.
+const watchers = new Map<string, () => void>();
+const unwatch = vi.fn();
+
+function fireChange(path: string): void {
+  const callback = watchers.get(path);
+  if (!callback) throw new Error(`Nothing is watching ${path}`);
+  act(() => callback());
+}
+
+beforeEach(() => {
+  watchers.clear();
+  vi.mocked(watch).mockImplementation(async (path, callback) => {
+    watchers.set(String(path), () => callback({ type: 'any', paths: [String(path)], attrs: null }));
+    return unwatch;
+  });
+});
+
+afterEach(() => {
+  vi.useRealTimers();
+});
 
 // Test fixtures omit isSymlink; fill it in so mocks satisfy DirEntry without casting.
 type MockDirEntry = Omit<DirEntry, 'isSymlink'>;
@@ -74,7 +98,7 @@ describe('useFolders', () => {
     });
   });
 
-  it('should refresh folders when refreshFolders is called', async () => {
+  it('should reload folders when the library root changes on disk', async () => {
     const initialFolders = [
       { name: 'folder1', isDirectory: true, isFile: false },
     ];
@@ -92,7 +116,8 @@ describe('useFolders', () => {
     });
 
     vi.mocked(readDir).mockResolvedValueOnce(dirEntries(updatedFolders));
-    result.current.refreshFolders();
+    await waitFor(() => expect(watchers.has(TEST_ROOT)).toBe(true));
+    fireChange(TEST_ROOT);
 
     await waitFor(() => {
       expect(result.current.folders).toEqual(['folder1', 'folder2']);
@@ -101,7 +126,7 @@ describe('useFolders', () => {
     expect(readDir).toHaveBeenCalledTimes(2);
   });
 
-  it('should clear error on successful refresh', async () => {
+  it('should clear error on a successful reload', async () => {
     const mockError = new Error('Initial error');
     vi.mocked(readDir).mockRejectedValueOnce(mockError);
 
@@ -115,7 +140,7 @@ describe('useFolders', () => {
       { name: 'folder1', isDirectory: true, isFile: false },
     ];
     vi.mocked(readDir).mockResolvedValueOnce(dirEntries(successFolders));
-    result.current.refreshFolders();
+    fireChange(TEST_ROOT);
 
     await waitFor(() => {
       expect(result.current.foldersError).toBeNull();
@@ -345,7 +370,7 @@ describe('useVideos', () => {
     expect(result.current.videos).toEqual([]);
   });
 
-  it('should refresh videos when refreshVideos is called', async () => {
+  it('should reload videos when the library root changes on disk', async () => {
     const initialVideos = [
       { name: 'video1.mov', isDirectory: false, isFile: true },
     ];
@@ -363,7 +388,8 @@ describe('useVideos', () => {
     });
 
     vi.mocked(readDir).mockResolvedValueOnce(dirEntries(updatedVideos));
-    result.current.refreshVideos();
+    await waitFor(() => expect(watchers.has(TEST_ROOT)).toBe(true));
+    fireChange(TEST_ROOT);
 
     await waitFor(() => {
       expect(result.current.videos).toEqual(['video1.mov', 'video2.mov']);
@@ -372,7 +398,7 @@ describe('useVideos', () => {
     expect(readDir).toHaveBeenCalledTimes(2);
   });
 
-  it('should clear error on successful refresh', async () => {
+  it('should clear error on a successful reload', async () => {
     const mockError = new Error('Initial error');
     vi.mocked(readDir).mockRejectedValueOnce(mockError);
 
@@ -386,7 +412,7 @@ describe('useVideos', () => {
       { name: 'video.mov', isDirectory: false, isFile: true },
     ];
     vi.mocked(readDir).mockResolvedValueOnce(dirEntries(successVideos));
-    result.current.refreshVideos();
+    fireChange(TEST_ROOT);
 
     await waitFor(() => {
       expect(result.current.videosError).toBeNull();
@@ -407,5 +433,149 @@ describe('useVideos', () => {
     await waitFor(() => {
       expect(result.current.videos).toEqual(['video.mov']);
     });
+  });
+});
+
+describe('live updates', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('should pick up new screenshots in a date folder as they are written', async () => {
+    const folder = `${TEST_ROOT}/2025-01-15`;
+    vi.mocked(readDir).mockResolvedValueOnce(
+      dirEntries([{ name: '00001.png', isDirectory: false, isFile: true }]),
+    );
+
+    const { result } = renderHook(() => useFiles('2025-01-15'));
+    await waitFor(() => expect(result.current.files).toEqual(['00001.png']));
+
+    vi.mocked(readDir).mockResolvedValueOnce(
+      dirEntries([
+        { name: '00001.png', isDirectory: false, isFile: true },
+        { name: '00002.png', isDirectory: false, isFile: true },
+      ]),
+    );
+    await waitFor(() => expect(watchers.has(folder)).toBe(true));
+    fireChange(folder);
+
+    await waitFor(() =>
+      expect(result.current.files).toEqual(['00001.png', '00002.png']),
+    );
+    expect(watch).toHaveBeenCalledWith(folder, expect.any(Function), {
+      baseDir: BaseDirectory.Home,
+      delayMs: 500,
+    });
+  });
+
+  it('should not watch a published cache folder', async () => {
+    vi.mocked(readDir).mockResolvedValue(
+      dirEntries([{ name: 'frame000001.jpg', isDirectory: false, isFile: true }]),
+    );
+
+    const { result } = renderHook(() => useFiles('.cache/video'));
+    await waitFor(() => expect(result.current.files).toEqual(['frame000001.jpg']));
+
+    expect(watch).not.toHaveBeenCalled();
+  });
+
+  it('should keep the same array when a reload finds nothing new', async () => {
+    const entries = dirEntries([{ name: '2025-01-15', isDirectory: true, isFile: false }]);
+    vi.mocked(readDir).mockResolvedValue(entries);
+
+    const { result } = renderHook(() => useFolders());
+    await waitFor(() => expect(result.current.folders).toEqual(['2025-01-15']));
+    const first = result.current.folders;
+
+    await waitFor(() => expect(watchers.has(TEST_ROOT)).toBe(true));
+    fireChange(TEST_ROOT);
+    await waitFor(() => expect(readDir).toHaveBeenCalledTimes(2));
+
+    expect(result.current.folders).toBe(first);
+  });
+
+  it('should not show the previous folder\'s files while a new folder loads', async () => {
+    vi.mocked(readDir).mockResolvedValueOnce(
+      dirEntries([{ name: 'old.png', isDirectory: false, isFile: true }]),
+    );
+    let resolveNew: (entries: Array<DirEntry>) => void = () => {};
+    vi.mocked(readDir).mockReturnValueOnce(
+      new Promise((resolve) => {
+        resolveNew = resolve;
+      }),
+    );
+
+    const { result, rerender } = renderHook(
+      ({ folder }: { folder: string }) => useFiles(folder),
+      { initialProps: { folder: '2025-01-14' } },
+    );
+    await waitFor(() => expect(result.current.files).toEqual(['old.png']));
+
+    rerender({ folder: '2025-01-15' });
+    expect(result.current.files).toEqual([]);
+
+    await act(async () => {
+      resolveNew(dirEntries([{ name: 'new.png', isDirectory: false, isFile: true }]));
+    });
+    expect(result.current.files).toEqual(['new.png']);
+  });
+
+  it('should ignore a slow listing for a folder that is no longer selected', async () => {
+    let resolveOld: (entries: Array<DirEntry>) => void = () => {};
+    vi.mocked(readDir).mockReturnValueOnce(
+      new Promise((resolve) => {
+        resolveOld = resolve;
+      }),
+    );
+    vi.mocked(readDir).mockResolvedValueOnce(
+      dirEntries([{ name: 'new.png', isDirectory: false, isFile: true }]),
+    );
+
+    const { result, rerender } = renderHook(
+      ({ folder }: { folder: string }) => useFiles(folder),
+      { initialProps: { folder: '2025-01-14' } },
+    );
+    rerender({ folder: '2025-01-15' });
+    await waitFor(() => expect(result.current.files).toEqual(['new.png']));
+
+    await act(async () => {
+      resolveOld(dirEntries([{ name: 'old.png', isDirectory: false, isFile: true }]));
+    });
+    expect(result.current.files).toEqual(['new.png']);
+
+    // Switching back must not resurrect the stale listing either.
+    vi.mocked(readDir).mockResolvedValueOnce(
+      dirEntries([{ name: 'fresh.png', isDirectory: false, isFile: true }]),
+    );
+    rerender({ folder: '2025-01-14' });
+    await waitFor(() => expect(result.current.files).toEqual(['fresh.png']));
+  });
+
+  it('should stop watching on unmount', async () => {
+    vi.mocked(readDir).mockResolvedValue([]);
+    const { unmount } = renderHook(() => useFolders());
+    await waitFor(() => expect(watchers.has(TEST_ROOT)).toBe(true));
+
+    unmount();
+
+    expect(unwatch).toHaveBeenCalled();
+  });
+
+  it('should fall back to polling when the watcher cannot be created', async () => {
+    vi.useFakeTimers();
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.mocked(watch).mockRejectedValue(new Error('fs.watch not allowed'));
+    vi.mocked(readDir).mockResolvedValue([]);
+
+    renderHook(() => useVideos());
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(readDir).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3000);
+    });
+    expect(readDir).toHaveBeenCalledTimes(2);
   });
 });

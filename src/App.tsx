@@ -10,8 +10,8 @@ import { timelapseRoot } from "./timelapseRoot";
 type ViewMode = "images" | "videos";
 
 export function App(): React.ReactNode {
-  const { folders, foldersError, refreshFolders } = useFolders();
-  const { videos, videosError, refreshVideos } = useVideos();
+  const { folders, foldersError } = useFolders();
+  const { videos, videosError } = useVideos();
   const [viewMode, setViewMode] = React.useState<ViewMode>("images");
   const [selectedFolder, setSelectedFolder] = React.useState<string | null>(
     null,
@@ -36,11 +36,14 @@ export function App(): React.ReactNode {
     null,
   );
 
-  // Get current date folder name (YYYY-MM-DD format)
-  const currentDateFolder = React.useMemo(() => {
-    const today = new Date();
-    return today.toISOString().split("T")[0];
-  }, []);
+  // Today's folder name. Recomputed whenever the folder list changes so the
+  // "(Today)" label moves over at midnight instead of sticking to launch day.
+  // Local date, to match `create_day_dir_if_needed` in Rust.
+  const currentDateFolder = React.useMemo(
+    () => localDateFolder(new Date()),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [folders],
+  );
 
   // Auto-select today's folder if it exists (for images mode)
   React.useEffect(() => {
@@ -65,12 +68,55 @@ export function App(): React.ReactNode {
     }
   }, [videos, selectedVideo, viewMode]);
 
-  // Reset image index when folder changes
+  // Follow the newest frame. Opening a folder jumps to its last frame; after
+  // that, new captures only move the index if it was already on the last one,
+  // so scrubbing back through the day isn't interrupted every second.
+  const followedListing = React.useRef<{ key: string; length: number }>({
+    key: "",
+    length: 0,
+  });
   React.useEffect(() => {
-    if (viewMode === "images") {
-      setCurrentImageIndex(Math.max(files.length - 1, 0));
-    }
+    const key = `${viewMode}:${selectedFolder ?? ""}`;
+    const previous = followedListing.current;
+    followedListing.current = { key, length: files.length };
+    // Recording the videos key too means coming back to images counts as
+    // opening the folder afresh, rather than inheriting the video's index.
+    if (viewMode !== "images") return;
+    const last = Math.max(files.length - 1, 0);
+    setCurrentImageIndex((index) =>
+      previous.key !== key || index >= previous.length - 1
+        ? last
+        : Math.min(index, last),
+    );
   }, [selectedFolder, files.length, viewMode]);
+
+  // Roll over to the new day's folder at midnight, but only for someone who
+  // was watching the live edge of the previous newest day.
+  const newestFolder = React.useMemo(
+    () => [...folders].sort().at(-1) ?? null,
+    [folders],
+  );
+  const isAtLiveEdge =
+    files.length === 0 || currentImageIndex >= files.length - 1;
+  const liveEdgeRef = React.useRef({ selectedFolder, isAtLiveEdge });
+  React.useEffect(() => {
+    liveEdgeRef.current = { selectedFolder, isAtLiveEdge };
+  }, [selectedFolder, isAtLiveEdge]);
+  const previousNewestFolder = React.useRef(newestFolder);
+  React.useEffect(() => {
+    const previous = previousNewestFolder.current;
+    previousNewestFolder.current = newestFolder;
+    const viewer = liveEdgeRef.current;
+    if (
+      previous &&
+      newestFolder &&
+      newestFolder !== previous &&
+      viewer.selectedFolder === previous &&
+      viewer.isAtLiveEdge
+    ) {
+      setSelectedFolder(newestFolder);
+    }
+  }, [newestFolder]);
 
   // Reset image index when video frames are loaded
   React.useEffect(() => {
@@ -154,66 +200,50 @@ export function App(): React.ReactNode {
     viewMode,
   ]);
 
+  // The file on screen, relative to the library root. Effects below key on
+  // this string rather than on the file arrays, which change every time a new
+  // capture lands even when the visible frame hasn't.
+  const currentFramePath =
+    viewMode === "images"
+      ? selectedFolder && files[currentImageIndex]
+        ? `${selectedFolder}/${files[currentImageIndex]}`
+        : null
+      : videoCacheFolder && videoFiles[currentImageIndex]
+        ? `.cache/${videoCacheFolder}/${videoFiles[currentImageIndex]}`
+        : null;
+
   // Load current image when folder or index changes (works for both images and videos)
   React.useEffect(() => {
-    async function loadImage(): Promise<void> {
-      if (viewMode === "images") {
-        if (!selectedFolder || files.length === 0 || !files[currentImageIndex]) {
-          setCurrentImageSrc(null);
-          return;
-        }
+    if (!currentFramePath) {
+      setCurrentImageSrc(null);
+      return;
+    }
 
-        try {
-          const imagePath = `${timelapseRoot()}/${selectedFolder}/${files[currentImageIndex]}`;
-          console.log("Loading image from path:", imagePath);
-
-          const imageData = await readFile(imagePath, {
-            baseDir: BaseDirectory.Home,
-          });
-
-          console.log("Image data loaded, size:", imageData.length);
-
-          // Create a blob URL from the binary data
-          const blob = new Blob([imageData], { type: "image/jpeg" });
-          const blobUrl = URL.createObjectURL(blob);
-
-          console.log("Created blob URL:", blobUrl);
-          setCurrentImageSrc(blobUrl);
-        } catch (error) {
-          console.error("Error loading image:", error);
-          setCurrentImageSrc(null);
-        }
-      } else if (viewMode === "videos") {
-        if (!videoCacheFolder || videoFiles.length === 0 || !videoFiles[currentImageIndex]) {
-          setCurrentImageSrc(null);
-          return;
-        }
-
-        try {
-          const framePath = `${timelapseRoot()}/.cache/${videoCacheFolder}/${videoFiles[currentImageIndex]}`;
-          console.log("Loading video frame from path:", framePath);
-
-          const frameData = await readFile(framePath, {
-            baseDir: BaseDirectory.Home,
-          });
-
-          console.log("Frame data loaded, size:", frameData.length);
-
-          // Create a blob URL from the binary data
-          const blob = new Blob([frameData], { type: "image/jpeg" });
-          const blobUrl = URL.createObjectURL(blob);
-
-          console.log("Created blob URL:", blobUrl);
-          setCurrentImageSrc(blobUrl);
-        } catch (error) {
-          console.error("Error loading frame:", error);
-          setCurrentImageSrc(null);
-        }
+    let cancelled = false;
+    async function loadImage(path: string): Promise<void> {
+      try {
+        const imageData = await readFile(`${timelapseRoot()}/${path}`, {
+          baseDir: BaseDirectory.Home,
+        });
+        // A later frame was requested while this one was loading.
+        if (cancelled) return;
+        const blob = new Blob([imageData], { type: "image/jpeg" });
+        setCurrentImageSrc(URL.createObjectURL(blob));
+      } catch (error) {
+        if (cancelled) return;
+        console.error(
+          path.startsWith(".cache/") ? "Error loading frame:" : "Error loading image:",
+          error,
+        );
+        setCurrentImageSrc(null);
       }
     }
 
-    loadImage();
-  }, [selectedFolder, files, videoCacheFolder, videoFiles, currentImageIndex, viewMode]);
+    loadImage(currentFramePath);
+    return (): void => {
+      cancelled = true;
+    };
+  }, [currentFramePath]);
 
   // Clean up blob URLs when component unmounts or image changes
   React.useEffect(() => {
@@ -232,33 +262,20 @@ export function App(): React.ReactNode {
     [],
   );
 
-  const refreshContent = React.useCallback(() => {
-    if (viewMode === "images") {
-      refreshFolders();
-      // Force refresh by changing the selected folder
-      const currentFolder = selectedFolder;
-      setSelectedFolder(null);
-      setTimeout(() => setSelectedFolder(currentFolder), 10);
-    } else {
-      refreshVideos();
-      // Force refresh by changing the selected video
-      const currentVideo = selectedVideo;
-      setSelectedVideo(null);
-      setTimeout(() => setSelectedVideo(currentVideo), 10);
-    }
-  }, [refreshFolders, refreshVideos, selectedFolder, selectedVideo, viewMode]);
-
   // Fetch timestamp for current frame from database
+  const currentScreenshot =
+    viewMode === "images" ? (files[currentImageIndex] ?? null) : null;
   React.useEffect(() => {
+    let cancelled = false;
     async function fetchTimestamp(): Promise<void> {
-      if (viewMode !== "images" || files.length === 0) {
+      if (!currentScreenshot) {
         setCurrentTimestamp(null);
         return;
       }
 
       try {
         // Extract frame number from filename (e.g., "00001.png" -> 1)
-        const filename = files[currentImageIndex];
+        const filename = currentScreenshot;
         const frameNumber = parseInt(filename.replace(".png", ""), 10);
 
         const metadata = await invoke<[string, string] | null>(
@@ -268,19 +285,24 @@ export function App(): React.ReactNode {
           },
         );
 
+        if (cancelled) return;
         if (metadata && metadata[1]) {
           setCurrentTimestamp(metadata[1]); // Use local_time
         } else {
           setCurrentTimestamp(null);
         }
       } catch (error) {
+        if (cancelled) return;
         console.error("Error fetching timestamp:", error);
         setCurrentTimestamp(null);
       }
     }
 
     fetchTimestamp();
-  }, [currentImageIndex, files, viewMode]);
+    return (): void => {
+      cancelled = true;
+    };
+  }, [currentScreenshot]);
 
   const formatTime = React.useCallback(
     (index: number) => {
@@ -540,19 +562,14 @@ export function App(): React.ReactNode {
             </div>
           )}
 
-          {/* Refresh button */}
-          <button
-            onClick={refreshContent}
-            disabled={viewMode === "images" ? !selectedFolder : !selectedVideo}
-            className="bg-gradient-to-b from-fuchsia-50 to-amber-50 hover:bg-blue-700 disabled:bg-gray-600 px-3 py-1 rounded-xl text-sm font-medium text-amber-800 transition-colors border-2 border-yellow-500 shadow-md shadow-amber-400/20"
-            title={
-              viewMode === "images" ? "Refresh screenshots" : "Refresh videos"
-            }
-          >
-            ↻ Refresh
-          </button>
         </div>
       </div>
     </main>
   );
+}
+
+function localDateFolder(date: Date): string {
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${date.getFullYear()}-${month}-${day}`;
 }
