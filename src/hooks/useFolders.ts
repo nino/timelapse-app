@@ -57,8 +57,12 @@ export function useFiles(folder: string | null): {
         return;
       }
 
-      // Retry logic for video cache folders that might be still being created
-      const maxRetries = 5;
+      // ffmpeg writes a cache folder while we are already trying to list it, so
+      // for those an empty or missing directory is expected and worth retrying.
+      // A date folder gets exactly one attempt: there is nothing to wait for, and
+      // retrying would only delay a genuine error by the length of the loop.
+      const isCacheFolder = folder.startsWith(".cache/");
+      const maxRetries = isCacheFolder ? 5 : 1;
       const retryDelay = 500; // ms
       let lastError: Error | null = null;
 
@@ -68,12 +72,14 @@ export function useFiles(folder: string | null): {
             baseDir: BaseDirectory.Home,
           });
           const fileList = (entries)
-            .filter((entry) => entry.isFile)
+            // Hidden files are in-progress writes, such as the capture loop's
+            // `.00042.png.tmp` before it is renamed into place.
+            .filter((entry) => entry.isFile && !entry.name.startsWith("."))
             .map((entry) => entry.name)
             .sort();
 
           // If we got files, or if this is not a cache folder, accept the result
-          if (fileList.length > 0 || !folder.startsWith(".cache/")) {
+          if (fileList.length > 0 || !isCacheFolder) {
             setFiles(fileList);
             return;
           }
