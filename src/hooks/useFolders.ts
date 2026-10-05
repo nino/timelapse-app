@@ -72,7 +72,9 @@ export function useFiles(folder: string | null): {
             baseDir: BaseDirectory.Home,
           });
           const fileList = (entries)
-            .filter((entry) => entry.isFile)
+            // Hidden files are in-progress writes, such as the capture loop's
+            // `.00042.png.tmp` before it is renamed into place.
+            .filter((entry) => entry.isFile && !entry.name.startsWith("."))
             .map((entry) => entry.name)
             .sort();
 
