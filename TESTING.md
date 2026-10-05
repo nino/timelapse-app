@@ -6,9 +6,8 @@ This document describes the comprehensive test suite for the timelapse-app.
 
 The project includes extensive test coverage for both frontend (React/TypeScript) and backend (Rust) code:
 
-- **Frontend Tests**: 43 tests covering React components and hooks
-- **Rust Tests**: 33 tests covering core functionality and Tauri commands
-- **Total Coverage**: 76 tests across the application
+- **Frontend Tests**: React components and hooks
+- **Rust Tests**: core functionality and Tauri commands
 
 Both suites are hermetic. Every Rust test builds its `Photographer` through
 `Photographer::new_in` against a `TempDir`, so no test reads or writes a real
@@ -22,14 +21,14 @@ directory and confirming nothing is created inside it.
 ## Frontend Tests
 
 ### Technology Stack
-- **Test Runner**: Vitest 4.0
+- **Test Runner**: `bun test` (Bun's built-in runner)
 - **Testing Library**: @testing-library/react 16.3
-- **Environment**: happy-dom (modern, faster alternative to jsdom)
+- **Environment**: happy-dom, registered globally by `@happy-dom/global-registrator`
 - **Assertions**: @testing-library/jest-dom matchers
 
 ### Test Files
 
-#### `src/hooks/useFolders.test.ts` (18 tests)
+#### `src/hooks/useFolders.test.ts`
 Tests for custom React hooks that handle file system operations:
 
 **useFolders hook:**
@@ -56,7 +55,7 @@ Tests for custom React hooks that handle file system operations:
 - ✓ Clears errors on successful refresh
 - ✓ Filters out directories
 
-#### `src/App.test.tsx` (23 tests)
+#### `src/App.test.tsx`
 Tests for the main App component:
 
 **Error Handling:**
@@ -102,7 +101,7 @@ Tests for the main App component:
 - ✓ Handles empty folders list
 - ✓ Handles empty files list
 
-#### `src/timelapseRoot.test.ts` (2 tests)
+#### `src/timelapseRoot.test.ts`
 Guards the library-root contract:
 - ✓ Throws rather than guessing when the root is unresolved
 - ✓ Takes the root from Rust, not from the bundler environment
@@ -114,14 +113,15 @@ literal fails the suite instead of passing silently.
 ### Running Frontend Tests
 
 ```bash
-# Run tests in watch mode (interactive)
-bun run test
+# Run tests once
+bun test
 
-# Run tests once (CI mode)
-bun run test:run
+# Run one file, or tests whose name matches a pattern
+bun test src/hooks/useFolders.test.ts
+bun test -t "useVideos"
 
-# Run tests with UI
-bun run test:ui
+# Run tests in watch mode
+bun run test:watch
 
 # Run tests with coverage report
 bun run test:coverage
@@ -136,7 +136,7 @@ bun run test:coverage
 
 ### Test Files
 
-#### `src-tauri/src/timelapse.rs` (15 tests)
+#### `src-tauri/src/timelapse.rs`
 Tests for core timelapse functionality:
 
 **Photographer struct:**
@@ -162,14 +162,16 @@ Tests for core timelapse functionality:
 - ✓ Error messages display correctly
 - ✓ ErrorLogEntry serializes/deserializes properly
 
-#### `src-tauri/src/paths.rs` (1 test)
+#### `src-tauri/src/paths.rs`
 - ✓ The library directory name tracks the build profile
 
-#### `src-tauri/src/lib.rs` (12 tests)
+#### `src-tauri/src/lib.rs`
 Tests for the Tauri command implementations. `tauri::State` wraps a private
 reference and has no public constructor, so each state-backed command is a thin
 shim over a `*_impl` function that takes `&PhotographerState`; the tests drive
-those directly.
+those directly. `evict_old_cache` and `extract_video_frames` are split the same
+way for a different reason — theirs take the library root as a `&Path`, so the
+tests can aim them at a `TempDir` instead of `$HOME`.
 
 **greet command:**
 - ✓ Returns correct greeting message
@@ -197,6 +199,27 @@ those directly.
 - ✓ Returns error when not running
 - ✓ Returns None for a frame that was never captured
 
+**evict_old_cache command:** (the only `remove_dir_all` in the app)
+- ✓ Removes a cache folder older than 15 days
+- ✓ Keeps a cache folder younger than 15 days
+- ✓ Puts the cutoff at 15 days, checked an hour either side
+- ✓ Skips plain files — only directories are ever removed
+- ✓ Counts only the folders it actually removed
+- ✓ Reports "does not exist" rather than erroring when there is no cache dir
+- ✓ Never reaches outside `.cache`, even for an equally old day folder
+
+Ages are stamped onto the directories with `File::set_times` rather than waited
+for, so these tests neither sleep nor depend on when they run.
+
+**extract_video_frames command:**
+- ✓ Reuses a populated cache folder without invoking ffmpeg
+- ✓ Treats an *empty* cache folder as a miss, not a hit
+- ✓ Creates the cache folder before invoking ffmpeg
+
+Only the first of these needs the cache-hit branch; the other two fall through
+to ffmpeg and assert on the failure, which holds whether or not ffmpeg is
+installed.
+
 ### Running Rust Tests
 
 ```bash
@@ -216,36 +239,23 @@ cargo tarpaulin --out Html
 
 ## Test Configuration
 
-### Vitest Configuration (`vitest.config.ts`)
-```typescript
-export default defineConfig({
-  plugins: [react()],
-  test: {
-    globals: true,
-    environment: 'happy-dom',
-    setupFiles: ['./src/test/setup.ts'],
-    coverage: {
-      provider: 'v8',
-      reporter: ['text', 'json', 'html'],
-    },
-  },
-});
+### Bun Configuration (`bunfig.toml`)
+```toml
+[test]
+preload = ["./src/test/happydom.ts", "./src/test/setup.ts"]
 ```
 
-### Test Setup (`src/test/setup.ts`)
-- Extends Vitest expect with jest-dom matchers
-- Mocks URL.createObjectURL and URL.revokeObjectURL
-- Automatic cleanup after each test
-
-## Test Coverage Summary
-
-| Area | Files | Tests | Coverage |
-|------|-------|-------|----------|
-| React Hooks | 1 | 18 | ✓ Comprehensive |
-| React Components | 1 | 16 | ✓ Comprehensive |
-| Rust Core Logic | 1 | 13 | ✓ Comprehensive |
-| Rust Tauri Commands | 1 | 10 | ✓ Comprehensive |
-| **Total** | **4** | **57** | **✓ Comprehensive** |
+### Test Setup
+- `src/test/happydom.ts` registers happy-dom's `window`/`document` globals. It
+  loads first because React Testing Library needs them at import time.
+- `src/test/setup.ts`:
+  - Extends Bun's expect with jest-dom matchers (typed in `src/test/jest-dom.d.ts`)
+  - Mocks the Tauri modules (`readDir`, `readFile`, `invoke`) once for the whole
+    run. `mock.module` in Bun is process-wide, so test files must not re-mock
+    them with a different shape.
+  - Mocks URL.createObjectURL and URL.revokeObjectURL
+  - Automatic cleanup after each test
+- `src/test/mocked.ts` exports `mocked(fn)`, the replacement for `vi.mocked`.
 
 ## Key Testing Patterns
 
@@ -267,7 +277,7 @@ To run all tests in CI:
 
 ```bash
 # Frontend tests
-bun run test:run
+bun test
 
 # Rust tests
 cd src-tauri && cargo test --release
@@ -304,7 +314,7 @@ When adding new features:
 
 ## Resources
 
-- [Vitest Documentation](https://vitest.dev/)
+- [Bun test runner](https://bun.sh/docs/cli/test)
 - [React Testing Library](https://testing-library.com/react)
 - [Rust Testing Guide](https://doc.rust-lang.org/book/ch11-00-testing.html)
 - [Tauri Testing](https://tauri.app/develop/tests/)
