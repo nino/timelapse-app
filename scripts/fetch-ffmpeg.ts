@@ -4,14 +4,15 @@
 // src-tauri/binaries/ffmpeg-<target triple> where `externalBin` in
 // src-tauri/tauri.macos.conf.json expects it. Runs before `tauri dev` and
 // `tauri build`; a no-op when the pinned build is already there, and on
-// non-macOS targets, which have no sidecar.
+// non-macOS targets, which have no sidecar. For `universal-apple-darwin` it
+// fetches both architectures and joins them with `lipo`.
 //
 // Usage: bun scripts/fetch-ffmpeg.ts [target-triple]
 
 import { createHash } from "crypto";
 import { chmod, mkdir, readFile, rm, writeFile } from "fs/promises";
 import { tmpdir } from "os";
-import { join, resolve } from "path";
+import { join } from "path";
 
 // Martin Riedl's static macOS builds of ffmpeg 9.0.2 (https://ffmpeg.martin-riedl.de),
 // which include libx265 for the converter's HEVC encode. Changing a pin
@@ -27,12 +28,27 @@ const BUILDS: Record<string, { url: string; sha256: string }> = {
   },
 };
 
+function fail(message: string): never {
+  console.error(message);
+  process.exit(1);
+}
+
+// Run a command, treating a missing executable like any other failure: Bun
+// throws on ENOENT rather than reporting a failed spawn.
+function run(command: string[]): { success: boolean; stdout: Buffer; stderr: string } {
+  try {
+    const result = Bun.spawnSync(command);
+    return { success: result.success, stdout: result.stdout, stderr: result.stderr.toString() };
+  } catch (error) {
+    return { success: false, stdout: Buffer.alloc(0), stderr: String(error) };
+  }
+}
+
 function hostTriple(): string {
-  const result = Bun.spawnSync(["rustc", "-vV"]);
-  const host = result.stdout.toString().match(/^host: (\S+)$/m);
-  if (!result.success || !host) {
-    console.error("Could not work out the target triple from `rustc -vV`; pass it as an argument.");
-    process.exit(1);
+  const result = run(["rustc", "-vV"]);
+  const host = result.success ? result.stdout.toString().match(/^host: (\S+)$/m) : null;
+  if (!host) {
+    fail("Could not work out the target triple from `rustc -vV`; pass it as an argument.");
   }
   return host[1];
 }
@@ -43,47 +59,70 @@ if (!triple.endsWith("-apple-darwin")) {
   process.exit(0);
 }
 
-const build = BUILDS[triple];
-if (!build) {
-  console.error(`No pinned ffmpeg build for ${triple}.`);
-  process.exit(1);
+// Relative to this script, so it works from any working directory.
+const binariesDir = join(import.meta.dir, "..", "src-tauri", "binaries");
+
+// Install the pinned ffmpeg for one architecture at `binary`, unless the
+// marker beside it says that exact build is already there.
+async function installSingle(arch: string, binary: string): Promise<void> {
+  const build = BUILDS[arch];
+  if (!build) {
+    fail(`No pinned ffmpeg build for ${arch}.`);
+  }
+  // The hash of the zip the binary came from, so a changed pin is noticed.
+  const marker = `${binary}.sha256`;
+  const installed = await readFile(marker, "utf8").catch((): string => "");
+  if (installed.trim() === build.sha256 && (await Bun.file(binary).exists())) {
+    return;
+  }
+
+  console.log(`Downloading ffmpeg for ${arch} from ${build.url}`);
+  const response = await fetch(build.url);
+  if (!response.ok) {
+    fail(`Download failed: ${response.status} ${response.statusText}`);
+  }
+  const zip = new Uint8Array(await response.arrayBuffer());
+
+  const actual = createHash("sha256").update(zip).digest("hex");
+  if (actual !== build.sha256) {
+    fail(`Checksum mismatch for ${build.url}: expected ${build.sha256}, got ${actual}`);
+  }
+
+  const zipPath = join(tmpdir(), `ffmpeg-${arch}-${actual}.zip`);
+  await writeFile(zipPath, zip);
+  const unzip = run(["unzip", "-p", zipPath, "ffmpeg"]);
+  await rm(zipPath, { force: true });
+  if (!unzip.success || unzip.stdout.length === 0) {
+    fail(`Could not unpack ffmpeg: ${unzip.stderr}`);
+  }
+
+  await writeFile(binary, unzip.stdout);
+  await chmod(binary, 0o755);
+  await writeFile(marker, `${build.sha256}\n`);
+  console.log(`Installed ${binary}`);
 }
 
-const binariesDir = resolve("src-tauri/binaries");
-const binary = join(binariesDir, `ffmpeg-${triple}`);
-// The hash of the zip the binary came from, so a changed pin is noticed.
-const marker = `${binary}.sha256`;
-
-const installed = await readFile(marker, "utf8").catch((): string => "");
-if (installed.trim() === build.sha256 && (await Bun.file(binary).exists())) {
-  process.exit(0);
-}
-
-console.log(`Downloading ffmpeg for ${triple} from ${build.url}`);
-const response = await fetch(build.url);
-if (!response.ok) {
-  console.error(`Download failed: ${response.status} ${response.statusText}`);
-  process.exit(1);
-}
-const zip = new Uint8Array(await response.arrayBuffer());
-
-const actual = createHash("sha256").update(zip).digest("hex");
-if (actual !== build.sha256) {
-  console.error(`Checksum mismatch for ${build.url}: expected ${build.sha256}, got ${actual}`);
-  process.exit(1);
-}
-
-const zipPath = join(tmpdir(), `ffmpeg-${triple}-${actual}.zip`);
-await writeFile(zipPath, zip);
 await mkdir(binariesDir, { recursive: true });
-const unzip = Bun.spawnSync(["unzip", "-p", zipPath, "ffmpeg"]);
-await rm(zipPath, { force: true });
-if (!unzip.success || unzip.stdout.length === 0) {
-  console.error(`Could not unpack ffmpeg: ${unzip.stderr.toString()}`);
-  process.exit(1);
-}
+const binaryFor = (arch: string): string => join(binariesDir, `ffmpeg-${arch}`);
 
-await writeFile(binary, unzip.stdout);
-await chmod(binary, 0o755);
-await writeFile(marker, `${build.sha256}\n`);
-console.log(`Installed ${binary}`);
+if (triple === "universal-apple-darwin") {
+  // Tauri wants one fat sidecar for a universal bundle.
+  const arches = ["aarch64-apple-darwin", "x86_64-apple-darwin"];
+  for (const arch of arches) {
+    await installSingle(arch, binaryFor(arch));
+  }
+  const universal = binaryFor(triple);
+  const marker = `${universal}.sha256`;
+  const expected = arches.map((arch): string => BUILDS[arch].sha256).join("+");
+  const installed = await readFile(marker, "utf8").catch((): string => "");
+  if (installed.trim() !== expected || !(await Bun.file(universal).exists())) {
+    const lipo = run(["lipo", "-create", "-output", universal, ...arches.map(binaryFor)]);
+    if (!lipo.success) {
+      fail(`Could not build a universal ffmpeg with lipo: ${lipo.stderr}`);
+    }
+    await writeFile(marker, `${expected}\n`);
+    console.log(`Installed ${universal}`);
+  }
+} else {
+  await installSingle(triple, binaryFor(triple));
+}

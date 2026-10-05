@@ -1,5 +1,6 @@
 use active_win_pos_rs::get_active_window;
 use chrono::{DateTime, Utc, Local};
+use fast_image_resize::images::CroppedImageMut;
 use fast_image_resize::{FilterType, ResizeAlg, ResizeOptions, Resizer};
 use image::{ImageFormat, RgbImage};
 use screenshots::Screen;
@@ -29,6 +30,9 @@ pub enum Error {
 
     #[error("Unable to resize screenshot {path} because: {reason}")]
     UnableToResizeScreenshot { path: String, reason: String },
+
+    #[error("Unable to write screenshot {path} because: {reason}")]
+    UnableToWriteScreenshot { path: String, reason: String },
 
     #[error("Unable convert screenshot path to string")]
     UnableToConvertScreenshotPathToString,
@@ -170,20 +174,21 @@ impl Photographer {
         );
 
         let image_data = capture_screenshot().await?;
-        let frame = fit_to_frame(&image_data, &screenshot_path)?;
 
-        // A black frame is dropped before it is written
-        if is_image_all_black(&frame) {
+        // Decoding, resizing and encoding take a good part of a second, so
+        // they run on the blocking pool rather than holding up a runtime worker.
+        let path = screenshot_path.clone();
+        let is_black = tokio::task::spawn_blocking(move || store_frame(&image_data, &path))
+            .await
+            .map_err(|e| Error::UnableToWriteScreenshot {
+                path: screenshot_path.clone(),
+                reason: format!("Frame processing panicked: {}", e),
+            })??;
+
+        if is_black {
             println!("Screenshot is all black, skipping: {}", screenshot_path);
             Ok(true) // Return true to indicate image was black and dropped
         } else {
-            frame
-                .save_with_format(&screenshot_path, ImageFormat::Png)
-                .map_err(|e| Error::UnableToResizeScreenshot {
-                    path: screenshot_path.clone(),
-                    reason: format!("Failed to write image: {}", e),
-                })?;
-
             // Extract frame number from filename (e.g., "00001.png" -> 1)
             let frame_number: u32 = filename
                 .replace(".png", "")
@@ -305,6 +310,50 @@ fn window_overlaps_screen(window: (i32, i32, i32, i32), screen: (i32, i32, u32, 
 const FRAME_WIDTH: u32 = 1800;
 const FRAME_HEIGHT: u32 = 1124;
 
+/// Fit a captured PNG into a frame and write it to `file_path`, unless the
+/// frame is all black. Returns whether it was black (and so not written).
+///
+/// The PNG is written to a hidden temporary file beside `file_path` and renamed
+/// into place, so an interrupted write never leaves a truncated `NNNNN.png`
+/// for `next_filename`, the viewer and the converter to trip over.
+fn store_frame(data: &[u8], file_path: &str) -> Result<bool, Error> {
+    let frame = fit_to_frame(data, file_path)?;
+    if is_image_all_black(&frame) {
+        return Ok(true);
+    }
+
+    let write_error = |reason: String| Error::UnableToWriteScreenshot {
+        path: file_path.to_string(),
+        reason,
+    };
+    let final_path = std::path::Path::new(file_path);
+    let file_name = final_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or(Error::UnableToConvertScreenshotPathToString)?;
+    // `.00042.png.tmp`: a dotfile the viewer hides, and not a `.png` the
+    // converter or `next_filename` would count.
+    let temp_path = final_path.with_file_name(format!(".{}.tmp", file_name));
+
+    let written = frame
+        .save_with_format(&temp_path, ImageFormat::Png)
+        .map_err(|e| write_error(format!("Failed to write image: {}", e)))
+        .and_then(|()| {
+            std::fs::rename(&temp_path, final_path)
+                .map_err(|e| write_error(format!("Failed to move image into place: {}", e)))
+        });
+    if written.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    written.map(|()| false)
+}
+
+thread_local! {
+    // A resizer keeps scratch buffers between calls; the blocking pool reuses
+    // its threads, so each keeps one.
+    static RESIZER: std::cell::RefCell<Resizer> = std::cell::RefCell::new(Resizer::new());
+}
+
 /// Decode a captured PNG, scale it to fit `FRAME_WIDTH`×`FRAME_HEIGHT` keeping
 /// its aspect ratio, and centre it on a black canvas of exactly that size.
 fn fit_to_frame(data: &[u8], file_path: &str) -> Result<RgbImage, Error> {
@@ -313,9 +362,12 @@ fn fit_to_frame(data: &[u8], file_path: &str) -> Result<RgbImage, Error> {
         reason,
     };
 
+    // Captures are RGBA, for which this is not a copy. The alpha is opaque, so
+    // it is resized as a plain fourth channel and dropped once the frame is
+    // small.
     let source = image::load_from_memory_with_format(data, ImageFormat::Png)
         .map_err(|e| resize_error(format!("Failed to read image: {}", e)))?
-        .into_rgb8();
+        .into_rgba8();
     let (orig_width, orig_height) = source.dimensions();
     if orig_width == 0 || orig_height == 0 {
         return Err(resize_error("Captured image is empty".to_string()));
@@ -324,23 +376,23 @@ fn fit_to_frame(data: &[u8], file_path: &str) -> Result<RgbImage, Error> {
     let scale = (FRAME_WIDTH as f64 / orig_width as f64).min(FRAME_HEIGHT as f64 / orig_height as f64);
     let new_width = ((orig_width as f64 * scale) as u32).clamp(1, FRAME_WIDTH);
     let new_height = ((orig_height as f64 * scale) as u32).clamp(1, FRAME_HEIGHT);
-
-    // Box filter, as the ImageMagick version used: each output pixel is the
-    // average of the source pixels it covers, which keeps text legible.
-    let mut resized = RgbImage::new(new_width, new_height);
-    Resizer::new()
-        .resize(
-            &source,
-            &mut resized,
-            &ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FilterType::Box)),
-        )
-        .map_err(|e| resize_error(format!("Failed to resize image: {}", e)))?;
-
-    let mut canvas = RgbImage::new(FRAME_WIDTH, FRAME_HEIGHT);
     let x_offset = (FRAME_WIDTH - new_width) / 2;
     let y_offset = (FRAME_HEIGHT - new_height) / 2;
-    image::imageops::replace(&mut canvas, &resized, x_offset as i64, y_offset as i64);
-    Ok(canvas)
+
+    // Resize straight into the centre of an opaque black canvas. Box filter, as
+    // the ImageMagick version used: each output pixel is the average of the
+    // source pixels it covers, which keeps text legible.
+    let mut canvas = image::RgbaImage::from_pixel(FRAME_WIDTH, FRAME_HEIGHT, image::Rgba([0, 0, 0, 255]));
+    let mut target = CroppedImageMut::new(&mut canvas, x_offset, y_offset, new_width, new_height)
+        .map_err(|e| resize_error(format!("Failed to place image: {}", e)))?;
+    let options = ResizeOptions::new()
+        .resize_alg(ResizeAlg::Convolution(FilterType::Box))
+        .use_alpha(false);
+    RESIZER
+        .with(|resizer| resizer.borrow_mut().resize(&source, &mut target, &options))
+        .map_err(|e| resize_error(format!("Failed to resize image: {}", e)))?;
+
+    Ok(image::DynamicImage::ImageRgba8(canvas).into_rgb8())
 }
 
 /// Whether the frame is (almost) entirely black, which is what a capture of a
@@ -666,5 +718,47 @@ mod tests {
             }
         }
         assert!(!is_image_all_black(&dim));
+    }
+
+    #[test]
+    fn test_store_frame_writes_through_a_temporary_file() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("00001.png");
+        let capture = RgbImage::from_pixel(3456, 2234, image::Rgb([200, 200, 200]));
+
+        let is_black = store_frame(&png_of(&capture), path.to_str().unwrap()).unwrap();
+
+        assert!(!is_black);
+        let written = image::open(&path).unwrap();
+        assert_eq!((written.width(), written.height()), (FRAME_WIDTH, FRAME_HEIGHT));
+        let names: Vec<String> = fs::read_dir(temp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["00001.png"], "no temporary file is left behind");
+    }
+
+    #[test]
+    fn test_store_frame_drops_a_black_frame() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("00001.png");
+        let capture = RgbImage::new(3456, 2234);
+
+        assert!(store_frame(&png_of(&capture), path.to_str().unwrap()).unwrap());
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 0, "nothing is written");
+    }
+
+    #[test]
+    fn test_store_frame_cleans_up_after_a_failed_write() {
+        let temp = TempDir::new().unwrap();
+        // A directory where the PNG should go makes the rename fail.
+        let path = temp.path().join("00001.png");
+        fs::create_dir(&path).unwrap();
+        let capture = RgbImage::from_pixel(100, 100, image::Rgb([200, 200, 200]));
+
+        let result = store_frame(&png_of(&capture), path.to_str().unwrap());
+
+        assert!(matches!(result, Err(Error::UnableToWriteScreenshot { .. })));
+        assert!(!temp.path().join(".00001.png.tmp").exists());
     }
 }
