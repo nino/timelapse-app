@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+#!/usr/bin/env bun
 
 import { readFile, writeFile } from "fs/promises";
 import { resolve } from "path";
@@ -8,7 +8,7 @@ type VersionType = "major" | "minor" | "patch";
 const versionType = (process.argv[2] ?? "patch") as VersionType;
 
 if (!["major", "minor", "patch"].includes(versionType)) {
-  console.error("Usage: node bump-version.ts [major|minor|patch]");
+  console.error("Usage: bun bump-version.ts [major|minor|patch]");
   process.exit(1);
 }
 

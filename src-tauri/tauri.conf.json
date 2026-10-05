@@ -4,9 +4,9 @@
   "version": "0.1.2",
   "identifier": "com.timelapse-app.app",
   "build": {
-    "beforeDevCommand": "yarn dev",
+    "beforeDevCommand": "bun run fetch:ffmpeg && bun run dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "yarn build",
+    "beforeBuildCommand": "bun run fetch:ffmpeg && bun run build",
     "frontendDist": "../dist"
   },
   "app": {

@@ -5,6 +5,7 @@ import React from "react";
 
 import "./App.css";
 import { useFiles, useFolders, useVideos } from "./hooks/useFolders";
+import { timelapseRoot } from "./timelapseRoot";
 
 type ViewMode = "images" | "videos";
 
@@ -25,6 +26,9 @@ export function App(): React.ReactNode {
     null,
   );
   const [isExtractingFrames, setIsExtractingFrames] = React.useState(false);
+  const [extractionError, setExtractionError] = React.useState<string | null>(
+    null,
+  );
   const { files: videoFiles } = useFiles(
     videoCacheFolder ? `.cache/${videoCacheFolder}` : null,
   );
@@ -81,11 +85,13 @@ export function App(): React.ReactNode {
       if (viewMode !== "videos" || !selectedVideo) {
         setVideoCacheFolder(null);
         setIsExtractingFrames(false);
+        setExtractionError(null);
         return;
       }
 
       try {
         setIsExtractingFrames(true);
+        setExtractionError(null);
         setVideoCacheFolder(null); // Clear old frames immediately
         console.log("Extracting frames from video:", selectedVideo);
 
@@ -98,7 +104,12 @@ export function App(): React.ReactNode {
         setVideoCacheFolder(cacheFolder);
         setIsExtractingFrames(false);
       } catch (error) {
+        // Without this the UI sits on "Loading video…" forever, which makes a
+        // missing ffmpeg look identical to a slow extraction.
         console.error("Error extracting frames:", error);
+        setExtractionError(
+          error instanceof Error ? error.message : String(error),
+        );
         setVideoCacheFolder(null);
         setIsExtractingFrames(false);
       }
@@ -153,7 +164,7 @@ export function App(): React.ReactNode {
         }
 
         try {
-          const imagePath = `Timelapse/${selectedFolder}/${files[currentImageIndex]}`;
+          const imagePath = `${timelapseRoot()}/${selectedFolder}/${files[currentImageIndex]}`;
           console.log("Loading image from path:", imagePath);
 
           const imageData = await readFile(imagePath, {
@@ -179,7 +190,7 @@ export function App(): React.ReactNode {
         }
 
         try {
-          const framePath = `Timelapse/.cache/${videoCacheFolder}/${videoFiles[currentImageIndex]}`;
+          const framePath = `${timelapseRoot()}/.cache/${videoCacheFolder}/${videoFiles[currentImageIndex]}`;
           console.log("Loading video frame from path:", framePath);
 
           const frameData = await readFile(framePath, {
@@ -403,11 +414,14 @@ export function App(): React.ReactNode {
                 className="bg-gray-700 text-white px-3 py-1 rounded border border-gray-600 focus:outline-none focus:ring-2 focus:ring-blue-500"
               >
                 <option value="">Select a video…</option>
-                {videos.map((video) => (
-                  <option key={video} value={video}>
-                    {video}
-                  </option>
-                ))}
+                {[...videos]
+                  .sort()
+                  .reverse()
+                  .map((video) => (
+                    <option key={video} value={video}>
+                      {video}
+                    </option>
+                  ))}
               </select>
               {videos.length > 0 && (
                 <span className="text-gray-600 text-sm">
@@ -467,14 +481,23 @@ export function App(): React.ReactNode {
               ) : (
                 <>
                   <p className="text-xl mb-2">
-                    {isExtractingFrames
-                      ? "Extracting frames from video…"
-                      : videoFiles.length > 0
-                        ? "Loading frame…"
-                        : selectedVideo
-                          ? "Loading video…"
-                          : "No video selected"}
+                    {extractionError
+                      ? "Could not extract frames from this video"
+                      : isExtractingFrames
+                        ? "Extracting frames from video…"
+                        : videoFiles.length > 0
+                          ? "Loading frame…"
+                          : videoCacheFolder
+                            ? "Loading frames…"
+                            : selectedVideo
+                              ? "Loading video…"
+                              : "No video selected"}
                   </p>
+                  {extractionError && (
+                    <p className="text-sm mt-2 text-red-400">
+                      {extractionError}
+                    </p>
+                  )}
                   {!selectedVideo && videos.length > 0 && (
                     <p>Select a video to begin</p>
                   )}

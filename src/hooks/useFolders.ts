@@ -2,6 +2,8 @@ import { BaseDirectory } from "@tauri-apps/api/path";
 import { readDir } from "@tauri-apps/plugin-fs";
 import React from "react";
 
+import { timelapseRoot } from "../timelapseRoot";
+
 function ensureError(val: unknown): Error {
   if (val instanceof Error) {
     return val;
@@ -20,7 +22,7 @@ export function useFolders(): {
   const loadFolders = React.useCallback(async (): Promise<void> => {
     try {
       setFoldersError(null);
-      const entries = await readDir("Timelapse", {
+      const entries = await readDir(timelapseRoot(), {
         baseDir: BaseDirectory.Home,
       });
       const folderList = entries
@@ -55,23 +57,29 @@ export function useFiles(folder: string | null): {
         return;
       }
 
-      // Retry logic for video cache folders that might be still being created
-      const maxRetries = 5;
+      // ffmpeg writes a cache folder while we are already trying to list it, so
+      // for those an empty or missing directory is expected and worth retrying.
+      // A date folder gets exactly one attempt: there is nothing to wait for, and
+      // retrying would only delay a genuine error by the length of the loop.
+      const isCacheFolder = folder.startsWith(".cache/");
+      const maxRetries = isCacheFolder ? 5 : 1;
       const retryDelay = 500; // ms
       let lastError: Error | null = null;
 
       for (let attempt = 0; attempt < maxRetries; attempt++) {
         try {
-          const entries = await readDir(`Timelapse/${folder}`, {
+          const entries = await readDir(`${timelapseRoot()}/${folder}`, {
             baseDir: BaseDirectory.Home,
           });
           const fileList = (entries)
-            .filter((entry) => entry.isFile)
+            // Hidden files are in-progress writes, such as the capture loop's
+            // `.00042.png.tmp` before it is renamed into place.
+            .filter((entry) => entry.isFile && !entry.name.startsWith("."))
             .map((entry) => entry.name)
             .sort();
 
           // If we got files, or if this is not a cache folder, accept the result
-          if (fileList.length > 0 || !folder.startsWith(".cache/")) {
+          if (fileList.length > 0 || !isCacheFolder) {
             setFiles(fileList);
             return;
           }
@@ -121,7 +129,7 @@ export function useVideos(): {
   const loadVideos = React.useCallback(async (): Promise<void> => {
     try {
       setVideosError(null);
-      const entries = await readDir("Timelapse", {
+      const entries = await readDir(timelapseRoot(), {
         baseDir: BaseDirectory.Home,
       });
       const videoList = entries

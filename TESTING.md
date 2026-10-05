@@ -6,21 +6,29 @@ This document describes the comprehensive test suite for the timelapse-app.
 
 The project includes extensive test coverage for both frontend (React/TypeScript) and backend (Rust) code:
 
-- **Frontend Tests**: 34 tests covering React components and hooks
-- **Rust Tests**: 23 tests covering core functionality and Tauri commands
-- **Total Coverage**: 57 tests across the application
+- **Frontend Tests**: React components and hooks
+- **Rust Tests**: core functionality and Tauri commands
+
+Both suites are hermetic. Every Rust test builds its `Photographer` through
+`Photographer::new_in` against a `TempDir`, so no test reads or writes a real
+library and none captures the screen. This holds in **both** profiles — worth
+stating explicitly, because `cargo test --release` turns `debug_assertions` off,
+which flips `TIMELAPSE_DIR_NAME` from `Timelapse_dev` to the production
+`Timelapse`; any test that called `Photographer::new()` would open the real
+database. Verified by running both profiles with `HOME` pointed at an empty
+directory and confirming nothing is created inside it.
 
 ## Frontend Tests
 
 ### Technology Stack
-- **Test Runner**: Vitest 4.0
+- **Test Runner**: `bun test` (Bun's built-in runner)
 - **Testing Library**: @testing-library/react 16.3
-- **Environment**: happy-dom (modern, faster alternative to jsdom)
+- **Environment**: happy-dom, registered globally by `@happy-dom/global-registrator`
 - **Assertions**: @testing-library/jest-dom matchers
 
 ### Test Files
 
-#### `src/hooks/useFolders.test.ts` (18 tests)
+#### `src/hooks/useFolders.test.ts`
 Tests for custom React hooks that handle file system operations:
 
 **useFolders hook:**
@@ -41,13 +49,13 @@ Tests for custom React hooks that handle file system operations:
 **useVideos hook:**
 - ✓ Loads video files (.mov) successfully
 - ✓ Only includes .mov files (filters other formats)
-- ✓ Sorts videos in reverse order (most recent first)
+- ✓ Sorts videos chronologically (oldest first)
 - ✓ Handles errors when loading videos
 - ✓ Refreshes videos when requested
 - ✓ Clears errors on successful refresh
 - ✓ Filters out directories
 
-#### `src/App.test.tsx` (16 tests)
+#### `src/App.test.tsx`
 Tests for the main App component:
 
 **Error Handling:**
@@ -70,6 +78,15 @@ Tests for the main App component:
 - ✓ Loads image when folder and files are available
 - ✓ Handles image loading errors gracefully
 
+**Video Loading:**
+- ✓ Extracts frames and renders the first frame
+- ✓ Shows loading state while frames are being extracted
+- ✓ Handles frame extraction errors
+- ✓ Handles frame read errors
+- ✓ Cleans up blob URL when switching videos
+- ✓ Cleans up blob URL when switching away from video mode
+- ✓ Shows frame count and an enabled scrubber
+
 **Blob URL Cleanup:**
 - ✓ Revokes blob URLs on cleanup (prevents memory leaks)
 
@@ -84,20 +101,30 @@ Tests for the main App component:
 - ✓ Handles empty folders list
 - ✓ Handles empty files list
 
+#### `src/timelapseRoot.test.ts`
+Guards the library-root contract:
+- ✓ Throws rather than guessing when the root is unresolved
+- ✓ Takes the root from Rust, not from the bundler environment
+
+Note: `src/test/setup.ts` pins the root to `Timelapse_test_root` — deliberately
+neither production name — so any path built from a hardcoded `"Timelapse"`
+literal fails the suite instead of passing silently.
+
 ### Running Frontend Tests
 
 ```bash
-# Run tests in watch mode (interactive)
-yarn test
+# Run tests once
+bun test
 
-# Run tests once (CI mode)
-yarn test:run
+# Run one file, or tests whose name matches a pattern
+bun test src/hooks/useFolders.test.ts
+bun test -t "useVideos"
 
-# Run tests with UI
-yarn test:ui
+# Run tests in watch mode
+bun run test:watch
 
 # Run tests with coverage report
-yarn test:coverage
+bun run test:coverage
 ```
 
 ## Rust Tests
@@ -109,7 +136,7 @@ yarn test:coverage
 
 ### Test Files
 
-#### `src-tauri/src/timelapse.rs` (13 tests)
+#### `src-tauri/src/timelapse.rs`
 Tests for core timelapse functionality:
 
 **Photographer struct:**
@@ -135,8 +162,16 @@ Tests for core timelapse functionality:
 - ✓ Error messages display correctly
 - ✓ ErrorLogEntry serializes/deserializes properly
 
-#### `src-tauri/src/lib.rs` (10 tests)
-Tests for Tauri commands:
+#### `src-tauri/src/paths.rs`
+- ✓ The library directory name tracks the build profile
+
+#### `src-tauri/src/lib.rs`
+Tests for the Tauri command implementations. `tauri::State` wraps a private
+reference and has no public constructor, so each state-backed command is a thin
+shim over a `*_impl` function that takes `&PhotographerState`; the tests drive
+those directly. `evict_old_cache` and `extract_video_frames` are split the same
+way for a different reason — theirs take the library root as a `&Path`, so the
+tests can aim them at a `TempDir` instead of `$HOME`.
 
 **greet command:**
 - ✓ Returns correct greeting message
@@ -160,6 +195,31 @@ Tests for Tauri commands:
 - ✓ Clears logs successfully
 - ✓ Returns error when not running
 
+**get_screenshot_metadata command:**
+- ✓ Returns error when not running
+- ✓ Returns None for a frame that was never captured
+
+**evict_old_cache command:** (the only `remove_dir_all` in the app)
+- ✓ Removes a cache folder older than 15 days
+- ✓ Keeps a cache folder younger than 15 days
+- ✓ Puts the cutoff at 15 days, checked an hour either side
+- ✓ Skips plain files — only directories are ever removed
+- ✓ Counts only the folders it actually removed
+- ✓ Reports "does not exist" rather than erroring when there is no cache dir
+- ✓ Never reaches outside `.cache`, even for an equally old day folder
+
+Ages are stamped onto the directories with `File::set_times` rather than waited
+for, so these tests neither sleep nor depend on when they run.
+
+**extract_video_frames command:**
+- ✓ Reuses a populated cache folder without invoking ffmpeg
+- ✓ Treats an *empty* cache folder as a miss, not a hit
+- ✓ Creates the cache folder before invoking ffmpeg
+
+Only the first of these needs the cache-hit branch; the other two fall through
+to ffmpeg and assert on the failure, which holds whether or not ffmpeg is
+installed.
+
 ### Running Rust Tests
 
 ```bash
@@ -179,36 +239,23 @@ cargo tarpaulin --out Html
 
 ## Test Configuration
 
-### Vitest Configuration (`vitest.config.ts`)
-```typescript
-export default defineConfig({
-  plugins: [react()],
-  test: {
-    globals: true,
-    environment: 'happy-dom',
-    setupFiles: ['./src/test/setup.ts'],
-    coverage: {
-      provider: 'v8',
-      reporter: ['text', 'json', 'html'],
-    },
-  },
-});
+### Bun Configuration (`bunfig.toml`)
+```toml
+[test]
+preload = ["./src/test/happydom.ts", "./src/test/setup.ts"]
 ```
 
-### Test Setup (`src/test/setup.ts`)
-- Extends Vitest expect with jest-dom matchers
-- Mocks URL.createObjectURL and URL.revokeObjectURL
-- Automatic cleanup after each test
-
-## Test Coverage Summary
-
-| Area | Files | Tests | Coverage |
-|------|-------|-------|----------|
-| React Hooks | 1 | 18 | ✓ Comprehensive |
-| React Components | 1 | 16 | ✓ Comprehensive |
-| Rust Core Logic | 1 | 13 | ✓ Comprehensive |
-| Rust Tauri Commands | 1 | 10 | ✓ Comprehensive |
-| **Total** | **4** | **57** | **✓ Comprehensive** |
+### Test Setup
+- `src/test/happydom.ts` registers happy-dom's `window`/`document` globals. It
+  loads first because React Testing Library needs them at import time.
+- `src/test/setup.ts`:
+  - Extends Bun's expect with jest-dom matchers (typed in `src/test/jest-dom.d.ts`)
+  - Mocks the Tauri modules (`readDir`, `readFile`, `invoke`) once for the whole
+    run. `mock.module` in Bun is process-wide, so test files must not re-mock
+    them with a different shape.
+  - Mocks URL.createObjectURL and URL.revokeObjectURL
+  - Automatic cleanup after each test
+- `src/test/mocked.ts` exports `mocked(fn)`, the replacement for `vi.mocked`.
 
 ## Key Testing Patterns
 
@@ -230,7 +277,7 @@ To run all tests in CI:
 
 ```bash
 # Frontend tests
-yarn test:run
+bun test
 
 # Rust tests
 cd src-tauri && cargo test --release
@@ -256,7 +303,7 @@ When adding new features:
 ## Troubleshooting
 
 ### Frontend Tests
-- If tests fail with "module not found", run `yarn install`
+- If tests fail with "module not found", run `bun install`
 - For timeout errors, increase timeout in test configuration
 - Clear node_modules and reinstall if seeing weird behavior
 
@@ -267,7 +314,7 @@ When adding new features:
 
 ## Resources
 
-- [Vitest Documentation](https://vitest.dev/)
+- [Bun test runner](https://bun.sh/docs/cli/test)
 - [React Testing Library](https://testing-library.com/react)
 - [Rust Testing Guide](https://doc.rust-lang.org/book/ch11-00-testing.html)
 - [Tauri Testing](https://tauri.app/develop/tests/)
