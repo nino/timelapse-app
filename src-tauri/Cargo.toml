@@ -27,7 +27,8 @@ thiserror = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "5.0"
 tokio = { version = "1", features = ["full"] }
-magick_rust = "1.0.0"
+fast_image_resize = { version = "6", features = ["image"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
 screenshots = "0.5"
 active-win-pos-rs = "0.8"
 rusqlite = { version = "0.32", features = ["bundled"] }
@@ -37,6 +38,28 @@ frame_source = { path = "frame-source" }
 tempfile = "3.17"
 
 # The frame source is its own crate so it can be built and tested without the
-# capture stack (MagickWand, screen capture): `cargo test -p frame_source`.
+# capture stack (screen capture): `cargo test -p frame_source`.
 [workspace]
 members = ["frame-source"]
+
+# The capture loop decodes, resizes and re-encodes a screen-sized PNG every
+# second. Unoptimized, that alone overruns the interval under `tauri dev`, so
+# the image crates are optimized even in debug builds.
+[profile.dev.package.image]
+opt-level = 3
+[profile.dev.package.png]
+opt-level = 3
+[profile.dev.package.fdeflate]
+opt-level = 3
+[profile.dev.package.flate2]
+opt-level = 3
+[profile.dev.package.miniz_oxide]
+opt-level = 3
+[profile.dev.package.crc32fast]
+opt-level = 3
+[profile.dev.package.adler2]
+opt-level = 3
+[profile.dev.package.simd-adler32]
+opt-level = 3
+[profile.dev.package.fast_image_resize]
+opt-level = 3
