@@ -13,7 +13,8 @@
     "test": "bun test",
     "test:watch": "bun test --watch",
     "test:coverage": "bun test --coverage",
-    "version:bump": "bun scripts/bump-version.ts"
+    "version:bump": "bun scripts/bump-version.ts",
+    "fetch:ffmpeg": "bun scripts/fetch-ffmpeg.ts"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.11.1",

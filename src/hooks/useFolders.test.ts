@@ -213,6 +213,22 @@ describe('useFiles', () => {
     });
   });
 
+  it('should hide in-progress hidden files', async () => {
+    const mockEntries = [
+      { name: '00001.png', isDirectory: false, isFile: true },
+      { name: '.00002.png.tmp', isDirectory: false, isFile: true },
+      { name: '.DS_Store', isDirectory: false, isFile: true },
+    ];
+
+    mocked(readDir).mockResolvedValue(dirEntries(mockEntries));
+
+    const { result } = renderHook(() => useFiles('test-folder'));
+
+    await waitFor(() => {
+      expect(result.current.files).toEqual(['00001.png']);
+    });
+  });
+
   it('should reload files when folder changes', async () => {
     const folder1Files = [
       { name: 'file1.png', isDirectory: false, isFile: true },

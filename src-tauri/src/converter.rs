@@ -388,10 +388,10 @@ fn ffmpeg_command(frames_dir: &Path, output: &Path) -> Command {
     // which is most of what keeps the machine cool while it encodes.
     let mut command = if cfg!(target_os = "macos") {
         let mut command = Command::new("taskpolicy");
-        command.arg("-b").arg("ffmpeg");
+        command.arg("-b").arg(crate::paths::ffmpeg());
         command
     } else {
-        Command::new("ffmpeg")
+        Command::new(crate::paths::ffmpeg())
     };
     command
         .args(["-y", "-loglevel", "error", "-framerate", FRAMERATE, "-i"])
@@ -453,7 +453,7 @@ fn encode_with_ffmpeg(frames_dir: &Path, output: &Path, running: &AtomicBool) ->
         .spawn()
         .map_err(|e| {
             ConvertError::Failed(format!(
-                "Failed to run ffmpeg: {}. Make sure ffmpeg is installed and in PATH.",
+                "Failed to run ffmpeg: {}. The app bundles ffmpeg; outside a bundle it must be on PATH.",
                 e
             ))
         })?;
@@ -919,7 +919,8 @@ mod tests {
     /// it.
     #[test]
     fn encodes_a_real_batch_with_ffmpeg() {
-        let has_x265 = Command::new("ffmpeg")
+        let ffmpeg = crate::paths::ffmpeg();
+        let has_x265 = Command::new(&ffmpeg)
             .args(["-hide_banner", "-encoders"])
             .output()
             .map(|o| String::from_utf8_lossy(&o.stdout).contains("libx265"))
@@ -933,13 +934,13 @@ mod tests {
         let root = temp.path();
         let day_dir = root.join("2026-10-01");
         fs::create_dir_all(&day_dir).unwrap();
-        let status = Command::new("ffmpeg")
+        let status = Command::new(&ffmpeg)
             .args(["-loglevel", "error", "-f", "lavfi", "-i", "testsrc=size=320x200:rate=15", "-frames:v", "6"])
             .arg(day_dir.join("%05d.png"))
             .status()
             .unwrap();
         assert!(status.success());
-        // Leave a gap, as a deleted black frame would.
+        // Leave a gap, as a deleted frame does.
         fs::remove_file(day_dir.join("00003.png")).unwrap();
         for n in [1, 2, 4, 5, 6] {
             let path = day_dir.join(format!("{:05}.png", n));
@@ -955,13 +956,27 @@ mod tests {
         let running = AtomicBool::new(true);
         let name = convert_batch(root, &batch, |dir, out| encode_with_ffmpeg(dir, out, &running)).unwrap();
 
-        let probe = Command::new("ffprobe")
-            .args(["-v", "error", "-count_frames", "-select_streams", "v:0", "-show_entries", "stream=codec_name,width,height,nb_read_frames", "-of", "csv=p=0"])
+        // Only ffmpeg is bundled, so inspect the result with it rather than
+        // ffprobe: framecrc prints one line per packet without decoding, and
+        // the stream line on stderr names the codec and size.
+        let probe = Command::new(&ffmpeg)
+            .args(["-hide_banner", "-i"])
             .arg(root.join(&name))
+            .args(["-map", "0:v:0", "-c", "copy", "-f", "framecrc", "-"])
             .output()
             .unwrap();
-        let probe = String::from_utf8_lossy(&probe.stdout);
-        assert_eq!(probe.trim(), "hevc,1800,1124,5", "all five frames, gap closed");
+        assert!(probe.status.success());
+        let stream = String::from_utf8_lossy(&probe.stderr);
+        assert!(
+            stream.contains("Video: hevc") && stream.contains("1800x1124"),
+            "an 1800x1124 HEVC stream: {}",
+            stream
+        );
+        let frames = String::from_utf8_lossy(&probe.stdout)
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .count();
+        assert_eq!(frames, 5, "all five frames, gap closed");
         assert_eq!(fs::read_dir(&day_dir).unwrap().count(), 5, "the PNGs are kept");
     }
 }
