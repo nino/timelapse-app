@@ -14,7 +14,7 @@
 
 use crate::converter::{is_day_folder_name, on_ac_power, DeleteCheck, HourBatch};
 use crate::database::ScreenshotDatabase;
-use magick_rust::{FilterType, MagickWand};
+use image::imageops;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -129,16 +129,12 @@ pub struct Thumbnail(Vec<u8>);
 
 impl Thumbnail {
     pub fn of(image: &Path) -> Result<Thumbnail, String> {
-        let path = image.to_str().ok_or("image path is not valid UTF-8")?;
-        crate::timelapse::init_magick_wand();
-        let wand = MagickWand::new();
-        wand.read_image(path)
-            .map_err(|e| format!("Failed to read {}: {:?}", path, e))?;
-        wand.resize_image(THUMB_WIDTH, THUMB_HEIGHT, FilterType::Box)
-            .map_err(|e| format!("Failed to resize {}: {:?}", path, e))?;
-        wand.export_image_pixels(0, 0, THUMB_WIDTH, THUMB_HEIGHT, "I")
-            .map(Thumbnail)
-            .ok_or_else(|| format!("Failed to read pixels of {}", path))
+        let grey = image::open(image)
+            .map_err(|e| format!("Failed to read {}: {}", image.display(), e))?
+            .into_luma8();
+        // `thumbnail` averages each block of source pixels, like a box filter.
+        let small = imageops::thumbnail(&grey, THUMB_WIDTH as u32, THUMB_HEIGHT as u32);
+        Ok(Thumbnail(small.into_raw()))
     }
 
     pub fn differs_from(&self, other: &Thumbnail) -> bool {
@@ -425,7 +421,7 @@ mod vision {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use magick_rust::{CompositeOperator, PixelWand};
+    use image::{GrayImage, Luma};
     use std::cell::RefCell;
     use std::fs::{File, FileTimes};
     use std::rc::Rc;
@@ -454,25 +450,25 @@ mod tests {
         }
     }
 
-    /// Write a white image of the app's capture size with a black square of
-    /// side `block` (in full-size pixels) at `(x, y)`, or no square for 0.
-    fn write_frame(path: &Path, block: usize, x: isize, y: isize) {
-        crate::timelapse::init_magick_wand();
-        let mut white = PixelWand::new();
-        white.set_color("white").unwrap();
-        let mut black = PixelWand::new();
-        black.set_color("black").unwrap();
-
-        let canvas = MagickWand::new();
-        canvas.new_image(1800, 1124, &white).unwrap();
-        if block > 0 {
-            let square = MagickWand::new();
-            square.new_image(block, block, &black).unwrap();
-            canvas
-                .compose_images(&square, CompositeOperator::Over, true, x, y)
-                .unwrap();
+    /// Write a white image of the app's capture size with black rectangles,
+    /// each `(x, y, width, height)` in full-size pixels.
+    fn write_image(path: &Path, rects: &[(u32, u32, u32, u32)]) {
+        let mut canvas = GrayImage::from_pixel(1800, 1124, Luma([255]));
+        for &(x, y, width, height) in rects {
+            for py in y..y + height {
+                for px in x..x + width {
+                    canvas.put_pixel(px, py, Luma([0]));
+                }
+            }
         }
-        canvas.write_image(path.to_str().unwrap()).unwrap();
+        canvas.save(path).unwrap();
+    }
+
+    /// A white frame with a black square of side `block` at `(x, y)`, or no
+    /// square for 0.
+    fn write_frame(path: &Path, block: u32, x: u32, y: u32) {
+        let rects: &[(u32, u32, u32, u32)] = if block > 0 { &[(x, y, block, block)] } else { &[] };
+        write_image(path, rects);
     }
 
     fn set_age(path: &Path, age: Duration) {
@@ -486,7 +482,7 @@ mod tests {
     }
 
     /// Write frame `number` of `day`, a minute old unless `fresh`.
-    fn frame(root: &Path, day: &str, number: u32, block: usize, fresh: bool) -> PathBuf {
+    fn frame(root: &Path, day: &str, number: u32, block: u32, fresh: bool) -> PathBuf {
         let dir = root.join(day);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(format!("{:05}.png", number));
@@ -538,17 +534,7 @@ mod tests {
         write_frame(&path("blank.png"), 0, 0, 0);
         write_frame(&path("blank_again.png"), 0, 0, 0);
         // About the size of a text cursor: 2 px wide, 18 px tall.
-        write_frame(&path("cursor.png"), 0, 0, 0);
-        {
-            let mut black = PixelWand::new();
-            black.set_color("black").unwrap();
-            let canvas = MagickWand::new();
-            canvas.read_image(path("cursor.png").to_str().unwrap()).unwrap();
-            let cursor = MagickWand::new();
-            cursor.new_image(2, 18, &black).unwrap();
-            canvas.compose_images(&cursor, CompositeOperator::Over, true, 500, 500).unwrap();
-            canvas.write_image(path("cursor.png").to_str().unwrap()).unwrap();
-        }
+        write_image(&path("cursor.png"), &[(500, 500, 2, 18)]);
         // A block of new text, roughly a word or two of 13 px type.
         write_frame(&path("word.png"), 40, 300, 300);
 

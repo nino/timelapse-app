@@ -16,7 +16,7 @@ use crate::database::ScreenshotDatabase;
 // Ensure MagickWand is initialized only once
 static MAGICK_WAND_GENESIS: Once = Once::new();
 
-pub(crate) fn init_magick_wand() {
+fn init_magick_wand() {
     MAGICK_WAND_GENESIS.call_once(|| {
         magick_wand_genesis();
     });
