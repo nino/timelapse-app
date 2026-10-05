@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Name of the directory under `$HOME` holding screenshots, rendered videos,
 /// the extracted-frame cache and the SQLite database.
@@ -23,23 +23,22 @@ pub fn timelapse_root() -> Option<PathBuf> {
     Some(dirs::home_dir()?.join(TIMELAPSE_DIR_NAME))
 }
 
-/// Homebrew's `bin` directories (Apple Silicon first, then Intel).
-const HOMEBREW_BINS: [&str; 2] = ["/opt/homebrew/bin", "/usr/local/bin"];
+/// The `ffmpeg` to run: the copy bundled with the app when there is one, else
+/// whatever `ffmpeg` is on `PATH`.
+pub fn ffmpeg() -> PathBuf {
+    let exe_dir = std::env::current_exe().ok().and_then(|exe| exe.parent().map(Path::to_path_buf));
+    sidecar_or_path(exe_dir.as_deref(), "ffmpeg")
+}
 
-/// `path` with Homebrew's `bin` directories appended where missing.
-///
-/// An app opened from Finder inherits launchd's `PATH`
-/// (`/usr/bin:/bin:/usr/sbin:/sbin`), not the shell's, so the bundled app
-/// cannot find the Homebrew `ffmpeg` that frame extraction and the converter
-/// shell out to. `bun run tauri dev` starts from a shell and never noticed.
-pub fn path_with_homebrew(path: &str) -> String {
-    let mut dirs: Vec<&str> = path.split(':').filter(|d| !d.is_empty()).collect();
-    for bin in HOMEBREW_BINS {
-        if !dirs.contains(&bin) {
-            dirs.push(bin);
-        }
-    }
-    dirs.join(":")
+/// Tauri installs `externalBin` sidecars next to the app's executable
+/// (`Contents/MacOS/` in the bundle, `target/<profile>/` under `tauri dev`), so
+/// that is where a bundled tool is. Falls back to the bare name, resolved
+/// through `PATH`, which is how tests and Linux builds find a system ffmpeg.
+fn sidecar_or_path(exe_dir: Option<&Path>, name: &str) -> PathBuf {
+    exe_dir
+        .map(|dir| dir.join(name))
+        .filter(|candidate| candidate.is_file())
+        .unwrap_or_else(|| PathBuf::from(name))
 }
 
 #[cfg(test)]
@@ -58,15 +57,12 @@ mod tests {
     }
 
     #[test]
-    fn path_gains_homebrew_bins_once() {
-        assert_eq!(
-            path_with_homebrew("/usr/bin:/bin:/usr/sbin:/sbin"),
-            "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin"
-        );
-        assert_eq!(
-            path_with_homebrew("/opt/homebrew/bin:/usr/bin"),
-            "/opt/homebrew/bin:/usr/bin:/usr/local/bin"
-        );
-        assert_eq!(path_with_homebrew(""), "/opt/homebrew/bin:/usr/local/bin");
+    fn prefers_a_sidecar_next_to_the_executable() {
+        let dir = tempfile::TempDir::new().unwrap();
+        assert_eq!(sidecar_or_path(Some(dir.path()), "ffmpeg"), PathBuf::from("ffmpeg"));
+        assert_eq!(sidecar_or_path(None, "ffmpeg"), PathBuf::from("ffmpeg"));
+
+        std::fs::write(dir.path().join("ffmpeg"), b"").unwrap();
+        assert_eq!(sidecar_or_path(Some(dir.path()), "ffmpeg"), dir.path().join("ffmpeg"));
     }
 }

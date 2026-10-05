@@ -31,9 +31,7 @@ env:
 
 jobs:
   release:
-    # Apple Silicon only. The app links ImageMagick dynamically, and the
-    # runner's Homebrew ImageMagick is arm64, so a universal build has no x86_64
-    # half of libMagickWand to link against.
+    # Builds for the runner's own architecture, Apple Silicon.
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7
@@ -41,9 +39,6 @@ jobs:
           fetch-depth: 0 # the version is derived from the commit count
 
       - uses: oven-sh/setup-bun@v2
-
-      - name: Install ImageMagick
-        run: brew install imagemagick pkg-config
 
       - name: Cache cargo
         uses: actions/cache@v6
@@ -105,6 +100,12 @@ jobs:
       - name: Install frontend dependencies
         run: bun install --frozen-lockfile
 
+      # build.rs refuses to compile without the ffmpeg sidecar, and `cargo test`
+      # does not run Tauri's beforeBuildCommand, which is what fetches it for
+      # `tauri build`.
+      - name: Fetch the bundled ffmpeg
+        run: bun run fetch:ffmpeg
+
       - name: Test
         run: |
           bun test
@@ -159,8 +160,8 @@ jobs:
           fi
           echo "IDENTITY=$identity" >> "$GITHUB_ENV"
 
-      # Tauri signs the app with the hardened runtime and the entitlements in
-      # src-tauri/Entitlements.plist, then notarises and staples it itself when
+      # Tauri signs the app and its ffmpeg sidecar with the hardened runtime,
+      # then notarises and staples it itself when
       # the APPLE_API_* variables are set. The version is passed as a config
       # override so the tree keeps its own.
       - name: Build, sign and notarise the app
@@ -239,7 +240,7 @@ jobs:
             gh release delete "$TAG" --yes --cleanup-tag || true
             gh release create "$TAG" \
               --title "$APP v${VERSION} (${SHORT_SHA})" \
-              --notes "Automated build of \`${GITHUB_SHA}\` from \`main\`. Signed and notarised Apple Silicon macOS build. Needs ImageMagick and ffmpeg from Homebrew (\`brew install imagemagick ffmpeg\`)." \
+              --notes "Automated build of \`${GITHUB_SHA}\` from \`main\`. Signed and notarised Apple Silicon macOS build." \
               "$DMG"
           else
             # Point the tag at this commit when it is not already there — a
