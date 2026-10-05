@@ -24,5 +24,7 @@ coverage
 *.sln
 *.sw?
 
-# Claude Code
-.claude
+# Claude Code: local state stays out; the shared settings and hooks are tracked
+.claude/*
+!.claude/settings.json
+!.claude/hooks/
