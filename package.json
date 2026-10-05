@@ -10,11 +10,11 @@
     "tauri": "tauri",
     "lint": "oxlint",
     "lint:fix": "oxlint --fix",
-    "test": "vitest",
-    "test:ui": "vitest --ui",
-    "test:run": "vitest run",
-    "test:coverage": "vitest run --coverage",
-    "version:bump": "bun scripts/bump-version.ts"
+    "test": "bun test",
+    "test:watch": "bun test --watch",
+    "test:coverage": "bun test --coverage",
+    "version:bump": "bun scripts/bump-version.ts",
+    "fetch:ffmpeg": "bun scripts/fetch-ffmpeg.ts"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.11.1",
@@ -24,22 +24,20 @@
     "react-dom": "^19.2.8"
   },
   "devDependencies": {
+    "@happy-dom/global-registrator": "^20.14.5",
     "@tailwindcss/vite": "^4.3.3",
     "@tauri-apps/cli": "^2.11.4",
     "@testing-library/dom": "^10.4.1",
     "@testing-library/jest-dom": "^7.0.1",
     "@testing-library/react": "^16.3.3",
     "@testing-library/user-event": "^14.6.6",
+    "@types/bun": "^1.4.2",
     "@types/react": "^19.2.18",
     "@types/react-dom": "^19.2.5",
     "@vitejs/plugin-react": "^6.1.1",
-    "@vitest/coverage-v8": "^4.1.11",
-    "@vitest/ui": "^4.1.11",
-    "happy-dom": "^20.11.12",
     "oxlint": "^1.80.0",
     "tailwindcss": "^4.3.3",
     "typescript": "^7.0.2",
-    "vite": "^8.2.2",
-    "vitest": "^4.1.11"
+    "vite": "^8.2.2"
   }
 }
