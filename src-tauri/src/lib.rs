@@ -3,7 +3,7 @@ mod timelapse;
 mod database;
 mod paths;
 
-use frame_source::{DaySummary, FrameSource, FrameTime};
+use frame_source::{DaySummary, FrameSource, FrameTime, Tools};
 use tauri::http::{header, Response, StatusCode};
 
 use std::path::Path;
@@ -312,7 +312,7 @@ pub fn run() {
                         .map_err(|e| e.to_string())
                         .and_then(|dir| {
                             let dir = dir.join(paths::TIMELAPSE_DIR_NAME).join("frames");
-                            FrameSource::new(root, dir, FRAME_CACHE_CAP_BYTES)
+                            FrameSource::new(root, dir, FRAME_CACHE_CAP_BYTES, Tools::new(paths::ffmpeg()))
                                 .map_err(|e| e.to_string())
                         });
                     match source {
@@ -681,7 +681,8 @@ mod tests {
     fn frame_source_in(root: &Path) -> (TempDir, FrameSource) {
         let cache = TempDir::new().unwrap();
         let source =
-            FrameSource::new(root.to_path_buf(), cache.path().to_path_buf(), u64::MAX).unwrap();
+            FrameSource::new(root.to_path_buf(), cache.path().to_path_buf(), u64::MAX, Tools::new(paths::ffmpeg()))
+                .unwrap();
         (cache, source)
     }
 

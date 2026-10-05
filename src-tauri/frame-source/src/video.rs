@@ -7,32 +7,20 @@ use std::process::Command;
 
 use crate::Error;
 
-/// Where to find ffmpeg.
+/// Which ffmpeg to run. The crate doesn't look for one itself: the app passes
+/// its bundled sidecar (`paths::ffmpeg()`), so there is one rule for where
+/// ffmpeg comes from and it never falls back to a system install.
 #[derive(Debug, Clone)]
 pub struct Tools {
     pub ffmpeg: PathBuf,
 }
 
 impl Tools {
-    /// The copy bundled with the app (Tauri installs `externalBin` sidecars
-    /// next to the executable, without the target-triple suffix), else the
-    /// usual Homebrew paths, since macOS GUI apps don't inherit the shell's
-    /// PATH, else whatever `ffmpeg` is on PATH.
-    pub fn locate() -> Self {
-        let exe_dir = std::env::current_exe().ok().and_then(|exe| exe.parent().map(Path::to_path_buf));
-        Self { ffmpeg: locate(exe_dir.as_deref(), "ffmpeg") }
-    }
-}
-
-fn locate(exe_dir: Option<&Path>, name: &str) -> PathBuf {
-    let dirs = exe_dir.into_iter().chain([Path::new("/opt/homebrew/bin"), Path::new("/usr/local/bin")]);
-    for dir in dirs {
-        let candidate = dir.join(name);
-        if candidate.is_file() {
-            return candidate;
+    pub fn new(ffmpeg: impl Into<PathBuf>) -> Self {
+        Self {
+            ffmpeg: ffmpeg.into(),
         }
     }
-    PathBuf::from(name)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -75,7 +63,9 @@ pub fn probe(tools: &Tools, path: &Path) -> Result<Option<VideoInfo>, Error> {
 /// `Stream #0:0[0x1](und): Video: hevc (Main) (hvc1 / 0x31637668), yuv420p, 1800x1124, 2386 kb/s, 15 fps, 15 tbr, 15360 tbn`.
 /// `fps` is the average rate; `tbr` is the fallback ffmpeg itself uses.
 fn parse_fps(log: &str) -> Option<f64> {
-    let line = log.lines().find(|line| line.contains("Stream #0:") && line.contains("Video:"))?;
+    let line = log
+        .lines()
+        .find(|line| line.contains("Stream #0:") && line.contains("Video:"))?;
     let rate = |unit: &str| {
         line.split(", ")
             .find_map(|part| part.trim().strip_suffix(unit))
@@ -109,7 +99,11 @@ pub fn extract_frames(
     // Seek a quarter frame early. ffmpeg keeps frames whose timestamp is at or
     // after the seek point, so landing a hair past frame `first` (float
     // rounding of first / fps) would silently start one frame late.
-    let seek = if first == 0 { 0.0 } else { (first as f64 - 0.25) / info.fps };
+    let seek = if first == 0 {
+        0.0
+    } else {
+        (first as f64 - 0.25) / info.fps
+    };
     let output = Command::new(&tools.ffmpeg)
         .args(["-v", "error", "-nostdin", "-ss", &format!("{seek:.6}")])
         .arg("-i")
@@ -147,13 +141,5 @@ mod tests {
         assert_eq!(parse_fps("  Stream #0:1: Audio: aac, 44100 Hz"), None);
         assert_eq!(parse_rate("30k"), Some(30000.0));
         assert_eq!(parse_rate("0"), None);
-    }
-
-    #[test]
-    fn prefers_a_bundled_ffmpeg_next_to_the_executable() {
-        let dir = tempfile::TempDir::new().unwrap();
-        assert_ne!(locate(Some(dir.path()), "ffmpeg"), dir.path().join("ffmpeg"));
-        fs::write(dir.path().join("ffmpeg"), b"").unwrap();
-        assert_eq!(locate(Some(dir.path()), "ffmpeg"), dir.path().join("ffmpeg"));
     }
 }

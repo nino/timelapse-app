@@ -60,7 +60,13 @@ impl ChunkCache {
         for (_, path, bytes) in found {
             state.clock += 1;
             state.total_bytes += bytes;
-            state.entries.insert(path, Entry { bytes, last_used: state.clock });
+            state.entries.insert(
+                path,
+                Entry {
+                    bytes,
+                    last_used: state.clock,
+                },
+            );
         }
         let cache = Self {
             dir,
@@ -110,7 +116,9 @@ impl ChunkCache {
             state.clock += 1;
             let last_used = state.clock;
             state.total_bytes += bytes;
-            state.entries.insert(chunk_dir.clone(), Entry { bytes, last_used });
+            state
+                .entries
+                .insert(chunk_dir.clone(), Entry { bytes, last_used });
         }
         self.evict(Some(&chunk_dir));
         Ok(chunk_dir)
@@ -193,7 +201,9 @@ mod tests {
         assert!(dir.join("0001.jpg").is_file());
 
         let again = cache
-            .get_or_fill("v", 0, |_| panic!("a cached chunk must not be decoded again"))
+            .get_or_fill("v", 0, |_| {
+                panic!("a cached chunk must not be decoded again")
+            })
             .unwrap();
         assert_eq!(dir, again);
         assert_eq!(cache.total_bytes(), 10);
@@ -211,7 +221,10 @@ mod tests {
         let c = cache.get_or_fill("v", 2, fill_with(10)).unwrap();
 
         assert!(a.is_dir());
-        assert!(!b.exists(), "the least recently used chunk should be evicted");
+        assert!(
+            !b.exists(),
+            "the least recently used chunk should be evicted"
+        );
         assert!(c.is_dir());
         assert_eq!(cache.total_bytes(), 20);
     }

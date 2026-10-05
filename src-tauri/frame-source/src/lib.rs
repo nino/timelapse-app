@@ -42,7 +42,11 @@ pub enum Error {
     #[error("not a day: {0:?}")]
     NotADay(String),
     #[error("frame {index} is past the end of {day} ({count} frames)")]
-    OutOfRange { day: String, index: usize, count: usize },
+    OutOfRange {
+        day: String,
+        index: usize,
+        count: usize,
+    },
     #[error("{0}")]
     Tool(String),
     #[error("database error: {0}")]
@@ -97,8 +101,14 @@ struct Probe {
 /// One run of a day's frames from a single source.
 enum Segment {
     /// `shots[range]`, all from one clock hour.
-    Screenshots { shots: Arc<Vec<Shot>>, range: std::ops::Range<usize> },
-    Video { file: VideoFile, info: VideoInfo },
+    Screenshots {
+        shots: Arc<Vec<Shot>>,
+        range: std::ops::Range<usize>,
+    },
+    Video {
+        file: VideoFile,
+        info: VideoInfo,
+    },
 }
 
 impl Segment {
@@ -126,12 +136,9 @@ pub struct FrameSource {
 
 impl FrameSource {
     /// `cache_dir` should be outside the library: it is disposable, and the
-    /// library may be synced.
-    pub fn new(root: PathBuf, cache_dir: PathBuf, cache_cap_bytes: u64) -> std::io::Result<Self> {
-        Self::with_tools(root, cache_dir, cache_cap_bytes, Tools::locate())
-    }
-
-    pub fn with_tools(
+    /// library may be synced. `tools` says which ffmpeg to run; the app passes
+    /// its bundled one.
+    pub fn new(
         root: PathBuf,
         cache_dir: PathBuf,
         cache_cap_bytes: u64,
@@ -151,7 +158,10 @@ impl FrameSource {
     /// Cheap: it reads directory names only.
     pub fn days(&self) -> Result<Vec<String>, Error> {
         match library::list_days(&self.root) {
-            Ok(days) => Ok(days.iter().map(|d| d.format("%Y-%m-%d").to_string()).collect()),
+            Ok(days) => Ok(days
+                .iter()
+                .map(|d| d.format("%Y-%m-%d").to_string())
+                .collect()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
             Err(e) => Err(e.into()),
         }
@@ -160,7 +170,9 @@ impl FrameSource {
     pub fn day(&self, date: &str) -> Result<DaySummary, Error> {
         let segments = self.plan(parse_date(date)?)?;
         let has = |video: bool| {
-            segments.iter().any(|s| matches!(s, Segment::Video { .. }) == video)
+            segments
+                .iter()
+                .any(|s| matches!(s, Segment::Video { .. }) == video)
         };
         let source = match (has(false), has(true)) {
             (false, false) => Source::Empty,
@@ -218,7 +230,10 @@ impl FrameSource {
                     // it again.
                     Err(_) => fs::read(chunk_dir()?.join(&name))?,
                 };
-                Ok(Frame { bytes, mime: "image/jpeg" })
+                Ok(Frame {
+                    bytes,
+                    mime: "image/jpeg",
+                })
             }
         }
     }
@@ -233,7 +248,10 @@ impl FrameSource {
             Segment::Screenshots { shots, range } => {
                 let shot = &shots[range.start + local];
                 if let Some(local_time) = self.db_time(date, shot.number)? {
-                    return Ok(Some(FrameTime { local_time, exact: true }));
+                    return Ok(Some(FrameTime {
+                        local_time,
+                        exact: true,
+                    }));
                 }
                 // Not in the database (it only goes back to late 2025): the
                 // file's mtime is when it was written, which is when it was
@@ -303,7 +321,10 @@ impl FrameSource {
             timeline.push((
                 hour,
                 shots[start].modified,
-                Segment::Screenshots { shots: shots.clone(), range: start..end },
+                Segment::Screenshots {
+                    shots: shots.clone(),
+                    range: start..end,
+                },
             ));
             start = end;
         }
@@ -323,7 +344,10 @@ impl FrameSource {
             return Ok(legacy);
         }
         timeline.sort_by_key(|(hour, start, _)| (*hour, *start));
-        Ok(timeline.into_iter().map(|(_, _, segment)| segment).collect())
+        Ok(timeline
+            .into_iter()
+            .map(|(_, _, segment)| segment)
+            .collect())
     }
 
     fn list_screenshots(&self, day: NaiveDate) -> Result<Arc<Vec<Shot>>, Error> {
@@ -339,7 +363,10 @@ impl FrameSource {
             }
         }
         let shots = Arc::new(library::list_screenshots(&dir)?);
-        self.screenshots.lock().unwrap().insert(day, (modified, shots.clone()));
+        self.screenshots
+            .lock()
+            .unwrap()
+            .insert(day, (modified, shots.clone()));
         Ok(shots)
     }
 
@@ -365,14 +392,18 @@ impl FrameSource {
         if let Some(times) = self.day_times.lock().unwrap().get(&day) {
             return Ok(times.clone());
         }
-        let Some(conn) = self.open_db()? else { return Ok(Arc::default()) };
+        let Some(conn) = self.open_db()? else {
+            return Ok(Arc::default());
+        };
         let mut statement = conn.prepare(
             "SELECT local_time FROM screenshots
              WHERE substr(local_time, 1, 10) = ?1
              ORDER BY frame_number, id",
         )?;
         let times = statement
-            .query_map([day.format("%Y-%m-%d").to_string()], |row| row.get::<_, String>(0))?
+            .query_map([day.format("%Y-%m-%d").to_string()], |row| {
+                row.get::<_, String>(0)
+            })?
             .collect::<Result<Vec<_>, _>>()?;
         let times = Arc::new(times);
         self.day_times.lock().unwrap().insert(day, times.clone());
@@ -391,7 +422,9 @@ impl FrameSource {
     }
 
     fn db_time(&self, date: &str, frame_number: u32) -> Result<Option<String>, Error> {
-        let Some(conn) = self.open_db()? else { return Ok(None) };
+        let Some(conn) = self.open_db()? else {
+            return Ok(None);
+        };
         // Frame numbers restart every day, so the date has to be part of the
         // key. `local_time` is ISO 8601 in local time, so its first ten
         // characters are the day folder's name.
@@ -415,7 +448,11 @@ fn parse_date(date: &str) -> Result<NaiveDate, Error> {
 }
 
 /// The segment holding day-wide frame `index`, and the index within it.
-fn locate<'a>(segments: &'a [Segment], date: &str, index: usize) -> Result<(&'a Segment, usize), Error> {
+fn locate<'a>(
+    segments: &'a [Segment],
+    date: &str,
+    index: usize,
+) -> Result<(&'a Segment, usize), Error> {
     let mut local = index;
     for segment in segments {
         if local < segment.len() {

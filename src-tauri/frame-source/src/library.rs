@@ -127,12 +127,22 @@ pub fn list_screenshots(day_dir: &Path) -> std::io::Result<Vec<Shot>> {
     let mut shots = Vec::new();
     for entry in entries {
         let entry = entry?;
-        let Ok(name) = entry.file_name().into_string() else { continue };
-        let Some(number) = parse_screenshot_name(&name) else { continue };
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        let Some(number) = parse_screenshot_name(&name) else {
+            continue;
+        };
         // The converter may delete it between the listing and the stat.
-        let Ok(modified) = entry.metadata().and_then(|m| m.modified()) else { continue };
+        let Ok(modified) = entry.metadata().and_then(|m| m.modified()) else {
+            continue;
+        };
         let modified = DateTime::<Local>::from(modified).naive_local();
-        shots.push(Shot { name, number, modified });
+        shots.push(Shot {
+            name,
+            number,
+            modified,
+        });
     }
     shots.sort_by_key(|shot| shot.number);
     Ok(shots)
@@ -151,10 +161,18 @@ pub fn list_videos(root: &Path, day: NaiveDate) -> std::io::Result<Vec<VideoFile
         };
         for entry in entries {
             let entry = entry?;
-            let Ok(name) = entry.file_name().into_string() else { continue };
-            let Some((start, kind)) = parse_video_name(&name) else { continue };
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
+            let Some((start, kind)) = parse_video_name(&name) else {
+                continue;
+            };
             if start.date() == day && entry.file_type()?.is_file() {
-                videos.push(VideoFile { path: entry.path(), start, kind });
+                videos.push(VideoFile {
+                    path: entry.path(),
+                    start,
+                    kind,
+                });
             }
         }
     }
@@ -185,11 +203,19 @@ mod tests {
 
     #[test]
     fn parses_names() {
-        assert_eq!(parse_day("2024-12-20"), NaiveDate::from_ymd_opt(2024, 12, 20));
+        assert_eq!(
+            parse_day("2024-12-20"),
+            NaiveDate::from_ymd_opt(2024, 12, 20)
+        );
         assert_eq!(parse_day(".cache"), None);
         assert_eq!(parse_day("2024-12-20--12-48-38.mov"), None);
 
-        let at = |h, m, s| NaiveDate::from_ymd_opt(2024, 12, 20).unwrap().and_hms_opt(h, m, s).unwrap();
+        let at = |h, m, s| {
+            NaiveDate::from_ymd_opt(2024, 12, 20)
+                .unwrap()
+                .and_hms_opt(h, m, s)
+                .unwrap()
+        };
         assert_eq!(
             parse_video_name("2024-12-20--12-48-38.mov"),
             Some((at(12, 48, 38), VideoKind::Legacy))
@@ -239,13 +265,24 @@ mod tests {
     #[test]
     fn sorts_screenshots_numerically_and_ignores_other_files() {
         let dir = TempDir::new().unwrap();
-        for name in ["00010.png", "00002.png", "100000.png", ".DS_Store", "notes.txt"] {
+        for name in [
+            "00010.png",
+            "00002.png",
+            "100000.png",
+            ".DS_Store",
+            "notes.txt",
+        ] {
             fs::write(dir.path().join(name), b"").unwrap();
         }
-        let names: Vec<_> =
-            list_screenshots(dir.path()).unwrap().into_iter().map(|s| s.name).collect();
+        let names: Vec<_> = list_screenshots(dir.path())
+            .unwrap()
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
         assert_eq!(names, vec!["00002.png", "00010.png", "100000.png"]);
-        assert!(list_screenshots(&dir.path().join("missing")).unwrap().is_empty());
+        assert!(list_screenshots(&dir.path().join("missing"))
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -265,7 +302,11 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            vec!["2024-12-29--11-17-04.mov", "2024-12-29--14-17-25.mov", "2024-12-29--16-00-00.mov"]
+            vec![
+                "2024-12-29--11-17-04.mov",
+                "2024-12-29--14-17-25.mov",
+                "2024-12-29--16-00-00.mov"
+            ]
         );
     }
 

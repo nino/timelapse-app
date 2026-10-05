@@ -20,7 +20,9 @@ fn make_video(path: &Path, frames: usize, level_offset: usize) {
         .args(["-frames:v", &frames.to_string()])
         // Keyframes every 2 s, like a real encode, so seeking has to decode
         // forward from a keyframe to land on the right frame.
-        .args(["-c:v", "libx264", "-g", "30", "-pix_fmt", "yuv420p", "-qp", "0"])
+        .args([
+            "-c:v", "libx264", "-g", "30", "-pix_fmt", "yuv420p", "-qp", "0",
+        ])
         .arg(path)
         .status()
         .expect("ffmpeg must be installed to run these tests");
@@ -34,14 +36,28 @@ fn gray_level(bytes: &[u8], dir: &Path) -> usize {
     let output = Command::new("ffmpeg")
         .args(["-v", "error", "-i"])
         .arg(&file)
-        .args(["-vf", "scale=1:1", "-f", "rawvideo", "-pix_fmt", "gray", "-"])
+        .args([
+            "-vf",
+            "scale=1:1",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "gray",
+            "-",
+        ])
         .output()
         .unwrap();
     assert!(output.status.success());
     usize::from(output.stdout[0])
 }
 
-fn assert_frame(source: &FrameSource, date: &str, index: usize, expected_level: usize, scratch: &Path) {
+fn assert_frame(
+    source: &FrameSource,
+    date: &str,
+    index: usize,
+    expected_level: usize,
+    scratch: &Path,
+) {
     let frame = source.frame(date, index).unwrap();
     assert_eq!(frame.mime, "image/jpeg");
     let level = gray_level(&frame.bytes, scratch);
@@ -67,11 +83,12 @@ impl Library {
     }
 
     fn source(&self, cap: u64) -> FrameSource {
-        FrameSource::with_tools(
+        // Whatever ffmpeg is on PATH; the app passes its bundled one.
+        FrameSource::new(
             self.root.path().to_path_buf(),
             self.cache.path().to_path_buf(),
             cap,
-            Tools::locate(),
+            Tools::new("ffmpeg"),
         )
         .unwrap()
     }
@@ -90,12 +107,32 @@ fn serves_exact_frames_across_chunks_and_videos() {
     assert_eq!(day.source, Source::Video);
 
     let scratch = lib.scratch.path();
-    for index in [0, 1, 37, CHUNK_FRAMES - 1, CHUNK_FRAMES, CHUNK_FRAMES + 1, 199] {
-        assert_frame(&source, "2024-12-20", index, index * LEVEL_STEP % 256, scratch);
+    for index in [
+        0,
+        1,
+        37,
+        CHUNK_FRAMES - 1,
+        CHUNK_FRAMES,
+        CHUNK_FRAMES + 1,
+        199,
+    ] {
+        assert_frame(
+            &source,
+            "2024-12-20",
+            index,
+            index * LEVEL_STEP % 256,
+            scratch,
+        );
     }
     // Frame 200 of the day is frame 0 of the second video.
     assert_frame(&source, "2024-12-20", 200, 100, scratch);
-    assert_frame(&source, "2024-12-20", 239, (100 + 39 * LEVEL_STEP) % 256, scratch);
+    assert_frame(
+        &source,
+        "2024-12-20",
+        239,
+        (100 + 39 * LEVEL_STEP) % 256,
+        scratch,
+    );
 
     assert!(source.frame("2024-12-20", 240).is_err());
 }
@@ -136,7 +173,10 @@ fn times_legacy_videos_from_the_database_not_the_file_name() {
     let source = lib.source(u64::MAX);
 
     let time = source.frame_time("2025-12-01", 2).unwrap().unwrap();
-    assert_eq!((time.local_time.as_str(), time.exact), ("2025-12-01T20:01:00+00:00", true));
+    assert_eq!(
+        (time.local_time.as_str(), time.exact),
+        ("2025-12-01T20:01:00+00:00", true)
+    );
     assert_eq!(source.frame_time("2025-12-02", 0).unwrap(), None);
     // Before the database existed there is nothing to go on.
     make_video(&lib.root.path().join("2024-12-20--09-00-00.mov"), 2, 0);
@@ -152,7 +192,11 @@ fn skips_broken_and_duplicate_videos() {
         lib.root.path().join("2024-12-29--14-17-25.mov"),
     )
     .unwrap();
-    fs::write(lib.root.path().join("2024-12-29--16-44-03.mov"), b"36 bytes of not a video....").unwrap();
+    fs::write(
+        lib.root.path().join("2024-12-29--16-44-03.mov"),
+        b"36 bytes of not a video....",
+    )
+    .unwrap();
     let source = lib.source(u64::MAX);
 
     assert_eq!(source.day("2024-12-29").unwrap().frame_count, 20);
@@ -172,7 +216,10 @@ fn prefers_screenshots_and_tracks_new_ones() {
     let day = source.day("2026-10-04").unwrap();
     assert_eq!((day.frame_count, day.source), (2, Source::Screenshots));
     let frame = source.frame("2026-10-04", 1).unwrap();
-    assert_eq!((frame.bytes.as_slice(), frame.mime), (&b"two"[..], "image/png"));
+    assert_eq!(
+        (frame.bytes.as_slice(), frame.mime),
+        (&b"two"[..], "image/png")
+    );
 
     // The capture loop keeps writing; the next question sees the new frame.
     std::thread::sleep(std::time::Duration::from_millis(20));
@@ -227,14 +274,24 @@ fn stitches_converted_hours_and_remaining_screenshots_in_time_order() {
     assert!(source.frame("2026-10-04", 8).is_err());
 
     let time = |index| source.frame_time("2026-10-04", index).unwrap().unwrap();
-    assert_eq!((time(1).local_time.as_str(), time(1).exact), ("2026-10-04T09:00:06", false));
-    assert_eq!((time(6).local_time.as_str(), time(6).exact), ("2026-10-04T10:00:01", true));
+    assert_eq!(
+        (time(1).local_time.as_str(), time(1).exact),
+        ("2026-10-04T09:00:06", false)
+    );
+    assert_eq!(
+        (time(6).local_time.as_str(), time(6).exact),
+        ("2026-10-04T10:00:01", true)
+    );
 }
 
 #[test]
 fn serves_a_fully_converted_day_from_its_hourly_videos() {
     let lib = Library::new();
-    make_video(&lib.root.path().join("2026-10-01--09-10-00--hourly.mov"), 2, 0);
+    make_video(
+        &lib.root.path().join("2026-10-01--09-10-00--hourly.mov"),
+        2,
+        0,
+    );
     // An old whole-day render of the same day is ignored once hourly videos exist.
     make_video(&lib.root.path().join("2026-10-01--23-00-00.mov"), 5, 0);
     let source = lib.source(u64::MAX);
@@ -260,13 +317,23 @@ fn lists_days_and_rejects_paths_that_are_not_days() {
 #[test]
 fn stays_under_its_cache_cap() {
     let lib = Library::new();
-    make_video(&lib.root.path().join("2024-12-20--09-00-00.mov"), CHUNK_FRAMES * 3, 0);
+    make_video(
+        &lib.root.path().join("2024-12-20--09-00-00.mov"),
+        CHUNK_FRAMES * 3,
+        0,
+    );
     let source = lib.source(1);
 
     // Each chunk alone is over the 1-byte cap, so only the latest survives,
     // and going back to an evicted chunk decodes it again.
     for index in [0, CHUNK_FRAMES, 2 * CHUNK_FRAMES, 5] {
-        assert_frame(&source, "2024-12-20", index, index * LEVEL_STEP % 256, lib.scratch.path());
+        assert_frame(
+            &source,
+            "2024-12-20",
+            index,
+            index * LEVEL_STEP % 256,
+            lib.scratch.path(),
+        );
     }
     let chunk_dirs = fs::read_dir(lib.cache.path())
         .unwrap()
