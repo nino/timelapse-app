@@ -388,10 +388,10 @@ fn ffmpeg_command(frames_dir: &Path, output: &Path) -> Command {
     // which is most of what keeps the machine cool while it encodes.
     let mut command = if cfg!(target_os = "macos") {
         let mut command = Command::new("taskpolicy");
-        command.arg("-b").arg("ffmpeg");
+        command.arg("-b").arg(crate::paths::ffmpeg());
         command
     } else {
-        Command::new("ffmpeg")
+        Command::new(crate::paths::ffmpeg())
     };
     command
         .args(["-y", "-loglevel", "error", "-framerate", FRAMERATE, "-i"])
@@ -453,7 +453,7 @@ fn encode_with_ffmpeg(frames_dir: &Path, output: &Path, running: &AtomicBool) ->
         .spawn()
         .map_err(|e| {
             ConvertError::Failed(format!(
-                "Failed to run ffmpeg: {}. Make sure ffmpeg is installed and in PATH.",
+                "Failed to run ffmpeg: {}. The app bundles ffmpeg; outside a bundle it must be on PATH.",
                 e
             ))
         })?;

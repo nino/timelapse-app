@@ -1,26 +1,17 @@
 use active_win_pos_rs::get_active_window;
 use chrono::{DateTime, Utc, Local};
-use magick_rust::{magick_wand_genesis, MagickWand};
+use fast_image_resize::{FilterType, ResizeAlg, ResizeOptions, Resizer};
+use image::{ImageFormat, RgbImage};
 use screenshots::Screen;
 use serde::{Deserialize, Serialize};
 use std::{
     path::PathBuf,
     sync::atomic::{AtomicBool, Ordering},
-    sync::Once,
     sync::{Arc, Mutex},
 };
 use thiserror::Error;
 use tokio::time::{sleep, Duration};
 use crate::database::ScreenshotDatabase;
-
-// Ensure MagickWand is initialized only once
-static MAGICK_WAND_GENESIS: Once = Once::new();
-
-fn init_magick_wand() {
-    MAGICK_WAND_GENESIS.call_once(|| {
-        magick_wand_genesis();
-    });
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorLogEntry {
@@ -41,9 +32,6 @@ pub enum Error {
 
     #[error("Unable convert screenshot path to string")]
     UnableToConvertScreenshotPathToString,
-
-    #[error("Unable to check if image is black: {reason}")]
-    UnableToCheckIfImageIsBlack { reason: String },
 
     #[error("Database error: {0}")]
     DatabaseError(#[from] rusqlite::Error),
@@ -71,9 +59,6 @@ impl Photographer {
     /// `~/Timelapse`. Tests use this so they never read or write the real
     /// screenshot library.
     pub fn new_in(timelapse_root_path: PathBuf) -> Result<Photographer, Error> {
-        // Initialize MagickWand
-        init_magick_wand();
-
         // Create the Timelapse directory if it doesn't exist
         std::fs::create_dir_all(&timelapse_root_path)?;
 
@@ -185,14 +170,20 @@ impl Photographer {
         );
 
         let image_data = capture_screenshot().await?;
-        resize_screenshot(&image_data, &screenshot_path).await?;
+        let frame = fit_to_frame(&image_data, &screenshot_path)?;
 
-        // Check if the image is all black
-        if is_image_all_black(&screenshot_path).await? {
-            println!("Screenshot is all black, deleting: {}", screenshot_path);
-            std::fs::remove_file(&screenshot_path)?;
-            Ok(true) // Return true to indicate image was black and deleted
+        // A black frame is dropped before it is written
+        if is_image_all_black(&frame) {
+            println!("Screenshot is all black, skipping: {}", screenshot_path);
+            Ok(true) // Return true to indicate image was black and dropped
         } else {
+            frame
+                .save_with_format(&screenshot_path, ImageFormat::Png)
+                .map_err(|e| Error::UnableToResizeScreenshot {
+                    path: screenshot_path.clone(),
+                    reason: format!("Failed to write image: {}", e),
+                })?;
+
             // Extract frame number from filename (e.g., "00001.png" -> 1)
             let frame_number: u32 = filename
                 .replace(".png", "")
@@ -310,134 +301,66 @@ fn window_overlaps_screen(window: (i32, i32, i32, i32), screen: (i32, i32, u32, 
         && window_center_y < sy + sh as i32
 }
 
-async fn resize_screenshot(data: &[u8], file_path: &str) -> Result<(), Error> {
-    let wand = MagickWand::new();
+/// Size of every stored frame. Screens of other shapes are letterboxed into it.
+const FRAME_WIDTH: u32 = 1800;
+const FRAME_HEIGHT: u32 = 1124;
 
-    // Read the image
-    wand.read_image_blob(data)
-        .map_err(|e| Error::UnableToResizeScreenshot {
-            path: file_path.to_string(),
-            reason: format!("Failed to read image: {:?}", e),
-        })?;
+/// Decode a captured PNG, scale it to fit `FRAME_WIDTH`×`FRAME_HEIGHT` keeping
+/// its aspect ratio, and centre it on a black canvas of exactly that size.
+fn fit_to_frame(data: &[u8], file_path: &str) -> Result<RgbImage, Error> {
+    let resize_error = |reason: String| Error::UnableToResizeScreenshot {
+        path: file_path.to_string(),
+        reason,
+    };
 
-    // Get original dimensions
-    let orig_width = wand.get_image_width() as f64;
-    let orig_height = wand.get_image_height() as f64;
+    let source = image::load_from_memory_with_format(data, ImageFormat::Png)
+        .map_err(|e| resize_error(format!("Failed to read image: {}", e)))?
+        .into_rgb8();
+    let (orig_width, orig_height) = source.dimensions();
+    if orig_width == 0 || orig_height == 0 {
+        return Err(resize_error("Captured image is empty".to_string()));
+    }
 
-    // Target dimensions
-    let target_width = 1800.0;
-    let target_height = 1124.0;
+    let scale = (FRAME_WIDTH as f64 / orig_width as f64).min(FRAME_HEIGHT as f64 / orig_height as f64);
+    let new_width = ((orig_width as f64 * scale) as u32).clamp(1, FRAME_WIDTH);
+    let new_height = ((orig_height as f64 * scale) as u32).clamp(1, FRAME_HEIGHT);
 
-    // Calculate scaling to fit within target dimensions while maintaining aspect ratio
-    let scale_x = target_width / orig_width;
-    let scale_y = target_height / orig_height;
-    let scale = scale_x.min(scale_y);
-
-    // Calculate new dimensions
-    let new_width = (orig_width * scale) as usize;
-    let new_height = (orig_height * scale) as usize;
-
-    // Resize the image maintaining aspect ratio
-    wand.resize_image(new_width, new_height, magick_rust::FilterType::Box)
-        .map_err(|e| Error::UnableToResizeScreenshot {
-            path: file_path.to_string(),
-            reason: format!("Failed to resize image: {:?}", e),
-        })?;
-
-    // Create a new black canvas of target size
-    let canvas = MagickWand::new();
-    canvas
-        .new_image(
-            target_width as usize,
-            target_height as usize,
-            &magick_rust::PixelWand::new(),
+    // Box filter, as the ImageMagick version used: each output pixel is the
+    // average of the source pixels it covers, which keeps text legible.
+    let mut resized = RgbImage::new(new_width, new_height);
+    Resizer::new()
+        .resize(
+            &source,
+            &mut resized,
+            &ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FilterType::Box)),
         )
-        .map_err(|e| Error::UnableToResizeScreenshot {
-            path: file_path.to_string(),
-            reason: format!("Failed to create canvas: {:?}", e),
-        })?;
+        .map_err(|e| resize_error(format!("Failed to resize image: {}", e)))?;
 
-    // Calculate position to center the resized image
-    let x_offset = ((target_width - new_width as f64) / 2.0) as isize;
-    let y_offset = ((target_height - new_height as f64) / 2.0) as isize;
-
-    // Composite the resized image onto the black canvas
-    canvas
-        .compose_images(
-            &wand,
-            magick_rust::CompositeOperator::Over,
-            true,
-            x_offset,
-            y_offset,
-        )
-        .map_err(|e| Error::UnableToResizeScreenshot {
-            path: file_path.to_string(),
-            reason: format!("Failed to composite image: {:?}", e),
-        })?;
-
-    // Write the final image
-    canvas
-        .write_image(file_path)
-        .map_err(|e| Error::UnableToResizeScreenshot {
-            path: file_path.to_string(),
-            reason: format!("Failed to write image: {:?}", e),
-        })?;
-
-    Ok(())
+    let mut canvas = RgbImage::new(FRAME_WIDTH, FRAME_HEIGHT);
+    let x_offset = (FRAME_WIDTH - new_width) / 2;
+    let y_offset = (FRAME_HEIGHT - new_height) / 2;
+    image::imageops::replace(&mut canvas, &resized, x_offset as i64, y_offset as i64);
+    Ok(canvas)
 }
 
-async fn is_image_all_black(file_path: &str) -> Result<bool, Error> {
-    let wand = MagickWand::new();
-
-    // Read the image
-    wand.read_image(file_path)
-        .map_err(|e| Error::UnableToCheckIfImageIsBlack {
-            reason: format!("Failed to read image: {:?}", e),
-        })?;
-
-    let width = wand.get_image_width();
-    let height = wand.get_image_height();
-
-    // Sample pixels to check if image is all black
-    // We'll check a grid of pixels across the image
-    let sample_size = 10; // Check every 10th pixel
+/// Whether the frame is (almost) entirely black, which is what a capture of a
+/// locked or sleeping screen looks like. Samples every 10th pixel in each
+/// direction and compares the mean luminance, from 0.0 to 1.0, against 0.01.
+fn is_image_all_black(image: &RgbImage) -> bool {
+    let sample_size = 10;
     let mut total_brightness = 0.0;
-    let mut pixel_count = 0;
+    let mut pixel_count = 0u64;
 
-    for y in (0..height).step_by(sample_size) {
-        for x in (0..width).step_by(sample_size) {
-            match wand.get_image_pixel_color(x as isize, y as isize) {
-                Some(pixel) => {
-                    // Get RGB values and calculate brightness
-                    let red = pixel.get_red();
-                    let green = pixel.get_green();
-                    let blue = pixel.get_blue();
-
-                    // Calculate luminance (brightness)
-                    let brightness = 0.299 * red + 0.587 * green + 0.114 * blue;
-                    total_brightness += brightness;
-                    pixel_count += 1;
-                }
-                None => {
-                    // Skip pixels that can't be read
-                    continue;
-                }
-            }
+    for y in (0..image.height()).step_by(sample_size) {
+        for x in (0..image.width()).step_by(sample_size) {
+            let [red, green, blue] = image.get_pixel(x, y).0;
+            let brightness = 0.299 * red as f64 + 0.587 * green as f64 + 0.114 * blue as f64;
+            total_brightness += brightness / 255.0;
+            pixel_count += 1;
         }
     }
 
-    if pixel_count == 0 {
-        return Err(Error::UnableToCheckIfImageIsBlack {
-            reason: "No pixels could be sampled".to_string(),
-        });
-    }
-
-    let mean_brightness = total_brightness / pixel_count as f64;
-
-    // Consider image "all black" if mean brightness is very close to 0
-    // Using a small threshold to account for potential compression artifacts
-    // PixelWand values are typically in the range 0.0 to 1.0
-    Ok(mean_brightness < 0.01)
+    pixel_count == 0 || total_brightness / (pixel_count as f64) < 0.01
 }
 
 #[cfg(test)]
@@ -685,5 +608,63 @@ mod tests {
         let deserialized: Result<ErrorLogEntry, _> = serde_json::from_str(&json.unwrap());
         assert!(deserialized.is_ok());
         assert_eq!(deserialized.unwrap().error_message, "Test error message");
+    }
+
+    fn png_of(image: &RgbImage) -> Vec<u8> {
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image.write_to(&mut bytes, ImageFormat::Png).unwrap();
+        bytes.into_inner()
+    }
+
+    #[test]
+    fn test_fit_to_frame_letterboxes_a_taller_screen() {
+        // 1000×1000 scales to 1124×1124, centred with 338px black bars each side.
+        let white = RgbImage::from_pixel(1000, 1000, image::Rgb([255, 255, 255]));
+        let frame = fit_to_frame(&png_of(&white), "test.png").unwrap();
+
+        assert_eq!(frame.dimensions(), (FRAME_WIDTH, FRAME_HEIGHT));
+        assert_eq!(frame.get_pixel(0, 562).0, [0, 0, 0]);
+        assert_eq!(frame.get_pixel(337, 562).0, [0, 0, 0]);
+        assert_eq!(frame.get_pixel(338, 562).0, [255, 255, 255]);
+        assert_eq!(frame.get_pixel(900, 0).0, [255, 255, 255]);
+        assert_eq!(frame.get_pixel(1461, 1123).0, [255, 255, 255]);
+        assert_eq!(frame.get_pixel(1462, 562).0, [0, 0, 0]);
+    }
+
+    #[test]
+    fn test_fit_to_frame_downscales_a_retina_capture() {
+        let capture = RgbImage::from_pixel(3456, 2234, image::Rgb([10, 200, 30]));
+        let frame = fit_to_frame(&png_of(&capture), "test.png").unwrap();
+
+        assert_eq!(frame.dimensions(), (FRAME_WIDTH, FRAME_HEIGHT));
+        // 3456×2234 fits as 1738×1124, leaving 31px bars left and right.
+        assert_eq!(frame.get_pixel(30, 500).0, [0, 0, 0]);
+        assert_eq!(frame.get_pixel(31, 500).0, [10, 200, 30]);
+        assert_eq!(frame.get_pixel(900, 500).0, [10, 200, 30]);
+    }
+
+    #[test]
+    fn test_fit_to_frame_rejects_garbage() {
+        let result = fit_to_frame(b"not a png", "/test/path");
+        assert!(matches!(result, Err(Error::UnableToResizeScreenshot { .. })));
+    }
+
+    #[test]
+    fn test_is_image_all_black() {
+        let black = RgbImage::new(FRAME_WIDTH, FRAME_HEIGHT);
+        assert!(is_image_all_black(&black));
+
+        // Near-black noise from a sleeping display still counts as black.
+        let nearly_black = RgbImage::from_pixel(FRAME_WIDTH, FRAME_HEIGHT, image::Rgb([1, 1, 1]));
+        assert!(is_image_all_black(&nearly_black));
+
+        // A letterboxed dark-grey screen does not.
+        let mut dim = RgbImage::new(FRAME_WIDTH, FRAME_HEIGHT);
+        for (x, _, pixel) in dim.enumerate_pixels_mut() {
+            if (300..1500).contains(&x) {
+                *pixel = image::Rgb([20, 20, 20]);
+            }
+        }
+        assert!(!is_image_all_black(&dim));
     }
 }
