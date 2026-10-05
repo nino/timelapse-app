@@ -1,7 +1,7 @@
 version: 2
 updates:
-  # Enable version updates for npm (JavaScript/TypeScript dependencies)
-  - package-ecosystem: "npm"
+  # Enable version updates for Bun (JavaScript/TypeScript dependencies)
+  - package-ecosystem: "bun"
     directory: "/"
     schedule:
       interval: "weekly"

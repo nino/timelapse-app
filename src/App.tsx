@@ -1,26 +1,50 @@
+import { invoke } from "@tauri-apps/api/core";
 import { BaseDirectory } from "@tauri-apps/api/path";
 import { readFile } from "@tauri-apps/plugin-fs";
-import React, { ReactNode, useState, useCallback, useMemo } from "react";
+import React from "react";
 
 import "./App.css";
-import { useFiles, useFolders } from "./hooks/useFolders";
+import { useFiles, useFolders, useVideos } from "./hooks/useFolders";
+import { timelapseRoot } from "./timelapseRoot";
 
-export function App(): ReactNode {
-  const { folders, foldersError } = useFolders();
-  const [selectedFolder, setSelectedFolder] = useState<string | null>(null);
+type ViewMode = "images" | "videos";
+
+export function App(): React.ReactNode {
+  const { folders, foldersError, refreshFolders } = useFolders();
+  const { videos, videosError, refreshVideos } = useVideos();
+  const [viewMode, setViewMode] = React.useState<ViewMode>("images");
+  const [selectedFolder, setSelectedFolder] = React.useState<string | null>(
+    null,
+  );
+  const [selectedVideo, setSelectedVideo] = React.useState<string | null>(null);
   const { files, filesError } = useFiles(selectedFolder);
-  const [currentImageIndex, setCurrentImageIndex] = useState(0);
-  const [currentImageSrc, setCurrentImageSrc] = useState<string | null>(null);
+  const [currentImageIndex, setCurrentImageIndex] = React.useState(0);
+  const [currentImageSrc, setCurrentImageSrc] = React.useState<string | null>(
+    null,
+  );
+  const [videoCacheFolder, setVideoCacheFolder] = React.useState<string | null>(
+    null,
+  );
+  const [isExtractingFrames, setIsExtractingFrames] = React.useState(false);
+  const [extractionError, setExtractionError] = React.useState<string | null>(
+    null,
+  );
+  const { files: videoFiles } = useFiles(
+    videoCacheFolder ? `.cache/${videoCacheFolder}` : null,
+  );
+  const [currentTimestamp, setCurrentTimestamp] = React.useState<string | null>(
+    null,
+  );
 
   // Get current date folder name (YYYY-MM-DD format)
-  const currentDateFolder = useMemo(() => {
+  const currentDateFolder = React.useMemo(() => {
     const today = new Date();
     return today.toISOString().split("T")[0];
   }, []);
 
-  // Auto-select today's folder if it exists
+  // Auto-select today's folder if it exists (for images mode)
   React.useEffect(() => {
-    if (folders.length > 0 && !selectedFolder) {
+    if (viewMode === "images" && folders.length > 0 && !selectedFolder) {
       const todayFolder = folders.find(
         (folder) => folder === currentDateFolder,
       );
@@ -32,17 +56,76 @@ export function App(): ReactNode {
         setSelectedFolder(sortedFolders[0]);
       }
     }
-  }, [folders, selectedFolder, currentDateFolder]);
+  }, [folders, selectedFolder, currentDateFolder, viewMode]);
+
+  // Auto-select most recent video (for videos mode)
+  React.useEffect(() => {
+    if (viewMode === "videos" && videos.length > 0 && !selectedVideo) {
+      setSelectedVideo(videos[videos.length - 1]); // Videos are in chronological order, so last is most recent
+    }
+  }, [videos, selectedVideo, viewMode]);
 
   // Reset image index when folder changes
   React.useEffect(() => {
-    setCurrentImageIndex(0);
-  }, [selectedFolder]);
+    if (viewMode === "images") {
+      setCurrentImageIndex(Math.max(files.length - 1, 0));
+    }
+  }, [selectedFolder, files.length, viewMode]);
+
+  // Reset image index when video frames are loaded
+  React.useEffect(() => {
+    if (viewMode === "videos" && videoFiles.length > 0) {
+      setCurrentImageIndex(0); // Start from first frame for videos
+    }
+  }, [videoFiles.length, viewMode]);
+
+  // Extract frames from selected video
+  React.useEffect(() => {
+    async function extractFrames(): Promise<void> {
+      if (viewMode !== "videos" || !selectedVideo) {
+        setVideoCacheFolder(null);
+        setIsExtractingFrames(false);
+        setExtractionError(null);
+        return;
+      }
+
+      try {
+        setIsExtractingFrames(true);
+        setExtractionError(null);
+        setVideoCacheFolder(null); // Clear old frames immediately
+        console.log("Extracting frames from video:", selectedVideo);
+
+        // Call Tauri command to extract frames (uses cache if available)
+        const cacheFolder = await invoke<string>("extract_video_frames", {
+          videoFilename: selectedVideo,
+        });
+
+        console.log("Frames extracted to cache folder:", cacheFolder);
+        setVideoCacheFolder(cacheFolder);
+        setIsExtractingFrames(false);
+      } catch (error) {
+        // Without this the UI sits on "Loading video…" forever, which makes a
+        // missing ffmpeg look identical to a slow extraction.
+        console.error("Error extracting frames:", error);
+        setExtractionError(
+          error instanceof Error ? error.message : String(error),
+        );
+        setVideoCacheFolder(null);
+        setIsExtractingFrames(false);
+      }
+    }
+
+    extractFrames();
+  }, [selectedVideo, viewMode]);
 
   // Keyboard navigation
   React.useEffect(() => {
     const handleKeydown = (e: KeyboardEvent): void => {
-      if (!selectedFolder || files.length === 0) return;
+      const activeFiles = viewMode === "images" ? files : videoFiles;
+
+      if (viewMode === "images" && (!selectedFolder || files.length === 0))
+        return;
+      if (viewMode === "videos" && videoFiles.length === 0) return;
 
       let step = 1;
       if (e.shiftKey) step = 10;
@@ -56,47 +139,81 @@ export function App(): ReactNode {
         setCurrentImageIndex(newIndex);
       } else if (e.key === "ArrowRight") {
         e.preventDefault();
-        newIndex = Math.min(files.length - 1, currentImageIndex + step);
+        newIndex = Math.min(activeFiles.length - 1, currentImageIndex + step);
         setCurrentImageIndex(newIndex);
       }
     };
 
     window.addEventListener("keydown", handleKeydown);
     return (): void => window.removeEventListener("keydown", handleKeydown);
-  }, [selectedFolder, files.length, currentImageIndex]);
+  }, [
+    selectedFolder,
+    files.length,
+    videoFiles.length,
+    currentImageIndex,
+    viewMode,
+  ]);
 
-  // Load current image when folder or index changes
+  // Load current image when folder or index changes (works for both images and videos)
   React.useEffect(() => {
     async function loadImage(): Promise<void> {
-      if (!selectedFolder || files.length === 0 || !files[currentImageIndex]) {
-        setCurrentImageSrc(null);
-        return;
-      }
+      if (viewMode === "images") {
+        if (!selectedFolder || files.length === 0 || !files[currentImageIndex]) {
+          setCurrentImageSrc(null);
+          return;
+        }
 
-      try {
-        const imagePath = `Timelapse/${selectedFolder}/${files[currentImageIndex]}`;
-        console.log("Loading image from path:", imagePath);
+        try {
+          const imagePath = `${timelapseRoot()}/${selectedFolder}/${files[currentImageIndex]}`;
+          console.log("Loading image from path:", imagePath);
 
-        const imageData = await readFile(imagePath, {
-          baseDir: BaseDirectory.Home,
-        });
+          const imageData = await readFile(imagePath, {
+            baseDir: BaseDirectory.Home,
+          });
 
-        console.log("Image data loaded, size:", imageData.length);
+          console.log("Image data loaded, size:", imageData.length);
 
-        // Create a blob URL from the binary data
-        const blob = new Blob([imageData], { type: "image/jpeg" });
-        const blobUrl = URL.createObjectURL(blob);
+          // Create a blob URL from the binary data
+          const blob = new Blob([imageData], { type: "image/jpeg" });
+          const blobUrl = URL.createObjectURL(blob);
 
-        console.log("Created blob URL:", blobUrl);
-        setCurrentImageSrc(blobUrl);
-      } catch (error) {
-        console.error("Error loading image:", error);
-        setCurrentImageSrc(null);
+          console.log("Created blob URL:", blobUrl);
+          setCurrentImageSrc(blobUrl);
+        } catch (error) {
+          console.error("Error loading image:", error);
+          setCurrentImageSrc(null);
+        }
+      } else if (viewMode === "videos") {
+        if (!videoCacheFolder || videoFiles.length === 0 || !videoFiles[currentImageIndex]) {
+          setCurrentImageSrc(null);
+          return;
+        }
+
+        try {
+          const framePath = `${timelapseRoot()}/.cache/${videoCacheFolder}/${videoFiles[currentImageIndex]}`;
+          console.log("Loading video frame from path:", framePath);
+
+          const frameData = await readFile(framePath, {
+            baseDir: BaseDirectory.Home,
+          });
+
+          console.log("Frame data loaded, size:", frameData.length);
+
+          // Create a blob URL from the binary data
+          const blob = new Blob([frameData], { type: "image/jpeg" });
+          const blobUrl = URL.createObjectURL(blob);
+
+          console.log("Created blob URL:", blobUrl);
+          setCurrentImageSrc(blobUrl);
+        } catch (error) {
+          console.error("Error loading frame:", error);
+          setCurrentImageSrc(null);
+        }
       }
     }
 
     loadImage();
-  }, [selectedFolder, files, currentImageIndex]);
+  }, [selectedFolder, files, videoCacheFolder, videoFiles, currentImageIndex, viewMode]);
 
   // Clean up blob URLs when component unmounts or image changes
   React.useEffect(() => {
@@ -107,7 +224,7 @@ export function App(): ReactNode {
     };
   }, [currentImageSrc]);
 
-  const handleScrubberChange = useCallback(
+  const handleScrubberChange = React.useCallback(
     (e: React.ChangeEvent<HTMLInputElement>) => {
       const newIndex = parseInt(e.target.value, 10);
       setCurrentImageIndex(newIndex);
@@ -115,22 +232,82 @@ export function App(): ReactNode {
     [],
   );
 
-  const refreshFiles = useCallback(() => {
-    // Force refresh by changing the selected folder
-    const currentFolder = selectedFolder;
-    setSelectedFolder(null);
-    setTimeout(() => setSelectedFolder(currentFolder), 10);
-  }, [selectedFolder]);
+  const refreshContent = React.useCallback(() => {
+    if (viewMode === "images") {
+      refreshFolders();
+      // Force refresh by changing the selected folder
+      const currentFolder = selectedFolder;
+      setSelectedFolder(null);
+      setTimeout(() => setSelectedFolder(currentFolder), 10);
+    } else {
+      refreshVideos();
+      // Force refresh by changing the selected video
+      const currentVideo = selectedVideo;
+      setSelectedVideo(null);
+      setTimeout(() => setSelectedVideo(currentVideo), 10);
+    }
+  }, [refreshFolders, refreshVideos, selectedFolder, selectedVideo, viewMode]);
 
-  const formatTime = useCallback((index: number) => {
-    // Assume screenshots are taken every few seconds, estimate time
-    const totalMinutes = Math.floor((index * 30) / 60); // Assuming 30 seconds between screenshots
-    const hours = Math.floor(totalMinutes / 60);
-    const minutes = totalMinutes % 60;
-    return `${hours.toString().padStart(2, "0")}:${minutes
-      .toString()
-      .padStart(2, "0")}`;
-  }, []);
+  // Fetch timestamp for current frame from database
+  React.useEffect(() => {
+    async function fetchTimestamp(): Promise<void> {
+      if (viewMode !== "images" || files.length === 0) {
+        setCurrentTimestamp(null);
+        return;
+      }
+
+      try {
+        // Extract frame number from filename (e.g., "00001.png" -> 1)
+        const filename = files[currentImageIndex];
+        const frameNumber = parseInt(filename.replace(".png", ""), 10);
+
+        const metadata = await invoke<[string, string] | null>(
+          "get_screenshot_metadata",
+          {
+            frameNumber,
+          },
+        );
+
+        if (metadata && metadata[1]) {
+          setCurrentTimestamp(metadata[1]); // Use local_time
+        } else {
+          setCurrentTimestamp(null);
+        }
+      } catch (error) {
+        console.error("Error fetching timestamp:", error);
+        setCurrentTimestamp(null);
+      }
+    }
+
+    fetchTimestamp();
+  }, [currentImageIndex, files, viewMode]);
+
+  const formatTime = React.useCallback(
+    (index: number) => {
+      // If we have a real timestamp from the database, use it
+      if (currentTimestamp) {
+        try {
+          const date = new Date(currentTimestamp);
+          const hours = date.getHours();
+          const minutes = date.getMinutes();
+          return `${hours.toString().padStart(2, "0")}:${minutes
+            .toString()
+            .padStart(2, "0")}`;
+        } catch (e) {
+          console.error("Error parsing timestamp:", e);
+        }
+      }
+
+      // Fall back to estimate if no timestamp available
+      const totalMinutes = Math.floor((index * 1) / 60); // Assuming 1 second between screenshots
+      const hours = Math.floor(totalMinutes / 60);
+      const minutes = totalMinutes % 60;
+      return `${hours.toString().padStart(2, "0")}:${minutes
+        .toString()
+        .padStart(2, "0")}`;
+    },
+    [currentTimestamp],
+  );
 
   if (foldersError) {
     return (
@@ -152,72 +329,189 @@ export function App(): ReactNode {
     );
   }
 
+  if (videosError) {
+    return (
+      <main className="flex items-center justify-center h-screen">
+        <div className="text-red-500">
+          <p>Error loading videos: {videosError.message}</p>
+        </div>
+      </main>
+    );
+  }
+
   return (
     <main className="h-screen overflow-hidden grid grid-rows-[min-content_1fr_56px] bg-gray-100 text-black">
-      {/* Header with folder selection */}
+      {/* Header with mode toggle and content selection */}
       <header className="bg-gray-100 p-3 border-b border-gray-200">
         <div className="flex items-center gap-4">
           <h1 className="text-lg font-semibold">Timelapse Viewer</h1>
-          <select
-            value={selectedFolder || ""}
-            onChange={(e) => setSelectedFolder(e.target.value || null)}
-            className="bg-gray-700 text-white px-3 py-1 rounded border border-gray-600 focus:outline-none focus:ring-2 focus:ring-blue-500"
-          >
-            <option value="">Select a date…</option>
-            {[...folders]
-              .sort()
-              .reverse()
-              .map((folder) => (
-                <option key={folder} value={folder}>
-                  {folder} {folder === currentDateFolder ? "(Today)" : ""}
-                </option>
-              ))}
-          </select>
-          {selectedFolder && (
-            <span className="text-gray-300 text-sm">
-              {files.length} screenshots
-            </span>
+
+          {/* Mode toggle */}
+          <div className="flex bg-gray-200 rounded-lg p-1">
+            <button
+              onClick={() => setViewMode("images")}
+              className={`px-3 py-1 rounded text-sm font-medium transition-colors ${
+                viewMode === "images"
+                  ? "bg-white text-gray-900 shadow-sm"
+                  : "text-gray-600 hover:text-gray-900"
+              }`}
+            >
+              Images
+            </button>
+            <button
+              onClick={() => setViewMode("videos")}
+              className={`px-3 py-1 rounded text-sm font-medium transition-colors ${
+                viewMode === "videos"
+                  ? "bg-white text-gray-900 shadow-sm"
+                  : "text-gray-600 hover:text-gray-900"
+              }`}
+            >
+              Videos
+            </button>
+          </div>
+
+          {/* Images mode selectors */}
+          {viewMode === "images" && (
+            <>
+              <select
+                value={selectedFolder || ""}
+                onChange={(e) => setSelectedFolder(e.target.value || null)}
+                className="bg-gray-700 text-white px-3 py-1 rounded border border-gray-600 focus:outline-none focus:ring-2 focus:ring-blue-500"
+              >
+                <option value="">Select a date…</option>
+                {[...folders]
+                  .sort()
+                  .reverse()
+                  .map((folder) => (
+                    <option key={folder} value={folder}>
+                      {folder} {folder === currentDateFolder ? "(Today)" : ""}
+                    </option>
+                  ))}
+              </select>
+              {selectedFolder && files.length > 0 && (
+                <>
+                  <span className="text-gray-600 text-sm">
+                    {files.length} screenshots
+                  </span>
+                  <span className="text-gray-600 text-sm tabular-nums">
+                    Frame {currentImageIndex + 1} / {files.length}
+                  </span>
+                  <span className="text-gray-600 text-sm tabular-nums">
+                    {currentTimestamp ? "" : "~"}
+                    {formatTime(currentImageIndex)}
+                  </span>
+                </>
+              )}
+            </>
           )}
-          {/* Frame counter */}
-          {files.length > 0 && (
-            <span className="text-gray-300 text-sm">
-              Frame {currentImageIndex + 1} / {files.length}
-            </span>
-          )}
-          {/* Time estimate */}
-          {files.length > 0 && (
-            <span className="text-gray-300 text-sm">
-              ~{formatTime(currentImageIndex)}
-            </span>
+
+          {/* Videos mode selectors */}
+          {viewMode === "videos" && (
+            <>
+              <select
+                value={selectedVideo || ""}
+                onChange={(e) => setSelectedVideo(e.target.value || null)}
+                className="bg-gray-700 text-white px-3 py-1 rounded border border-gray-600 focus:outline-none focus:ring-2 focus:ring-blue-500"
+              >
+                <option value="">Select a video…</option>
+                {[...videos]
+                  .sort()
+                  .reverse()
+                  .map((video) => (
+                    <option key={video} value={video}>
+                      {video}
+                    </option>
+                  ))}
+              </select>
+              {videos.length > 0 && (
+                <span className="text-gray-600 text-sm">
+                  {videos.length} videos
+                </span>
+              )}
+              {selectedVideo && videoFiles.length > 0 && (
+                <>
+                  <span className="text-gray-600 text-sm">
+                    {videoFiles.length} frames
+                  </span>
+                  <span className="text-gray-600 text-sm tabular-nums">
+                    Frame {currentImageIndex + 1} / {videoFiles.length}
+                  </span>
+                </>
+              )}
+            </>
           )}
         </div>
       </header>
 
-      {/* Main image preview area */}
-      <div className="relative overflow-hidden">
+      {/* Main content area */}
+      <div className="relative overflow-hidden object-contain">
         {currentImageSrc ? (
           <img
             src={currentImageSrc}
-            alt={`Screenshot ${currentImageIndex + 1}`}
-            className="max-w-full object-contain absolute top-0 left-0 bottom-0 right-0"
+            alt={
+              viewMode === "images"
+                ? `Screenshot ${currentImageIndex + 1}`
+                : `Frame ${currentImageIndex + 1}`
+            }
+            className="w-full h-full object-contain absolute top-0 left-0 bottom-0 right-0"
             onError={() => {
               console.error("Failed to load image:", currentImageSrc);
               setCurrentImageSrc(null);
             }}
           />
         ) : (
-          <div className="text-gray-500 text-center">
-            <p className="text-xl mb-2">
-              {files.length > 0 ? "Loading image…" : "No screenshots available"}
-            </p>
-            {files.length === 0 && (
-              <p>Select a date folder with screenshots to begin</p>
-            )}
-            {files.length > 0 && (
-              <p className="text-sm mt-2">
-                Trying to load: {files[currentImageIndex]}
-              </p>
-            )}
+          <div className="flex items-center justify-center h-full text-gray-500 text-center">
+            <div>
+              {viewMode === "images" ? (
+                <>
+                  <p className="text-xl mb-2">
+                    {files.length > 0
+                      ? "Loading image…"
+                      : "No screenshots available"}
+                  </p>
+                  {files.length === 0 && (
+                    <p>Select a date folder with screenshots to begin</p>
+                  )}
+                  {files.length > 0 && (
+                    <p className="text-sm mt-2">
+                      Trying to load: {files[currentImageIndex]}
+                    </p>
+                  )}
+                </>
+              ) : (
+                <>
+                  <p className="text-xl mb-2">
+                    {extractionError
+                      ? "Could not extract frames from this video"
+                      : isExtractingFrames
+                        ? "Extracting frames from video…"
+                        : videoFiles.length > 0
+                          ? "Loading frame…"
+                          : videoCacheFolder
+                            ? "Loading frames…"
+                            : selectedVideo
+                              ? "Loading video…"
+                              : "No video selected"}
+                  </p>
+                  {extractionError && (
+                    <p className="text-sm mt-2 text-red-400">
+                      {extractionError}
+                    </p>
+                  )}
+                  {!selectedVideo && videos.length > 0 && (
+                    <p>Select a video to begin</p>
+                  )}
+                  {!selectedVideo && videos.length === 0 && (
+                    <p>No videos found in the Timelapse directory</p>
+                  )}
+                  {selectedVideo && videoFiles.length > 0 && (
+                    <p className="text-sm mt-2">
+                      Trying to load: {videoFiles[currentImageIndex]}
+                    </p>
+                  )}
+                </>
+              )}
+            </div>
           </div>
         )}
       </div>
@@ -225,32 +519,35 @@ export function App(): ReactNode {
       {/* Bottom controls */}
       <div className="bg-gray-100 p-4">
         <div className="flex items-center gap-4">
-          {/* Scrubber */}
-          <div className="flex-1">
+          {/* Scrubber (works for both images and videos) */}
+          <div className="flex-1 bg-gray-200 p-1 pt-0 rounded-full">
             <input
               type="range"
               min={0}
-              max={Math.max(0, files.length - 1)}
+              max={Math.max(0, (viewMode === "images" ? files.length : videoFiles.length) - 1)}
               value={currentImageIndex}
               onChange={handleScrubberChange}
-              disabled={files.length === 0}
-              className="w-full h-2 bg-gray-600 rounded-lg appearance-none cursor-pointer 
-                         slider:bg-blue-500 slider:rounded-lg slider:cursor-pointer
+              disabled={viewMode === "images" ? files.length === 0 : videoFiles.length === 0}
+              className="w-full h-2 bg-gray-300 rounded-lg appearance-none cursor-pointer
                          disabled:opacity-50 disabled:cursor-not-allowed"
             />
           </div>
 
-          {/* Current time display */}
-          <div className="text-sm text-gray-300 min-w-[60px] text-center backdrop-blur-xl">
-            {files.length > 0 ? formatTime(currentImageIndex) : "--:--"}
-          </div>
+          {/* Current time/frame display */}
+          {viewMode === "images" && (
+            <div className="text-sm text-gray-600 min-w-[60px] text-center">
+              {files.length > 0 ? formatTime(currentImageIndex) : "--:--"}
+            </div>
+          )}
 
           {/* Refresh button */}
           <button
-            onClick={refreshFiles}
-            disabled={!selectedFolder}
+            onClick={refreshContent}
+            disabled={viewMode === "images" ? !selectedFolder : !selectedVideo}
             className="bg-gradient-to-b from-fuchsia-50 to-amber-50 hover:bg-blue-700 disabled:bg-gray-600 px-3 py-1 rounded-xl text-sm font-medium text-amber-800 transition-colors border-2 border-yellow-500 shadow-md shadow-amber-400/20"
-            title="Refresh screenshots"
+            title={
+              viewMode === "images" ? "Refresh screenshots" : "Refresh videos"
+            }
           >
             ↻ Refresh
           </button>

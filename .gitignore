@@ -10,6 +10,7 @@ lerna-debug.log*
 node_modules
 dist
 dist-ssr
+coverage
 *.local
 
 # Editor directories and files
@@ -22,3 +23,8 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Claude Code: local state stays out; the shared settings and hooks are tracked
+.claude/*
+!.claude/settings.json
+!.claude/hooks/

@@ -1,6 +1,8 @@
 import { BaseDirectory } from "@tauri-apps/api/path";
 import { readDir } from "@tauri-apps/plugin-fs";
-import { useCallback, useEffect, useState } from "react";
+import React from "react";
+
+import { timelapseRoot } from "../timelapseRoot";
 
 function ensureError(val: unknown): Error {
   if (val instanceof Error) {
@@ -12,18 +14,20 @@ function ensureError(val: unknown): Error {
 export function useFolders(): {
   folders: Array<string>;
   foldersError: Error | null;
+  refreshFolders: () => void;
 } {
-  const [folders, setFolders] = useState<Array<string>>([]);
-  const [foldersError, setFoldersError] = useState<Error | null>(null);
+  const [folders, setFolders] = React.useState<Array<string>>([]);
+  const [foldersError, setFoldersError] = React.useState<Error | null>(null);
 
-  const loadFolders = useCallback(async (): Promise<void> => {
+  const loadFolders = React.useCallback(async (): Promise<void> => {
     try {
       setFoldersError(null);
-      const entries = await readDir("Timelapse", {
+      const entries = await readDir(timelapseRoot(), {
         baseDir: BaseDirectory.Home,
       });
       const folderList = entries
         .filter((entry) => entry.isDirectory)
+        .filter((entry) => !entry.name.startsWith(".")) // Exclude hidden folders like .cache
         .map((entry) => entry.name);
       setFolders(folderList);
     } catch (error) {
@@ -31,44 +35,116 @@ export function useFolders(): {
     }
   }, []);
 
-  useEffect(() => {
+  React.useEffect(() => {
     loadFolders();
   }, [loadFolders]);
 
-  return { folders, foldersError };
+  return { folders, foldersError, refreshFolders: loadFolders };
 }
 
 export function useFiles(folder: string | null): {
   files: Array<string>;
   filesError: Error | null;
 } {
-  const [files, setFiles] = useState<Array<string>>([]);
-  const [filesError, setFilesError] = useState<Error | null>(null);
+  const [files, setFiles] = React.useState<Array<string>>([]);
+  const [filesError, setFilesError] = React.useState<Error | null>(null);
 
-  const loadFiles = useCallback(async (): Promise<void> => {
+  const loadFiles = React.useCallback(async (): Promise<void> => {
     try {
       setFilesError(null);
       if (!folder) {
         setFiles([]);
         return;
       }
-      const entries = await readDir(`Timelapse/${folder}`, {
-        baseDir: BaseDirectory.Home,
-      });
-      const fileList = Iterator.from(entries)
-        .filter((entry) => entry.isFile)
-        .map((entry) => entry.name)
-        .toArray()
-        .sort();
-      setFiles(fileList);
+
+      // ffmpeg writes a cache folder while we are already trying to list it, so
+      // for those an empty or missing directory is expected and worth retrying.
+      // A date folder gets exactly one attempt: there is nothing to wait for, and
+      // retrying would only delay a genuine error by the length of the loop.
+      const isCacheFolder = folder.startsWith(".cache/");
+      const maxRetries = isCacheFolder ? 5 : 1;
+      const retryDelay = 500; // ms
+      let lastError: Error | null = null;
+
+      for (let attempt = 0; attempt < maxRetries; attempt++) {
+        try {
+          const entries = await readDir(`${timelapseRoot()}/${folder}`, {
+            baseDir: BaseDirectory.Home,
+          });
+          const fileList = (entries)
+            // Hidden files are in-progress writes, such as the capture loop's
+            // `.00042.png.tmp` before it is renamed into place.
+            .filter((entry) => entry.isFile && !entry.name.startsWith("."))
+            .map((entry) => entry.name)
+            .sort();
+
+          // If we got files, or if this is not a cache folder, accept the result
+          if (fileList.length > 0 || !isCacheFolder) {
+            setFiles(fileList);
+            return;
+          }
+
+          // For cache folders, if no files found, retry after delay
+          if (attempt < maxRetries - 1) {
+            console.log(`No files found in ${folder}, retrying in ${retryDelay}ms (attempt ${attempt + 1}/${maxRetries})...`);
+            await new Promise(resolve => setTimeout(resolve, retryDelay));
+          }
+        } catch (error) {
+          lastError = ensureError(error);
+          // If directory doesn't exist yet, wait and retry
+          if (attempt < maxRetries - 1) {
+            console.log(`Error reading ${folder}, retrying in ${retryDelay}ms (attempt ${attempt + 1}/${maxRetries})...`, error);
+            await new Promise(resolve => setTimeout(resolve, retryDelay));
+          }
+        }
+      }
+
+      // If we got here, all retries failed
+      if (lastError) {
+        throw lastError;
+      } else {
+        // No error, but no files found after all retries
+        setFiles([]);
+      }
     } catch (error) {
       setFilesError(ensureError(error));
     }
   }, [folder]);
 
-  useEffect(() => {
+  React.useEffect(() => {
     loadFiles();
   }, [loadFiles]);
 
   return { files, filesError };
+}
+
+export function useVideos(): {
+  videos: Array<string>;
+  videosError: Error | null;
+  refreshVideos: () => void;
+} {
+  const [videos, setVideos] = React.useState<Array<string>>([]);
+  const [videosError, setVideosError] = React.useState<Error | null>(null);
+
+  const loadVideos = React.useCallback(async (): Promise<void> => {
+    try {
+      setVideosError(null);
+      const entries = await readDir(timelapseRoot(), {
+        baseDir: BaseDirectory.Home,
+      });
+      const videoList = entries
+        .filter((entry) => entry.isFile && entry.name.endsWith(".mov"))
+        .map((entry) => entry.name)
+        .sort(); // Chronological order (oldest first)
+      setVideos(videoList);
+    } catch (error) {
+      setVideosError(ensureError(error));
+    }
+  }, []);
+
+  React.useEffect(() => {
+    loadVideos();
+  }, [loadVideos]);
+
+  return { videos, videosError, refreshVideos: loadVideos };
 }

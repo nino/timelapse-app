@@ -1,12 +1,12 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "timelapse-app",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "identifier": "com.timelapse-app.app",
   "build": {
-    "beforeDevCommand": "deno task dev",
+    "beforeDevCommand": "bun run fetch:ffmpeg && bun run dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "deno task build",
+    "beforeBuildCommand": "bun run fetch:ffmpeg && bun run build",
     "frontendDist": "../dist"
   },
   "app": {
