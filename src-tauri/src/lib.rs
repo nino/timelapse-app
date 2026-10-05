@@ -1,3 +1,4 @@
+mod converter;
 mod timelapse;
 mod database;
 mod paths;
@@ -175,7 +176,7 @@ fn extract_video_frames_impl(root: &Path, video_filename: &str) -> Result<String
     // Run ffmpeg to extract frames as JPEG images
     // frame%06d.jpg creates frame000001.jpg, frame000002.jpg, etc.
     let output_pattern = staging_path.join("frame%06d.jpg");
-    let spawned = Command::new("ffmpeg")
+    let spawned = Command::new(paths::ffmpeg())
         .arg("-i")
         .arg(&source_path)
         .arg("-vf")
@@ -190,7 +191,7 @@ fn extract_video_frames_impl(root: &Path, video_filename: &str) -> Result<String
         Ok(output) => output,
         Err(e) => {
             let _ = std::fs::remove_dir_all(&staging_path);
-            return Err(format!("Failed to execute ffmpeg: {}. Make sure ffmpeg is installed and in PATH.", e));
+            return Err(format!("Failed to execute ffmpeg: {}. The app bundles ffmpeg; outside a bundle it must be on PATH.", e));
         }
     };
 
@@ -354,6 +355,14 @@ pub fn run() {
                     Err(e) => {
                         eprintln!("Failed to start timelapse automatically: {}", e);
                     }
+                }
+
+                // Turn finished hours of screenshots into videos while on AC
+                // power. It runs for the life of the app, independently of the
+                // photographer, so it has no state or commands of its own yet.
+                match paths::timelapse_root() {
+                    Some(root) => converter::Converter::new_in(root).start(),
+                    None => eprintln!("Unable to find home directory; video conversion is off"),
                 }
             });
 
