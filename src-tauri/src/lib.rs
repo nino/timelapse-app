@@ -140,7 +140,7 @@ async fn clear_error_logs(state: State<'_, PhotographerState>) -> Result<String,
     clear_error_logs_impl(state.inner())
 }
 
-/// Run a blocking frame-source call (it may shell out to ffprobe) off the
+/// Run a blocking frame-source call (it may shell out to ffmpeg) off the
 /// async runtime's worker threads.
 async fn with_frame_source<T: Send + 'static>(
     source: &FrameSourceState,

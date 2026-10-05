@@ -1,4 +1,5 @@
-//! The only place that runs ffprobe/ffmpeg.
+//! The only place that runs ffmpeg. Only `ffmpeg` itself is used, not
+//! `ffprobe`, because ffmpeg is the one tool the app bundles.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -6,27 +7,27 @@ use std::process::Command;
 
 use crate::Error;
 
-/// Where to find the ffmpeg tools. macOS GUI apps don't inherit the shell's
-/// PATH, so a bare `ffmpeg` often isn't found from the bundled app even when it
-/// works in a terminal; `Tools::locate` also checks the usual Homebrew paths.
+/// Where to find ffmpeg.
 #[derive(Debug, Clone)]
 pub struct Tools {
     pub ffmpeg: PathBuf,
-    pub ffprobe: PathBuf,
 }
 
 impl Tools {
+    /// The copy bundled with the app (Tauri installs `externalBin` sidecars
+    /// next to the executable, without the target-triple suffix), else the
+    /// usual Homebrew paths, since macOS GUI apps don't inherit the shell's
+    /// PATH, else whatever `ffmpeg` is on PATH.
     pub fn locate() -> Self {
-        Self {
-            ffmpeg: locate("ffmpeg"),
-            ffprobe: locate("ffprobe"),
-        }
+        let exe_dir = std::env::current_exe().ok().and_then(|exe| exe.parent().map(Path::to_path_buf));
+        Self { ffmpeg: locate(exe_dir.as_deref(), "ffmpeg") }
     }
 }
 
-fn locate(name: &str) -> PathBuf {
-    for dir in ["/opt/homebrew/bin", "/usr/local/bin"] {
-        let candidate = Path::new(dir).join(name);
+fn locate(exe_dir: Option<&Path>, name: &str) -> PathBuf {
+    let dirs = exe_dir.into_iter().chain([Path::new("/opt/homebrew/bin"), Path::new("/usr/local/bin")]);
+    for dir in dirs {
+        let candidate = dir.join(name);
         if candidate.is_file() {
             return candidate;
         }
@@ -40,59 +41,57 @@ pub struct VideoInfo {
     pub fps: f64,
 }
 
-/// Frame count and rate of the first video stream. `Ok(None)` means ffprobe
+/// Frame count and rate of the first video stream. `Ok(None)` means ffmpeg
 /// could not make sense of the file (the legacy library has a few truncated
 /// stubs), which callers treat as "this video contributes no frames".
+///
+/// The count comes from stream-copying the video into ffmpeg's `framecrc`
+/// muxer, which writes one line per packet without decoding anything: exact
+/// for any container, and cached by the caller per file. (`-f null` with
+/// `-progress` reports no frame count for a stream copy.)
 pub fn probe(tools: &Tools, path: &Path) -> Result<Option<VideoInfo>, Error> {
-    let output = Command::new(&tools.ffprobe)
-        .args(["-v", "error", "-select_streams", "v:0"])
-        .args(["-show_entries", "stream=nb_frames,avg_frame_rate", "-of", "default=nw=1"])
+    let output = Command::new(&tools.ffmpeg)
+        .args(["-hide_banner", "-nostdin", "-nostats", "-i"])
         .arg(path)
+        .args(["-map", "0:v:0", "-c", "copy", "-f", "framecrc", "-"])
         .output()
-        .map_err(|e| Error::Tool(format!("could not run ffprobe: {e}")))?;
+        .map_err(|e| Error::Tool(format!("could not run ffmpeg: {e}")))?;
     if !output.status.success() {
         return Ok(None);
     }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let mut frame_count = None;
-    let mut fps = None;
-    for line in text.lines() {
-        if let Some(value) = line.strip_prefix("nb_frames=") {
-            frame_count = value.trim().parse::<usize>().ok();
-        } else if let Some(value) = line.strip_prefix("avg_frame_rate=") {
-            fps = parse_rate(value.trim());
-        }
+    let frame_count = output
+        .stdout
+        .split(|&b| b == b'\n')
+        .filter(|line| !line.is_empty() && !line.starts_with(b"#"))
+        .count();
+    let fps = parse_fps(&String::from_utf8_lossy(&output.stderr));
+    match (frame_count, fps) {
+        (frame_count, Some(fps)) if frame_count > 0 => Ok(Some(VideoInfo { frame_count, fps })),
+        _ => Ok(None),
     }
-    let Some(fps) = fps else { return Ok(None) };
-    let frame_count = match frame_count {
-        Some(n) => n,
-        // Some containers don't record a frame count; counting packets reads
-        // the whole file, so it is only the fallback.
-        None => match count_packets(tools, path)? {
-            Some(n) => n,
-            None => return Ok(None),
-        },
-    };
-    Ok((frame_count > 0).then_some(VideoInfo { frame_count, fps }))
 }
 
-fn count_packets(tools: &Tools, path: &Path) -> Result<Option<usize>, Error> {
-    let output = Command::new(&tools.ffprobe)
-        .args(["-v", "error", "-select_streams", "v:0", "-count_packets"])
-        .args(["-show_entries", "stream=nb_read_packets", "-of", "csv=p=0"])
-        .arg(path)
-        .output()
-        .map_err(|e| Error::Tool(format!("could not run ffprobe: {e}")))?;
-    if !output.status.success() {
-        return Ok(None);
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().parse().ok())
+/// The frame rate from the input's stream line in ffmpeg's log, e.g.
+/// `Stream #0:0[0x1](und): Video: hevc (Main) (hvc1 / 0x31637668), yuv420p, 1800x1124, 2386 kb/s, 15 fps, 15 tbr, 15360 tbn`.
+/// `fps` is the average rate; `tbr` is the fallback ffmpeg itself uses.
+fn parse_fps(log: &str) -> Option<f64> {
+    let line = log.lines().find(|line| line.contains("Stream #0:") && line.contains("Video:"))?;
+    let rate = |unit: &str| {
+        line.split(", ")
+            .find_map(|part| part.trim().strip_suffix(unit))
+            .and_then(|value| parse_rate(value.trim()))
+    };
+    rate(" fps").or_else(|| rate(" tbr"))
 }
 
 fn parse_rate(value: &str) -> Option<f64> {
-    let (num, den) = value.split_once('/').unwrap_or((value, "1"));
-    let (num, den): (f64, f64) = (num.parse().ok()?, den.parse().ok()?);
-    (num > 0.0 && den > 0.0).then(|| num / den)
+    // ffmpeg writes "15", "29.97", or "15k" for 15000.
+    let (value, scale) = match value.strip_suffix('k') {
+        Some(v) => (v, 1000.0),
+        None => (value, 1.0),
+    };
+    let rate: f64 = value.parse().ok()?;
+    (rate > 0.0).then_some(rate * scale)
 }
 
 /// Decode `count` frames starting at frame `first` into `out_dir` as
@@ -138,10 +137,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_frame_rates() {
-        assert_eq!(parse_rate("15/1"), Some(15.0));
-        assert_eq!(parse_rate("30000/1001").map(|r| (r * 100.0).round()), Some(2997.0));
-        assert_eq!(parse_rate("0/0"), None);
-        assert_eq!(parse_rate("25"), Some(25.0));
+    fn parses_frame_rates_from_the_log() {
+        let hevc = "  Stream #0:0[0x1](und): Video: hevc (Main) (hvc1 / 0x31637668), yuv420p(tv), 1800x1124, 2386 kb/s, 15 fps, 15 tbr, 15360 tbn (default)";
+        assert_eq!(parse_fps(&format!("Input #0\n{hevc}\n")), Some(15.0));
+        let ntsc = "  Stream #0:0: Video: h264, yuv420p, 640x480, 29.97 fps, 29.97 tbr, 30k tbn";
+        assert_eq!(parse_fps(ntsc), Some(29.97));
+        let no_fps = "  Stream #0:0: Video: mjpeg, yuvj420p, 640x480, 25 tbr, 25 tbn";
+        assert_eq!(parse_fps(no_fps), Some(25.0));
+        assert_eq!(parse_fps("  Stream #0:1: Audio: aac, 44100 Hz"), None);
+        assert_eq!(parse_rate("30k"), Some(30000.0));
+        assert_eq!(parse_rate("0"), None);
+    }
+
+    #[test]
+    fn prefers_a_bundled_ffmpeg_next_to_the_executable() {
+        let dir = tempfile::TempDir::new().unwrap();
+        assert_ne!(locate(Some(dir.path()), "ffmpeg"), dir.path().join("ffmpeg"));
+        fs::write(dir.path().join("ffmpeg"), b"").unwrap();
+        assert_eq!(locate(Some(dir.path()), "ffmpeg"), dir.path().join("ffmpeg"));
     }
 }

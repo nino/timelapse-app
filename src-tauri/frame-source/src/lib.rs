@@ -90,7 +90,7 @@ struct Probe {
     len: u64,
     modified: SystemTime,
     fingerprint: (u64, u64),
-    /// None for files ffprobe can't read.
+    /// None for files ffmpeg can't read.
     info: Option<VideoInfo>,
 }
 
