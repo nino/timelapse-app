@@ -341,6 +341,14 @@ pub fn run() {
                 None => eprintln!("Unable to find home directory"),
             }
 
+            // Scratch space for OCR's decoded video frames, per profile like
+            // the frame cache.
+            let ocr_dir = app
+                .path()
+                .app_cache_dir()
+                .ok()
+                .map(|dir| dir.join(paths::TIMELAPSE_DIR_NAME).join("ocr"));
+
             // Start timelapse automatically when app is ready
             let photographer_state = app.state::<PhotographerState>();
             let state_clone = Arc::clone(&photographer_state.inner());
@@ -379,7 +387,7 @@ pub fn run() {
                         )
                         .start();
 
-                        if ocr::start_background_ocr(root) {
+                        if ocr::start_background_ocr(root, ocr_dir) {
                             println!("OCR started");
                         } else {
                             println!("OCR is not available on this platform");

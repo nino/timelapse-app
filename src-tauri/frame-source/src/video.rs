@@ -2,8 +2,9 @@
 //! `ffprobe`, because ffmpeg is the one tool the app bundles.
 
 use std::fs;
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use crate::Error;
 
@@ -96,14 +97,7 @@ pub fn extract_frames(
     out_dir: &Path,
 ) -> Result<usize, Error> {
     fs::create_dir_all(out_dir)?;
-    // Seek a quarter frame early. ffmpeg keeps frames whose timestamp is at or
-    // after the seek point, so landing a hair past frame `first` (float
-    // rounding of first / fps) would silently start one frame late.
-    let seek = if first == 0 {
-        0.0
-    } else {
-        (first as f64 - 0.25) / info.fps
-    };
+    let seek = seek_to(first, info);
     let output = Command::new(&tools.ffmpeg)
         .args(["-v", "error", "-nostdin", "-ss", &format!("{seek:.6}")])
         .arg("-i")
@@ -126,6 +120,133 @@ pub fn extract_frames(
     Ok(written)
 }
 
+/// One decoded frame: `width` × `height` pixels of 8-bit RGB, row by row.
+pub struct RawFrame<'a> {
+    pub width: u32,
+    pub height: u32,
+    pub rgb: &'a [u8],
+}
+
+/// Decode every frame of `video` from frame `first` on, handing each to
+/// `on_frame` with its index in the video, without writing anything to disk.
+/// Stops early, killing ffmpeg, when `on_frame` returns false.
+///
+/// This is for bulk work that reads a whole video once, such as OCR, so on
+/// macOS ffmpeg runs under `taskpolicy -b` like the converter's encodes.
+pub fn stream_frames(
+    tools: &Tools,
+    video: &Path,
+    info: VideoInfo,
+    first: usize,
+    on_frame: &mut dyn FnMut(usize, RawFrame) -> bool,
+) -> Result<(), Error> {
+    let mut command = if cfg!(target_os = "macos") {
+        let mut command = Command::new("taskpolicy");
+        command.arg("-b").arg(&tools.ffmpeg);
+        command
+    } else {
+        Command::new(&tools.ffmpeg)
+    };
+    // PPM rather than raw video: each frame carries its own size, so nothing
+    // has to be probed first.
+    let mut child = command
+        .args(["-v", "error", "-nostdin", "-ss", &format!("{:.6}", seek_to(first, info))])
+        .arg("-i")
+        .arg(video)
+        .args(["-f", "image2pipe", "-c:v", "ppm", "-pix_fmt", "rgb24", "-"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| Error::Tool(format!("could not run ffmpeg: {e}")))?;
+
+    // Drained on its own thread so a stream of decode errors can't fill the
+    // pipe and stall ffmpeg while this thread waits on its frames.
+    let mut stderr = child.stderr.take().expect("stderr is piped");
+    let errors = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = stderr.read_to_string(&mut text);
+        text
+    });
+
+    let mut stdout = BufReader::new(child.stdout.take().expect("stdout is piped"));
+    let mut buffer = Vec::new();
+    let mut index = first;
+    let finished = loop {
+        let Some((width, height)) = read_ppm_header(&mut stdout)? else {
+            break true;
+        };
+        buffer.resize(width as usize * height as usize * 3, 0);
+        stdout.read_exact(&mut buffer)?;
+        let frame = RawFrame {
+            width,
+            height,
+            rgb: &buffer,
+        };
+        if !on_frame(index, frame) {
+            break false;
+        }
+        index += 1;
+    };
+
+    if !finished {
+        let _ = child.kill();
+    }
+    let status = child.wait()?;
+    let errors = errors.join().unwrap_or_default();
+    if finished && !status.success() {
+        return Err(Error::Tool(format!(
+            "ffmpeg failed on {}: {}",
+            video.display(),
+            errors.trim()
+        )));
+    }
+    Ok(())
+}
+
+/// The size from a binary PPM header (`P6 <width> <height> 255` and one
+/// whitespace byte), or `None` at the end of the stream.
+fn read_ppm_header(input: &mut impl BufRead) -> Result<Option<(u32, u32)>, Error> {
+    let mut fields = Vec::new();
+    while fields.len() < 4 {
+        let mut field = Vec::new();
+        loop {
+            let mut byte = [0u8];
+            if input.read(&mut byte)? == 0 {
+                if fields.is_empty() && field.is_empty() {
+                    return Ok(None);
+                }
+                return Err(Error::Tool("ffmpeg's output ended inside a frame header".into()));
+            }
+            if byte[0].is_ascii_whitespace() {
+                if field.is_empty() {
+                    continue;
+                }
+                break;
+            }
+            field.push(byte[0]);
+        }
+        fields.push(String::from_utf8_lossy(&field).into_owned());
+    }
+    let number = |field: &str| field.parse::<u32>().ok();
+    match (fields[0].as_str(), number(&fields[1]), number(&fields[2]), fields[3].as_str()) {
+        ("P6", Some(width), Some(height), "255") => Ok(Some((width, height))),
+        _ => Err(Error::Tool(format!("unexpected frame header from ffmpeg: {fields:?}"))),
+    }
+}
+
+/// Where to seek to start at frame `first`: a quarter frame early. ffmpeg
+/// keeps frames whose timestamp is at or after the seek point, so landing a
+/// hair past frame `first` (float rounding of first / fps) would silently
+/// start one frame late.
+fn seek_to(first: usize, info: VideoInfo) -> f64 {
+    if first == 0 {
+        0.0
+    } else {
+        (first as f64 - 0.25) / info.fps
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,5 +262,15 @@ mod tests {
         assert_eq!(parse_fps("  Stream #0:1: Audio: aac, 44100 Hz"), None);
         assert_eq!(parse_rate("30k"), Some(30000.0));
         assert_eq!(parse_rate("0"), None);
+    }
+
+    #[test]
+    fn reads_ppm_headers() {
+        let mut stream: &[u8] = b"P6\n3 2\n255\nxyz";
+        assert_eq!(read_ppm_header(&mut stream).unwrap(), Some((3, 2)));
+        assert_eq!(stream, b"xyz");
+        assert_eq!(read_ppm_header(&mut &b""[..]).unwrap(), None);
+        assert!(read_ppm_header(&mut &b"P6\n3"[..]).is_err());
+        assert!(read_ppm_header(&mut &b"P5 3 2 255\n"[..]).is_err());
     }
 }

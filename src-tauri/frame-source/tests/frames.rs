@@ -341,3 +341,45 @@ fn stays_under_its_cache_cap() {
         .count();
     assert_eq!(chunk_dirs, 1);
 }
+
+#[test]
+fn streams_every_frame_of_a_video_only_day() {
+    let lib = Library::new();
+    make_video(&lib.root.path().join("2024-12-20--09-00-00.mov"), 20, 0);
+    make_video(&lib.root.path().join("2024-12-20--17-05-22.mov"), 10, 100);
+    let source = lib.source(u64::MAX);
+
+    let videos = source.video_only_day("2024-12-20").unwrap().unwrap();
+    let spans: Vec<_> = videos.iter().map(|v| (v.first_index, v.frame_count)).collect();
+    assert_eq!(spans, vec![(0, 20), (20, 10)]);
+
+    // From frame 5 of the first video to the end, at the right levels.
+    let mut seen = Vec::new();
+    source
+        .stream_video(&videos[0], 5, &mut |index, frame| {
+            assert_eq!((frame.width, frame.height), (32, 32));
+            assert_eq!(frame.rgb.len(), 32 * 32 * 3);
+            let level = usize::from(frame.rgb[0]);
+            assert!(level.abs_diff(index * LEVEL_STEP) <= 2, "frame {index}: gray {level}");
+            seen.push(index);
+            true
+        })
+        .unwrap();
+    assert_eq!(seen, (5..20).collect::<Vec<_>>());
+
+    // Stopping early.
+    let mut count = 0;
+    source
+        .stream_video(&videos[1], 0, &mut |_, _| {
+            count += 1;
+            count < 3
+        })
+        .unwrap();
+    assert_eq!(count, 3);
+
+    // Once the day has a screenshot, it is not video-only.
+    let day_dir = lib.root.path().join("2024-12-20");
+    fs::create_dir_all(&day_dir).unwrap();
+    write_shot(&day_dir, "00001.png", b"png", "2024-12-20 09:00:00");
+    assert!(source.video_only_day("2024-12-20").unwrap().is_none());
+}
