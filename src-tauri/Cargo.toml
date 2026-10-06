@@ -30,7 +30,7 @@ tokio = { version = "1", features = ["full"] }
 fast_image_resize = { version = "6", features = ["image"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 screenshots = "0.5"
-active-win-pos-rs = "0.8"
+active-win-pos-rs = "0.11"
 rusqlite = { version = "0.32", features = ["bundled"] }
 frame_source = { path = "frame-source" }
 
