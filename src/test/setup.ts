@@ -14,6 +14,7 @@ expect.extend(matchers);
 mock.module('@tauri-apps/plugin-fs', () => ({
   readDir: mock(),
   readFile: mock(),
+  watch: mock(),
 }));
 
 mock.module('@tauri-apps/api/core', () => ({

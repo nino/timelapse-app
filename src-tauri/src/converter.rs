@@ -140,7 +140,7 @@ fn parse_pmset_power_source(output: &str) -> Option<bool> {
 }
 
 /// Is `name` a day folder name (`YYYY-MM-DD`)?
-fn is_day_folder_name(name: &str) -> bool {
+pub(crate) fn is_day_folder_name(name: &str) -> bool {
     name.len() == 10 && NaiveDate::parse_from_str(name, "%Y-%m-%d").is_ok()
 }
 
@@ -471,13 +471,6 @@ pub struct Converter {
 }
 
 impl Converter {
-    /// A converter that keeps every PNG. Screenshots must be OCR'd before
-    /// they are deleted, and until OCR records which hours it has read there
-    /// is nothing to check against, so nothing is deleted.
-    pub fn new_in(root: PathBuf) -> Self {
-        Self::with_delete_check(root, Arc::new(|_| false))
-    }
-
     pub fn with_delete_check(root: PathBuf, may_delete: DeleteCheck) -> Self {
         Converter {
             root,

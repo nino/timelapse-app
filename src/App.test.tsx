@@ -1,822 +1,277 @@
 import { afterAll, beforeEach, describe, expect, it, mock, spyOn } from 'bun:test';
-import { invoke } from '@tauri-apps/api/core';
-import { readFile } from '@tauri-apps/plugin-fs';
-import { render, screen, waitFor, fireEvent } from '@testing-library/react';
-import { App } from './App';
-import * as folderHooks from './hooks/useFolders';
-import { mocked } from './test/mocked';
-import { TEST_ROOT } from './test/setup';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 
-// readFile and invoke are replaced with mocks in src/test/setup.ts.
-//
-// The hooks are spied on rather than replaced with `mock.module`: Bun runs all
-// test files in one process and a module mock would also replace the real
-// hooks that src/hooks/useFolders.test.ts is testing. Restored in afterAll.
-const useFolders = spyOn(folderHooks, 'useFolders');
-const useFiles = spyOn(folderHooks, 'useFiles');
-const useVideos = spyOn(folderHooks, 'useVideos');
+import { App } from './App';
+import * as frames from './frames';
+import { frameUrl, type Day } from './frames';
+import * as library from './hooks/useLibrary';
+
+// Spied on rather than replaced with `mock.module`: Bun runs every test file in
+// one process, and a module mock would also replace the real hooks and
+// helpers that useLibrary.test.ts and frames.test.ts are testing.
+const useDays = spyOn(library, 'useDays');
+const useDay = spyOn(library, 'useDay');
+const getFrameTime = spyOn(frames, 'getFrameTime');
 
 afterAll(() => {
-  useFolders.mockRestore();
-  useFiles.mockRestore();
-  useVideos.mockRestore();
+  useDays.mockRestore();
+  useDay.mockRestore();
+  getFrameTime.mockRestore();
 });
 
-// App calls useFiles twice per render — once for the selected day folder and
-// once for the extracted-frame cache folder — so video tests need the mock to
-// answer per path rather than returning one list for both.
-function mockFilesByFolder(byFolder: Record<string, Array<string>>): void {
-  useFiles.mockImplementation((folder: string | null) => ({
-    files: folder === null ? [] : (byFolder[folder] ?? []),
-    filesError: null,
+/** Pretend the library holds `counts[date]` frames for each day. */
+function mockLibrary(counts: Record<string, number>, source: Day['source'] = 'screenshots'): void {
+  useDays.mockReturnValue({ days: Object.keys(counts).sort(), daysError: null });
+  useDay.mockImplementation((date: string | null) => ({
+    day: date === null ? null : { date, frameCount: counts[date] ?? 0, source },
+    dayError: null,
   }));
+}
+
+function image(): HTMLImageElement {
+  return screen.getByRole('img') as HTMLImageElement;
+}
+
+/** The frame currently requested by the `<img>`, as [day, index]. */
+function shownFrame(): string {
+  return image().getAttribute('src') ?? '';
+}
+
+/** Let the in-flight frame finish loading, as the browser would. */
+function finishLoading(): void {
+  fireEvent.load(image());
+}
+
+/**
+ * Let the frame-time lookup for the frame on screen resolve inside `act`.
+ * Every frame change starts one, and a test that ends before it resolves
+ * gets React's "not wrapped in act(...)" warning when it lands afterwards.
+ */
+async function settleFrameTime(): Promise<void> {
+  await act(async () => {});
+}
+
+function today(): string {
+  const now = new Date();
+  const pad = (n: number): string => String(n).padStart(2, '0');
+  return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
 }
 
 describe('App', () => {
   beforeEach(() => {
     mock.clearAllMocks();
-    mocked(URL.createObjectURL).mockReturnValue('blob:mock-url');
-    mocked(URL.revokeObjectURL).mockImplementation(() => {});
+    getFrameTime.mockResolvedValue(null);
   });
 
-  function clickVideosTab(): void {
-    const videosButton = screen
-      .getAllByText(/Videos/i)
-      .find(el => el.tagName === 'BUTTON');
-    if (videosButton) {
-      fireEvent.click(videosButton);
-    }
-  }
-
-  describe('Error Handling', () => {
-    it('should display folders error', () => {
-      const mockError = new Error('Failed to load folders');
-      useFolders.mockReturnValue({
-        folders: [],
-        foldersError: mockError,
-        refreshFolders: mock(),
-      });
-      useVideos.mockReturnValue({
-        videos: [],
-        videosError: null,
-        refreshVideos: mock(),
-      });
-      useFiles.mockReturnValue({
-        files: [],
-        filesError: null,
-      });
-
+  describe('Library states', () => {
+    it('shows a library error', () => {
+      useDays.mockReturnValue({ days: [], daysError: new Error('no access') });
+      useDay.mockReturnValue({ day: null, dayError: null });
       render(<App />);
-
-      expect(screen.getByText(/Error loading folders/i)).toBeInTheDocument();
-      expect(screen.getByText(/Failed to load folders/i)).toBeInTheDocument();
+      expect(screen.getByText(/Could not load the timelapse library: no access/)).toBeInTheDocument();
     });
 
-    it('should display files error', () => {
-      const mockError = new Error('Failed to load files');
-      useFolders.mockReturnValue({
-        folders: ['2025-01-15'],
-        foldersError: null,
-        refreshFolders: mock(),
-      });
-      useVideos.mockReturnValue({
-        videos: [],
-        videosError: null,
-        refreshVideos: mock(),
-      });
-      useFiles.mockReturnValue({
-        files: [],
-        filesError: mockError,
-      });
-
+    it('shows a day error', () => {
+      useDays.mockReturnValue({ days: ['2026-10-04'], daysError: null });
+      useDay.mockReturnValue({ day: null, dayError: new Error('ffprobe missing') });
       render(<App />);
-
-      expect(screen.getByText(/Error loading files/i)).toBeInTheDocument();
-      expect(screen.getByText(/Failed to load files/i)).toBeInTheDocument();
+      expect(screen.getByText(/ffprobe missing/)).toBeInTheDocument();
     });
 
-    it('should display videos error', () => {
-      const mockError = new Error('Failed to load videos');
-      useFolders.mockReturnValue({
-        folders: [],
-        foldersError: null,
-        refreshFolders: mock(),
-      });
-      useVideos.mockReturnValue({
-        videos: [],
-        videosError: mockError,
-        refreshVideos: mock(),
-      });
-      useFiles.mockReturnValue({
-        files: [],
-        filesError: null,
-      });
-
+    it('says when there is nothing yet', () => {
+      mockLibrary({});
       render(<App />);
-
-      expect(screen.getByText(/Error loading videos/i)).toBeInTheDocument();
-      expect(screen.getByText(/Failed to load videos/i)).toBeInTheDocument();
-    });
-  });
-
-  describe('View Modes', () => {
-    it('should render in images mode by default', () => {
-      useFolders.mockReturnValue({
-        folders: ['2025-01-15'],
-        foldersError: null,
-        refreshFolders: mock(),
-      });
-      useVideos.mockReturnValue({
-        videos: [],
-        videosError: null,
-        refreshVideos: mock(),
-      });
-      useFiles.mockReturnValue({
-        files: [],
-        filesError: null,
-      });
-
-      render(<App />);
-
-      expect(screen.getByText(/Images/i)).toBeInTheDocument();
-      expect(screen.getByText(/Videos/i)).toBeInTheDocument();
+      expect(screen.getByText('No screenshots yet')).toBeInTheDocument();
+      expect(screen.getByRole('slider')).toBeDisabled();
     });
 
-    it('should switch to videos mode when clicking Videos button', async () => {
-      useFolders.mockReturnValue({
-        folders: [],
-        foldersError: null,
-        refreshFolders: mock(),
-      });
-      useVideos.mockReturnValue({
-        videos: ['video1.mov'],
-        videosError: null,
-        refreshVideos: mock(),
-      });
-      useFiles.mockReturnValue({
-        files: [],
-        filesError: null,
-      });
-      mocked(readFile).mockResolvedValue(new Uint8Array([1, 2, 3]));
-
+    it('says when a day has no frames', async () => {
+      mockLibrary({ '2024-12-24': 0 }, 'empty');
       render(<App />);
-
-      const videosButtons = screen.getAllByText(/Videos/i);
-      const videosButton = videosButtons.find(el => el.tagName === 'BUTTON');
-
-      if (videosButton) {
-        fireEvent.click(videosButton);
-      }
-
-      // In videos mode, the component should show video-related UI
       await waitFor(() => {
-        expect(videosButtons.length).toBeGreaterThan(0);
+        expect(screen.getByText('Nothing was captured on this day')).toBeInTheDocument();
       });
     });
   });
 
-  describe('Folder Selection', () => {
-    it('should auto-select today\'s folder if it exists', async () => {
-      const today = new Date().toISOString().split('T')[0];
-      const folders = [today, '2025-01-14', '2025-01-13'];
-
-      useFolders.mockReturnValue({
-        folders,
-        foldersError: null,
-        refreshFolders: mock(),
-      });
-      useVideos.mockReturnValue({
-        videos: [],
-        videosError: null,
-        refreshVideos: mock(),
-      });
-      useFiles.mockReturnValue({
-        files: [],
-        filesError: null,
-      });
-
+  describe('One view for every day', () => {
+    it('has no Images/Videos tabs and no refresh button', async () => {
+      mockLibrary({ '2024-12-20': 10, '2026-10-04': 3 });
       render(<App />);
-
-      await waitFor(() => {
-        expect(useFiles).toHaveBeenCalledWith(today);
-      });
+      expect(screen.queryByRole('button')).not.toBeInTheDocument();
+      expect(screen.queryByText(/Refresh/)).not.toBeInTheDocument();
+      await settleFrameTime();
     });
 
-    it('should select most recent folder if today\'s folder doesn\'t exist', async () => {
-      const folders = ['2025-01-14', '2025-01-13', '2025-01-12'];
-
-      useFolders.mockReturnValue({
-        folders,
-        foldersError: null,
-        refreshFolders: mock(),
-      });
-      useVideos.mockReturnValue({
-        videos: [],
-        videosError: null,
-        refreshVideos: mock(),
-      });
-      useFiles.mockReturnValue({
-        files: [],
-        filesError: null,
-      });
-
+    it('opens the newest day on its last frame', async () => {
+      mockLibrary({ '2024-12-20': 10, '2026-10-04': 3 });
       render(<App />);
+      await waitFor(() => expect(shownFrame()).toBe(frameUrl('2026-10-04', 2)));
+      expect(screen.getByLabelText('Day')).toHaveValue('2026-10-04');
+      expect(screen.getByText('Frame 3 / 3')).toBeInTheDocument();
+    });
 
-      await waitFor(() => {
-        expect(useFiles).toHaveBeenCalledWith('2025-01-14');
-      });
+    it('lists days newest first and marks today', async () => {
+      mockLibrary({ '2024-12-20': 10, [today()]: 3 });
+      render(<App />);
+      const options = screen.getAllByRole('option').map((o) => o.textContent?.trim());
+      expect(options).toEqual([`${today()} (Today)`, '2024-12-20']);
+      await settleFrameTime();
+    });
+
+    it('serves a video day exactly like a screenshot day', async () => {
+      mockLibrary({ '2024-12-20': 7059 }, 'video');
+      render(<App />);
+      await waitFor(() => expect(shownFrame()).toBe(frameUrl('2024-12-20', 7058)));
+    });
+
+    it('switches days from the picker', async () => {
+      mockLibrary({ '2024-12-20': 10, '2026-10-04': 3 });
+      render(<App />);
+      await waitFor(() => expect(shownFrame()).toBe(frameUrl('2026-10-04', 2)));
+      finishLoading();
+
+      fireEvent.change(screen.getByLabelText('Day'), { target: { value: '2024-12-20' } });
+      await waitFor(() => expect(shownFrame()).toBe(frameUrl('2024-12-20', 9)));
     });
   });
 
-  describe('Video Selection', () => {
-    it('should auto-select most recent video when switching to videos mode', async () => {
-      // useVideos returns chronological order, so the last entry is newest.
-      const videos = ['video1.mov', 'video2.mov'];
-
-      useFolders.mockReturnValue({
-        folders: [],
-        foldersError: null,
-        refreshFolders: mock(),
-      });
-      useVideos.mockReturnValue({
-        videos,
-        videosError: null,
-        refreshVideos: mock(),
-      });
-      mockFilesByFolder({});
-      mocked(invoke).mockResolvedValue('video2-cache');
-
+  describe('Scrubbing', () => {
+    it('moves with the slider', async () => {
+      mockLibrary({ '2026-10-04': 100 });
       render(<App />);
+      await waitFor(() => expect(shownFrame()).toBe(frameUrl('2026-10-04', 99)));
+      finishLoading();
 
-      const videosButton = screen.getByText(/Videos/i).closest('button');
-      if (videosButton) {
-        fireEvent.click(videosButton);
-      }
-
-      await waitFor(() => {
-        expect(invoke).toHaveBeenCalledWith('extract_video_frames', {
-          videoFilename: 'video2.mov',
-        });
-      });
+      fireEvent.change(screen.getByRole('slider'), { target: { value: '5' } });
+      await waitFor(() => expect(shownFrame()).toBe(frameUrl('2026-10-04', 5)));
+      expect(screen.getByText('Frame 6 / 100')).toBeInTheDocument();
     });
 
-    it('should list videos newest-first, like the date picker', async () => {
-      // useVideos returns chronological order; the dropdown reverses it so both
-      // view modes agree on which end of the list is "most recent".
-      useFolders.mockReturnValue({
-        folders: [],
-        foldersError: null,
-        refreshFolders: mock(),
-      });
-      useVideos.mockReturnValue({
-        videos: ['2025-01-13.mov', '2025-01-14.mov', '2025-01-15.mov'],
-        videosError: null,
-        refreshVideos: mock(),
-      });
-      mockFilesByFolder({});
-      mocked(invoke).mockResolvedValue('2025-01-15');
-
+    it('waits for the current frame before requesting the next, then skips to the latest', async () => {
+      mockLibrary({ '2026-10-04': 100 });
       render(<App />);
-      clickVideosTab();
+      await waitFor(() => expect(shownFrame()).toBe(frameUrl('2026-10-04', 99)));
 
-      await waitFor(() => {
-        expect(screen.getByRole('combobox')).toBeInTheDocument();
-      });
+      const slider = screen.getByRole('slider');
+      fireEvent.change(slider, { target: { value: '10' } });
+      fireEvent.change(slider, { target: { value: '20' } });
+      fireEvent.change(slider, { target: { value: '30' } });
+      // Still loading frame 99, so nothing new has been requested.
+      expect(shownFrame()).toBe(frameUrl('2026-10-04', 99));
 
-      const options = Array.from(
-        screen.getByRole('combobox').querySelectorAll('option')
-      ).map((option) => option.textContent);
+      finishLoading();
+      await waitFor(() => expect(shownFrame()).toBe(frameUrl('2026-10-04', 30)));
+    });
 
-      expect(options).toEqual([
-        'Select a video…',
-        '2025-01-15.mov',
-        '2025-01-14.mov',
-        '2025-01-13.mov',
-      ]);
+    it('steps with the arrow keys: 1, Shift 10, Option 100', async () => {
+      mockLibrary({ '2026-10-04': 500 });
+      render(<App />);
+      await waitFor(() => expect(screen.getByText('Frame 500 / 500')).toBeInTheDocument());
+
+      fireEvent.keyDown(window, { key: 'ArrowLeft' });
+      expect(screen.getByText('Frame 499 / 500')).toBeInTheDocument();
+      fireEvent.keyDown(window, { key: 'ArrowLeft', shiftKey: true });
+      expect(screen.getByText('Frame 489 / 500')).toBeInTheDocument();
+      fireEvent.keyDown(window, { key: 'ArrowLeft', altKey: true });
+      expect(screen.getByText('Frame 389 / 500')).toBeInTheDocument();
+      fireEvent.keyDown(window, { key: 'ArrowRight', altKey: true });
+      fireEvent.keyDown(window, { key: 'ArrowRight', altKey: true });
+      expect(screen.getByText('Frame 500 / 500')).toBeInTheDocument();
+      await settleFrameTime();
+    });
+
+    it('keeps Shift and Option steps when the slider has focus', async () => {
+      mockLibrary({ '2026-10-04': 500 });
+      render(<App />);
+      await waitFor(() => expect(screen.getByText('Frame 500 / 500')).toBeInTheDocument());
+
+      const slider = screen.getByRole('slider');
+      const event = fireEvent.keyDown(slider, { key: 'ArrowLeft', shiftKey: true });
+      expect(event).toBe(false); // default prevented: no extra native step
+      expect(screen.getByText('Frame 490 / 500')).toBeInTheDocument();
+      await settleFrameTime();
+    });
+
+    it('says when a frame cannot be loaded', async () => {
+      mockLibrary({ '2026-10-04': 3 });
+      render(<App />);
+      await waitFor(() => expect(shownFrame()).toBe(frameUrl('2026-10-04', 2)));
+      fireEvent.error(image());
+      expect(screen.getByText('Could not load this frame')).toBeInTheDocument();
     });
   });
 
-  describe('Image Loading', () => {
-    it('should load image when folder and files are available', async () => {
-      const mockImageData = new Uint8Array([1, 2, 3, 4]);
-
-      useFolders.mockReturnValue({
-        folders: ['2025-01-15'],
-        foldersError: null,
-        refreshFolders: mock(),
+  describe('Frame times', () => {
+    it('shows the capture time', async () => {
+      getFrameTime.mockResolvedValue({
+        localTime: '2026-10-04T14:05:09+01:00',
+        exact: true,
       });
-      useVideos.mockReturnValue({
-        videos: [],
-        videosError: null,
-        refreshVideos: mock(),
-      });
-      useFiles.mockReturnValue({
-        files: ['image1.jpg', 'image2.jpg'],
-        filesError: null,
-      });
-      mocked(readFile).mockResolvedValue(mockImageData);
-
+      mockLibrary({ '2026-10-04': 3 });
       render(<App />);
-
-      // Assert the whole path, not just that readFile ran: this is what pins
-      // the library root and the "last image is selected first" index reset.
-      await waitFor(() => {
-        expect(readFile).toHaveBeenCalledWith(
-          `${TEST_ROOT}/2025-01-15/image2.jpg`,
-          expect.any(Object)
-        );
-      });
-
-      expect(URL.createObjectURL).toHaveBeenCalled();
+      const expected = new Date('2026-10-04T14:05:09+01:00');
+      const hhmm = `${String(expected.getHours()).padStart(2, '0')}:${String(expected.getMinutes()).padStart(2, '0')}`;
+      await waitFor(() => expect(screen.getByText(hhmm)).toBeInTheDocument());
+      expect(getFrameTime).toHaveBeenLastCalledWith('2026-10-04', 2);
     });
 
-    it('should handle image loading errors gracefully', async () => {
-      const consoleSpy = spyOn(console, 'error').mockImplementation(() => {});
-
-      useFolders.mockReturnValue({
-        folders: ['2025-01-15'],
-        foldersError: null,
-        refreshFolders: mock(),
-      });
-      useVideos.mockReturnValue({
-        videos: [],
-        videosError: null,
-        refreshVideos: mock(),
-      });
-      useFiles.mockReturnValue({
-        files: ['image1.jpg'],
-        filesError: null,
-      });
-      mocked(readFile).mockRejectedValue(new Error('File not found'));
-
+    it('marks estimated times', async () => {
+      getFrameTime.mockResolvedValue({ localTime: '2024-12-20T12:48:38', exact: false });
+      mockLibrary({ '2024-12-20': 3 }, 'video');
       render(<App />);
-
-      await waitFor(() => {
-        expect(consoleSpy).toHaveBeenCalledWith(
-          'Error loading image:',
-          expect.any(Error)
-        );
-      });
-
-      consoleSpy.mockRestore();
+      await waitFor(() => expect(screen.getByText('~12:48')).toBeInTheDocument());
     });
   });
 
-  describe('Video Loading', () => {
-    const CACHE = 'test-video-cache';
-    const FRAMES = ['frame0001.jpg', 'frame0002.jpg'];
+  describe('Live updates', () => {
+    it('follows new captures while on the newest frame', async () => {
+      mockLibrary({ '2026-10-04': 3 });
+      const { rerender } = render(<App />);
+      await waitFor(() => expect(shownFrame()).toBe(frameUrl('2026-10-04', 2)));
+      finishLoading();
 
-    function setupVideosMode(): void {
-      useFolders.mockReturnValue({
-        folders: [],
-        foldersError: null,
-        refreshFolders: mock(),
-      });
-      useVideos.mockReturnValue({
-        videos: ['test-video.mov'],
-        videosError: null,
-        refreshVideos: mock(),
-      });
-      mockFilesByFolder({ [`.cache/${CACHE}`]: FRAMES });
-      mocked(invoke).mockResolvedValue(CACHE);
-    }
-
-    it('should extract frames and render the first frame', async () => {
-      const mockFrameData = new Uint8Array([10, 20, 30, 40, 50]);
-      const mockBlobUrl = 'blob:mock-frame-url';
-
-      mocked(URL.createObjectURL).mockReturnValue(mockBlobUrl);
-      setupVideosMode();
-      mocked(readFile).mockResolvedValue(mockFrameData);
-
-      render(<App />);
-      clickVideosTab();
-
-      // Frames are read out of the cache folder the Rust command reports.
-      await waitFor(() => {
-        expect(readFile).toHaveBeenCalledWith(
-          `${TEST_ROOT}/.cache/${CACHE}/${FRAMES[0]}`,
-          expect.any(Object)
-        );
-      });
-
-      expect(URL.createObjectURL).toHaveBeenCalled();
-
-      await waitFor(() => {
-        const img = document.querySelector('img');
-        expect(img).toBeTruthy();
-        expect(img?.getAttribute('src')).toBe(mockBlobUrl);
-      });
+      mockLibrary({ '2026-10-04': 4 });
+      rerender(<App />);
+      await waitFor(() => expect(shownFrame()).toBe(frameUrl('2026-10-04', 3)));
+      expect(screen.getByText('Frame 4 / 4')).toBeInTheDocument();
     });
 
-    it('should show loading state while frames are being extracted', async () => {
-      useFolders.mockReturnValue({
-        folders: [],
-        foldersError: null,
-        refreshFolders: mock(),
-      });
-      useVideos.mockReturnValue({
-        videos: ['slow-video.mov'],
-        videosError: null,
-        refreshVideos: mock(),
-      });
-      mockFilesByFolder({});
+    it('stays on a scrubbed-back frame when new captures arrive', async () => {
+      mockLibrary({ '2026-10-04': 10 });
+      const { rerender } = render(<App />);
+      await waitFor(() => expect(shownFrame()).toBe(frameUrl('2026-10-04', 9)));
+      finishLoading();
+      fireEvent.change(screen.getByRole('slider'), { target: { value: '2' } });
+      await waitFor(() => expect(shownFrame()).toBe(frameUrl('2026-10-04', 2)));
+      finishLoading();
 
-      // Hold extraction open so the interim state stays on screen.
-      let resolveExtract: (value: string) => void;
-      mocked(invoke).mockReturnValue(
-        new Promise<string>(resolve => {
-          resolveExtract = resolve;
-        })
-      );
-
-      render(<App />);
-      clickVideosTab();
-
-      await waitFor(() => {
-        expect(
-          screen.getByText(/Extracting frames from video/i)
-        ).toBeInTheDocument();
-      });
-
-      const videoTexts = screen.getAllByText(/slow-video.mov/i);
-      expect(videoTexts.length).toBeGreaterThan(0);
-
-      resolveExtract!(CACHE);
+      mockLibrary({ '2026-10-04': 11 });
+      rerender(<App />);
+      await waitFor(() => expect(screen.getByText('Frame 3 / 11')).toBeInTheDocument());
+      expect(shownFrame()).toBe(frameUrl('2026-10-04', 2));
     });
 
-    it('should say it is loading frames while the cache folder is listed', async () => {
-      // extract_video_frames has resolved, but useFiles is still retrying the
-      // freshly-created cache folder. That window used to report "Loading
-      // video…", which reads as though extraction had not started.
-      useFolders.mockReturnValue({
-        folders: [],
-        foldersError: null,
-        refreshFolders: mock(),
-      });
-      useVideos.mockReturnValue({
-        videos: ['test-video.mov'],
-        videosError: null,
-        refreshVideos: mock(),
-      });
-      mockFilesByFolder({}); // the cache folder lists no frames yet
-      mocked(invoke).mockResolvedValue(CACHE);
+    it('moves to the new day at midnight when following the live edge', async () => {
+      mockLibrary({ '2026-10-04': 3 });
+      const { rerender } = render(<App />);
+      await waitFor(() => expect(screen.getByLabelText('Day')).toHaveValue('2026-10-04'));
 
-      render(<App />);
-      clickVideosTab();
-
-      await waitFor(() => {
-        expect(screen.getByText(/Loading frames/i)).toBeInTheDocument();
-      });
-      expect(screen.queryByText(/Loading video/i)).not.toBeInTheDocument();
+      mockLibrary({ '2026-10-04': 3, '2026-10-05': 1 });
+      rerender(<App />);
+      await waitFor(() => expect(screen.getByLabelText('Day')).toHaveValue('2026-10-05'));
     });
 
-    it('should handle frame extraction errors', async () => {
-      const consoleSpy = spyOn(console, 'error').mockImplementation(() => {});
+    it('stays on an older day when a new day appears', async () => {
+      mockLibrary({ '2026-10-03': 3, '2026-10-04': 3 });
+      const { rerender } = render(<App />);
+      await waitFor(() => expect(screen.getByLabelText('Day')).toHaveValue('2026-10-04'));
+      fireEvent.change(screen.getByLabelText('Day'), { target: { value: '2026-10-03' } });
 
-      useFolders.mockReturnValue({
-        folders: [],
-        foldersError: null,
-        refreshFolders: mock(),
-      });
-      useVideos.mockReturnValue({
-        videos: ['broken-video.mov'],
-        videosError: null,
-        refreshVideos: mock(),
-      });
-      mockFilesByFolder({});
-      mocked(invoke).mockRejectedValue(new Error('ffmpeg failed'));
-
-      render(<App />);
-      clickVideosTab();
-
-      await waitFor(() => {
-        expect(consoleSpy).toHaveBeenCalledWith(
-          'Error extracting frames:',
-          expect.any(Error)
-        );
-      });
-
-      // The failure has to reach the user: a missing ffmpeg must not be
-      // indistinguishable from a slow extraction.
-      expect(
-        screen.getByText(/Could not extract frames from this video/i)
-      ).toBeInTheDocument();
-      expect(screen.getByText('ffmpeg failed')).toBeInTheDocument();
-      expect(screen.queryByText(/Loading video/i)).not.toBeInTheDocument();
-
-      consoleSpy.mockRestore();
-    });
-
-    it('should handle frame read errors', async () => {
-      const consoleSpy = spyOn(console, 'error').mockImplementation(() => {});
-
-      setupVideosMode();
-      mocked(readFile).mockRejectedValue(new Error('Frame file not found'));
-
-      render(<App />);
-      clickVideosTab();
-
-      await waitFor(() => {
-        expect(consoleSpy).toHaveBeenCalledWith(
-          'Error loading frame:',
-          expect.any(Error)
-        );
-      });
-
-      expect(screen.getByText(/Loading frame/i)).toBeInTheDocument();
-
-      consoleSpy.mockRestore();
-    });
-
-    it('should clean up blob URL when switching videos', async () => {
-      const mockBlobUrl1 = 'blob:video-1';
-      const mockBlobUrl2 = 'blob:video-2';
-
-      let callCount = 0;
-      mocked(URL.createObjectURL).mockImplementation(() => {
-        callCount++;
-        return callCount === 1 ? mockBlobUrl1 : mockBlobUrl2;
-      });
-
-      useFolders.mockReturnValue({
-        folders: [],
-        foldersError: null,
-        refreshFolders: mock(),
-      });
-      useVideos.mockReturnValue({
-        videos: ['video1.mov', 'video2.mov'],
-        videosError: null,
-        refreshVideos: mock(),
-      });
-      // Each video extracts into its own cache folder.
-      mockFilesByFolder({
-        '.cache/cache-video1.mov': FRAMES,
-        '.cache/cache-video2.mov': FRAMES,
-      });
-      // invoke is generic over its result type; the cast pins it to the string
-      // extract_video_frames returns.
-      mocked(invoke).mockImplementation((async (_cmd: string, args?: unknown) => {
-        const { videoFilename } = args as { videoFilename: string };
-        return `cache-${videoFilename}`;
-      }) as typeof invoke);
-      mocked(readFile).mockResolvedValue(new Uint8Array([1, 2, 3]));
-
-      render(<App />);
-      clickVideosTab();
-
-      // video2.mov is auto-selected (chronologically last).
-      await waitFor(() => {
-        expect(readFile).toHaveBeenCalledWith(
-          `${TEST_ROOT}/.cache/cache-video2.mov/${FRAMES[0]}`,
-          expect.any(Object)
-        );
-      });
-
-      const videoSelect = screen.getByRole('combobox');
-      fireEvent.change(videoSelect, { target: { value: 'video1.mov' } });
-
-      await waitFor(() => {
-        expect(readFile).toHaveBeenCalledWith(
-          `${TEST_ROOT}/.cache/cache-video1.mov/${FRAMES[0]}`,
-          expect.any(Object)
-        );
-      });
-
-      await waitFor(() => {
-        expect(URL.revokeObjectURL).toHaveBeenCalledWith(mockBlobUrl1);
-      });
-    });
-
-    it('should clean up blob URL when switching away from video mode', async () => {
-      // Distinct URLs per blob: if the frame and the image shared one string,
-      // currentImageSrc would never change and the cleanup effect would not run.
-      const mockBlobUrl = 'blob:url-1';
-      let blobCounter = 0;
-      mocked(URL.createObjectURL).mockImplementation(
-        () => `blob:url-${++blobCounter}`
-      );
-
-      useFolders.mockReturnValue({
-        folders: ['2025-01-15'],
-        foldersError: null,
-        refreshFolders: mock(),
-      });
-      useVideos.mockReturnValue({
-        videos: ['test-video.mov'],
-        videosError: null,
-        refreshVideos: mock(),
-      });
-      mockFilesByFolder({
-        [`.cache/${CACHE}`]: FRAMES,
-        '2025-01-15': ['image1.jpg'],
-      });
-      mocked(invoke).mockResolvedValue(CACHE);
-      mocked(readFile).mockResolvedValue(new Uint8Array([1, 2, 3]));
-
-      render(<App />);
-      clickVideosTab();
-
-      await waitFor(() => {
-        expect(URL.createObjectURL).toHaveBeenCalled();
-      });
-
-      const imagesButton = screen.getByText(/Images/i).closest('button');
-      if (imagesButton) {
-        fireEvent.click(imagesButton);
-      }
-
-      await waitFor(() => {
-        expect(URL.revokeObjectURL).toHaveBeenCalledWith(mockBlobUrl);
-      });
-    });
-
-    it('should show frame count and an enabled scrubber', async () => {
-      setupVideosMode();
-      mocked(readFile).mockResolvedValue(new Uint8Array([1, 2, 3]));
-
-      render(<App />);
-      clickVideosTab();
-
-      await waitFor(() => {
-        expect(screen.getByText(`${FRAMES.length} frames`)).toBeInTheDocument();
-      });
-
-      expect(
-        screen.getByText(`Frame 1 / ${FRAMES.length}`)
-      ).toBeInTheDocument();
-
-      const scrubber = screen.getByRole('slider') as HTMLInputElement;
-      expect(scrubber.disabled).toBe(false);
-      expect(scrubber.max).toBe(String(FRAMES.length - 1));
-    });
-  });
-
-  describe('Blob URL Cleanup', () => {
-    it('should revoke blob URLs on cleanup', async () => {
-      const mockImageData = new Uint8Array([1, 2, 3]);
-      const mockBlobUrl = 'blob:mock-image-url';
-
-      mocked(URL.createObjectURL).mockReturnValue(mockBlobUrl);
-      useFolders.mockReturnValue({
-        folders: ['2025-01-15'],
-        foldersError: null,
-        refreshFolders: mock(),
-      });
-      useVideos.mockReturnValue({
-        videos: [],
-        videosError: null,
-        refreshVideos: mock(),
-      });
-      useFiles.mockReturnValue({
-        files: ['image1.jpg'],
-        filesError: null,
-      });
-      mocked(readFile).mockResolvedValue(mockImageData);
-
-      const { unmount } = render(<App />);
-
-      await waitFor(() => {
-        expect(URL.createObjectURL).toHaveBeenCalled();
-      });
-
-      unmount();
-
-      expect(URL.revokeObjectURL).toHaveBeenCalledWith(mockBlobUrl);
-    });
-  });
-
-  describe('Time Formatting', () => {
-    it('should format time correctly for different indices', () => {
-      useFolders.mockReturnValue({
-        folders: ['2025-01-15'],
-        foldersError: null,
-        refreshFolders: mock(),
-      });
-      useVideos.mockReturnValue({
-        videos: [],
-        videosError: null,
-        refreshVideos: mock(),
-      });
-      useFiles.mockReturnValue({
-        files: Array(7200).fill('image.jpg'), // 2 hours worth
-        filesError: null,
-      });
-
-      render(<App />);
-
-      // The time formatting logic is tested indirectly through the UI
-      // We can verify it's rendering without errors
-      expect(screen.getByText(/Timelapse/i)).toBeInTheDocument();
-    });
-  });
-
-  describe('Refresh Functionality', () => {
-    it('should call refreshFolders when refresh button is clicked in images mode', async () => {
-      const mockRefreshFolders = mock();
-      const mockRefreshVideos = mock();
-
-      useFolders.mockReturnValue({
-        folders: ['2025-01-15'],
-        foldersError: null,
-        refreshFolders: mockRefreshFolders,
-      });
-      useVideos.mockReturnValue({
-        videos: [],
-        videosError: null,
-        refreshVideos: mockRefreshVideos,
-      });
-      useFiles.mockReturnValue({
-        files: [],
-        filesError: null,
-      });
-
-      render(<App />);
-
-      const refreshButton = screen.getByText(/Refresh/i);
-      fireEvent.click(refreshButton);
-
-      expect(mockRefreshFolders).toHaveBeenCalled();
-      expect(mockRefreshVideos).not.toHaveBeenCalled();
-    });
-
-    it('should call refreshVideos when refresh button is clicked in videos mode', async () => {
-      const mockRefreshFolders = mock();
-      const mockRefreshVideos = mock();
-
-      useFolders.mockReturnValue({
-        folders: [],
-        foldersError: null,
-        refreshFolders: mockRefreshFolders,
-      });
-      useVideos.mockReturnValue({
-        videos: ['video1.mov'],
-        videosError: null,
-        refreshVideos: mockRefreshVideos,
-      });
-      useFiles.mockReturnValue({
-        files: [],
-        filesError: null,
-      });
-
-      render(<App />);
-
-      // Switch to videos mode
-      const videosButton = screen.getByText(/Videos/i).closest('button');
-      if (videosButton) {
-        fireEvent.click(videosButton);
-      }
-
-      await waitFor(() => {
-        const refreshButton = screen.getByText(/Refresh/i);
-        fireEvent.click(refreshButton);
-      });
-
-      expect(mockRefreshVideos).toHaveBeenCalled();
-    });
-  });
-
-  describe('Empty States', () => {
-    it('should handle empty folders list', () => {
-      useFolders.mockReturnValue({
-        folders: [],
-        foldersError: null,
-        refreshFolders: mock(),
-      });
-      useVideos.mockReturnValue({
-        videos: [],
-        videosError: null,
-        refreshVideos: mock(),
-      });
-      useFiles.mockReturnValue({
-        files: [],
-        filesError: null,
-      });
-
-      render(<App />);
-
-      expect(screen.getByText(/Timelapse/i)).toBeInTheDocument();
-    });
-
-    it('should handle empty files list', () => {
-      useFolders.mockReturnValue({
-        folders: ['2025-01-15'],
-        foldersError: null,
-        refreshFolders: mock(),
-      });
-      useVideos.mockReturnValue({
-        videos: [],
-        videosError: null,
-        refreshVideos: mock(),
-      });
-      useFiles.mockReturnValue({
-        files: [],
-        filesError: null,
-      });
-
-      render(<App />);
-
-      expect(screen.getByText(/Timelapse/i)).toBeInTheDocument();
+      mockLibrary({ '2026-10-03': 3, '2026-10-04': 3, '2026-10-05': 1 });
+      await act(async () => rerender(<App />));
+      expect(screen.getByRole('option', { name: /2026-10-05/ })).toBeInTheDocument();
+      expect(screen.getByLabelText('Day')).toHaveValue('2026-10-03');
     });
   });
 });
