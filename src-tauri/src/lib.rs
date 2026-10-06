@@ -3,14 +3,24 @@ mod timelapse;
 mod database;
 mod paths;
 
+use frame_source::{DaySummary, FrameSource, FrameTime, Tools};
+use tauri::http::{header, Response, StatusCode};
+
 use std::path::Path;
-use std::process::Command;
 use std::sync::{Arc, Mutex};
 use tauri::{Manager, State};
 use timelapse::Photographer;
 
 // Shared state to manage the timelapse photographer
 type PhotographerState = Arc<Mutex<Option<Photographer>>>;
+
+/// Answers "frame N of day D" for the viewer. Managed once `setup` has
+/// resolved the cache directory.
+type FrameSourceState = Arc<FrameSource>;
+
+/// Decoded video frames are disposable, so the cache lives in the OS cache
+/// directory rather than in the (possibly synced) library.
+const FRAME_CACHE_CAP_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 #[tauri::command]
@@ -130,119 +140,72 @@ async fn clear_error_logs(state: State<'_, PhotographerState>) -> Result<String,
     clear_error_logs_impl(state.inner())
 }
 
-/// Extract the frames of `<root>/<video_filename>` into
-/// `<root>/.cache/<basename>/`, and return that cache folder's name — the
-/// frontend reads the JPEGs out of it directly.
-///
-/// Takes the library root instead of resolving it so tests can aim it at a
-/// `TempDir`; the command below passes the real one.
-fn extract_video_frames_impl(root: &Path, video_filename: &str) -> Result<String, String> {
-    let source_path = root.join(video_filename);
-
-    // Create cache directory if it doesn't exist
-    let cache_dir = root.join(".cache");
-    std::fs::create_dir_all(&cache_dir).map_err(|e| format!("Failed to create cache directory: {}", e))?;
-
-    // Generate cache folder name (remove .mov extension)
-    let cache_folder_name = video_filename.trim_end_matches(".mov");
-    let cache_folder_path = cache_dir.join(cache_folder_name);
-
-    // Check if frame sequence already exists. The folder is only moved into
-    // place after ffmpeg has finished, so if it is here at all it is complete.
-    if cache_folder_path.is_dir() {
-        let entries = std::fs::read_dir(&cache_folder_path)
-            .map_err(|e| format!("Failed to read cache directory: {}", e))?;
-        let has_frames = entries.count() > 0;
-        if has_frames {
-            println!("Using cached frame sequence: {:?}", cache_folder_path);
-            return Ok(cache_folder_name.to_string());
-        }
-    }
-
-    // Extract into a staging folder and publish it under the real name only
-    // once ffmpeg has succeeded. Writing straight into the cache folder meant
-    // an interrupted run left a partial frame set that every later call read as
-    // a complete cache, with no way to recover but deleting it by hand.
-    let staging_path = cache_dir.join(format!(".{}.partial", cache_folder_name));
-    if staging_path.exists() {
-        std::fs::remove_dir_all(&staging_path)
-            .map_err(|e| format!("Failed to clear stale staging folder: {}", e))?;
-    }
-    std::fs::create_dir_all(&staging_path)
-        .map_err(|e| format!("Failed to create staging folder: {}", e))?;
-
-    println!("Extracting frames from video: {:?} -> {:?}", source_path, staging_path);
-
-    // Run ffmpeg to extract frames as JPEG images
-    // frame%06d.jpg creates frame000001.jpg, frame000002.jpg, etc.
-    let output_pattern = staging_path.join("frame%06d.jpg");
-    let spawned = Command::new(paths::ffmpeg())
-        .arg("-i")
-        .arg(&source_path)
-        .arg("-vf")
-        .arg("fps=30") // Extract at 30 fps (adjust as needed)
-        .arg("-q:v")
-        .arg("2") // High quality JPEG (1-31, lower is better)
-        .arg("-y")
-        .arg(&output_pattern)
-        .output();
-
-    let output = match spawned {
-        Ok(output) => output,
-        Err(e) => {
-            let _ = std::fs::remove_dir_all(&staging_path);
-            return Err(format!("Failed to execute ffmpeg: {}. The app bundles ffmpeg; outside a bundle it must be on PATH.", e));
-        }
-    };
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-        let _ = std::fs::remove_dir_all(&staging_path);
-        return Err(format!("ffmpeg failed: {}", stderr));
-    }
-
-    publish_staged_frames(&staging_path, &cache_folder_path, video_filename)?;
-
-    println!("Frame extraction complete: {:?}", cache_folder_path);
-
-    Ok(cache_folder_name.to_string())
+/// Run a blocking frame-source call (it may shell out to ffmpeg) off the
+/// async runtime's worker threads.
+async fn with_frame_source<T: Send + 'static>(
+    source: &FrameSourceState,
+    f: impl FnOnce(&FrameSource) -> Result<T, frame_source::Error> + Send + 'static,
+) -> Result<T, String> {
+    let source = Arc::clone(source);
+    tauri::async_runtime::spawn_blocking(move || f(&source))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
 }
 
-/// Move a finished staging folder into the place the frontend reads from.
-///
-/// Split out of `extract_video_frames_impl` so the empty-output guard and the
-/// rename are reachable in tests: everything above the call site needs a real
-/// video and a working ffmpeg before it gets this far.
-fn publish_staged_frames(
-    staging_path: &Path,
-    cache_folder_path: &Path,
-    video_filename: &str,
-) -> Result<(), String> {
-    // ffmpeg can exit 0 having written nothing — a zero-length or unreadable
-    // stream does exactly that. Publishing that empty folder would count as a
-    // cache hit forever after, stranding the UI on "Loading frames…".
-    let frame_count = std::fs::read_dir(staging_path)
-        .map_err(|e| format!("Failed to read staging folder: {}", e))?
-        .count();
-    if frame_count == 0 {
-        let _ = std::fs::remove_dir_all(staging_path);
-        return Err(format!("ffmpeg produced no frames for {}", video_filename));
-    }
-
-    // An empty folder left by an older run would make the rename fail, so clear
-    // it first.
-    if cache_folder_path.exists() {
-        std::fs::remove_dir_all(cache_folder_path)
-            .map_err(|e| format!("Failed to clear incomplete cache folder: {}", e))?;
-    }
-    std::fs::rename(staging_path, cache_folder_path)
-        .map_err(|e| format!("Failed to publish extracted frames: {}", e))
+/// Every day with frames, oldest first.
+#[tauri::command]
+async fn list_days(source: State<'_, FrameSourceState>) -> Result<Vec<String>, String> {
+    with_frame_source(source.inner(), |s| s.days()).await
 }
 
 #[tauri::command]
-async fn extract_video_frames(video_filename: String) -> Result<String, String> {
-    let timelapse_root = paths::timelapse_root().ok_or("Unable to find home directory")?;
-    extract_video_frames_impl(&timelapse_root, &video_filename)
+async fn get_day(source: State<'_, FrameSourceState>, date: String) -> Result<DaySummary, String> {
+    with_frame_source(source.inner(), move |s| s.day(&date)).await
+}
+
+#[tauri::command]
+async fn get_frame_time(
+    source: State<'_, FrameSourceState>,
+    date: String,
+    index: usize,
+) -> Result<Option<FrameTime>, String> {
+    with_frame_source(source.inner(), move |s| s.frame_time(&date, index)).await
+}
+
+/// The response for a `frames://localhost/<YYYY-MM-DD>/<index>` request.
+fn frame_response(source: Option<&FrameSource>, path: &str) -> Response<Vec<u8>> {
+    let reply = |status: StatusCode, message: String| {
+        Response::builder()
+            .status(status)
+            .header(header::CONTENT_TYPE, "text/plain")
+            .body(message.into_bytes())
+            .unwrap()
+    };
+    let Some(source) = source else {
+        return reply(StatusCode::SERVICE_UNAVAILABLE, "frame source not ready".into());
+    };
+    let mut parts = path.trim_start_matches('/').split('/');
+    let (Some(date), Some(index), None) = (parts.next(), parts.next(), parts.next()) else {
+        return reply(StatusCode::BAD_REQUEST, format!("expected /<day>/<index>, got {path}"));
+    };
+    let Ok(index) = index.parse::<usize>() else {
+        return reply(StatusCode::BAD_REQUEST, format!("not a frame index: {index}"));
+    };
+    match source.frame(date, index) {
+        Ok(frame) => Response::builder()
+            .header(header::CONTENT_TYPE, frame.mime)
+            // The same URL can name a different file if a black frame is
+            // deleted mid-day; the frame source's own cache is what makes
+            // repeat requests cheap.
+            .header(header::CACHE_CONTROL, "no-store")
+            .body(frame.bytes)
+            .unwrap(),
+        Err(e @ (frame_source::Error::NotADay(_) | frame_source::Error::OutOfRange { .. })) => {
+            reply(StatusCode::NOT_FOUND, e.to_string())
+        }
+        Err(e) => reply(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
 }
 
 #[tauri::command]
@@ -317,6 +280,18 @@ pub fn run() {
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_opener::init())
         .manage(photographer_state)
+        .register_asynchronous_uri_scheme_protocol("frames", |ctx, request, responder| {
+            let source = ctx
+                .app_handle()
+                .try_state::<FrameSourceState>()
+                .map(|state| Arc::clone(state.inner()));
+            let path = request.uri().path().to_owned();
+            // Decoding a chunk of video can take a moment; keep it off the
+            // webview's thread.
+            tauri::async_runtime::spawn_blocking(move || {
+                responder.respond(frame_response(source.as_deref(), &path));
+            });
+        })
         .setup(|app| {
             // Create the library up front. The frontend calls readDir on it
             // during its first render, which happens well before the delayed
@@ -327,6 +302,24 @@ pub fn run() {
                 Some(root) => {
                     if let Err(e) = std::fs::create_dir_all(&root) {
                         eprintln!("Failed to create {:?}: {}", root, e);
+                    }
+                    // Per-profile, like the library, so a dev build never
+                    // serves frames cached from the real one. A failure here
+                    // only breaks viewing; capture below still starts.
+                    let source = app
+                        .path()
+                        .app_cache_dir()
+                        .map_err(|e| e.to_string())
+                        .and_then(|dir| {
+                            let dir = dir.join(paths::TIMELAPSE_DIR_NAME).join("frames");
+                            FrameSource::new(root, dir, FRAME_CACHE_CAP_BYTES, Tools::new(paths::ffmpeg()))
+                                .map_err(|e| e.to_string())
+                        });
+                    match source {
+                        Ok(source) => {
+                            app.manage::<FrameSourceState>(Arc::new(source));
+                        }
+                        Err(e) => eprintln!("Failed to set up the frame source: {}", e),
                     }
                 }
                 None => eprintln!("Unable to find home directory"),
@@ -376,9 +369,11 @@ pub fn run() {
             is_timelapse_running,
             get_error_logs,
             clear_error_logs,
-            extract_video_frames,
             evict_old_cache,
-            get_screenshot_metadata
+            get_screenshot_metadata,
+            list_days,
+            get_day,
+            get_frame_time
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -683,151 +678,44 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_extract_video_frames_reuses_populated_cache() {
-        let (temp_dir, cache_dir) = temp_library();
-        let cached = cache_dir.join("2026-08-27");
-        fs::create_dir_all(&cached).unwrap();
-        fs::write(cached.join("frame000001.jpg"), b"already extracted").unwrap();
-
-        // No such video exists, and ffmpeg may not be installed — reaching
-        // either would fail, so an Ok here is proof the cache branch was taken.
-        let result = extract_video_frames_impl(temp_dir.path(), "2026-08-27.mov");
-
-        assert_eq!(result.unwrap(), "2026-08-27");
-        assert_eq!(
-            fs::read(cached.join("frame000001.jpg")).unwrap(),
-            b"already extracted",
-            "the cached frames should be left untouched"
-        );
-        assert_eq!(
-            fs::read_dir(&cached).unwrap().count(),
-            1,
-            "no new frames should have been written"
-        );
-    }
-
-    // The mirror of the test above: an *empty* cache folder is not a hit, so
-    // this falls through to ffmpeg and fails there — either because ffmpeg is
-    // missing, or because it is present and the source video is not.
-    #[test]
-    fn test_extract_video_frames_empty_cache_folder_is_not_a_hit() {
-        let (temp_dir, cache_dir) = temp_library();
-        let empty = cache_dir.join("2026-08-27");
-        fs::create_dir_all(&empty).unwrap();
-
-        let result = extract_video_frames_impl(temp_dir.path(), "2026-08-27.mov");
-
-        assert!(result.is_err(), "an empty cache folder must not count as cached");
+    fn frame_source_in(root: &Path) -> (TempDir, FrameSource) {
+        let cache = TempDir::new().unwrap();
+        let source =
+            FrameSource::new(root.to_path_buf(), cache.path().to_path_buf(), u64::MAX, Tools::new(paths::ffmpeg()))
+                .unwrap();
+        (cache, source)
     }
 
     #[test]
-    fn test_extract_video_frames_creates_cache_dir_when_missing() {
-        // No `.cache` at all, and no video to extract.
-        let temp_dir = TempDir::new().unwrap();
+    fn test_frame_response_serves_a_screenshot() {
+        let library = TempDir::new().unwrap();
+        fs::create_dir(library.path().join("2026-10-04")).unwrap();
+        fs::write(library.path().join("2026-10-04/00001.png"), b"png bytes").unwrap();
+        let (_cache, source) = frame_source_in(library.path());
 
-        let result = extract_video_frames_impl(temp_dir.path(), "2026-08-27.mov");
-
-        assert!(result.is_err(), "there is no source video to extract");
-        assert!(
-            temp_dir.path().join(".cache").is_dir(),
-            "the cache directory should have been created before ffmpeg ran"
-        );
-    }
-
-    // Extraction stages into `.<name>.partial` and only renames it into place
-    // once ffmpeg succeeds, so a failed run must not leave anything behind that
-    // a later call would read back as a finished cache.
-    #[test]
-    fn test_extract_video_frames_publishes_nothing_when_ffmpeg_fails() {
-        let (temp_dir, cache_dir) = temp_library();
-
-        let result = extract_video_frames_impl(temp_dir.path(), "2026-08-27.mov");
-
-        assert!(result.is_err(), "there is no source video to extract");
-        assert!(
-            !cache_dir.join("2026-08-27").exists(),
-            "a failed extraction must not publish a cache folder"
-        );
-        assert!(
-            !cache_dir.join(".2026-08-27.partial").exists(),
-            "the staging folder should have been cleaned up"
-        );
-    }
-
-    // The regression this replaces: frames written directly into the cache
-    // folder made any interrupted run look like a complete one forever.
-    #[test]
-    fn test_extract_video_frames_reruns_after_a_partial_extraction() {
-        let (temp_dir, cache_dir) = temp_library();
-
-        // Simulate an interrupted run under the new scheme: frames are in
-        // staging, and nothing has been published.
-        let staging = cache_dir.join(".2026-08-27.partial");
-        fs::create_dir_all(&staging).unwrap();
-        fs::write(staging.join("frame000001.jpg"), b"half a run").unwrap();
-
-        let result = extract_video_frames_impl(temp_dir.path(), "2026-08-27.mov");
-
-        assert!(
-            result.is_err(),
-            "a partial extraction must not count as cached; this should reach ffmpeg and fail"
-        );
-        assert!(
-            !cache_dir.join("2026-08-27").exists(),
-            "the partial frames must never be published under the real name"
-        );
+        let response = frame_response(Some(&source), "/2026-10-04/0");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "image/png");
+        assert_eq!(response.body(), b"png bytes");
     }
 
     #[test]
-    fn test_publish_staged_frames_moves_the_folder_into_place() {
-        let (_temp_dir, cache_dir) = temp_library();
-        let staging = cache_dir.join(".2026-08-27.partial");
-        fs::create_dir_all(&staging).unwrap();
-        fs::write(staging.join("frame000001.jpg"), b"a frame").unwrap();
-        let published = cache_dir.join("2026-08-27");
-
-        publish_staged_frames(&staging, &published, "2026-08-27.mov").unwrap();
-
-        assert!(!staging.exists(), "staging should have been renamed away");
-        assert_eq!(
-            fs::read(published.join("frame000001.jpg")).unwrap(),
-            b"a frame"
-        );
-    }
-
-    // ffmpeg reports success on some inputs without writing a single frame.
-    // Publishing that would be a permanent empty cache hit.
-    #[test]
-    fn test_publish_staged_frames_rejects_an_empty_staging_folder() {
-        let (_temp_dir, cache_dir) = temp_library();
-        let staging = cache_dir.join(".2026-08-27.partial");
-        fs::create_dir_all(&staging).unwrap();
-        let published = cache_dir.join("2026-08-27");
-
-        let result = publish_staged_frames(&staging, &published, "2026-08-27.mov");
-
-        assert!(result.is_err(), "an empty extraction must not be published");
-        assert!(!published.exists(), "nothing should have been published");
-        assert!(!staging.exists(), "the empty staging folder should be gone");
-    }
-
-    #[test]
-    fn test_publish_staged_frames_replaces_an_empty_leftover_folder() {
-        let (_temp_dir, cache_dir) = temp_library();
-        let staging = cache_dir.join(".2026-08-27.partial");
-        fs::create_dir_all(&staging).unwrap();
-        fs::write(staging.join("frame000001.jpg"), b"a frame").unwrap();
-
-        // An earlier version created this eagerly and left it behind on failure.
-        let published = cache_dir.join("2026-08-27");
-        fs::create_dir_all(&published).unwrap();
-
-        publish_staged_frames(&staging, &published, "2026-08-27.mov").unwrap();
+    fn test_frame_response_rejects_bad_requests() {
+        let library = TempDir::new().unwrap();
+        let (_cache, source) = frame_source_in(library.path());
 
         assert_eq!(
-            fs::read(published.join("frame000001.jpg")).unwrap(),
-            b"a frame"
+            frame_response(None, "/2026-10-04/0").status(),
+            StatusCode::SERVICE_UNAVAILABLE
         );
+        for (path, status) in [
+            ("/2026-10-04", StatusCode::BAD_REQUEST),
+            ("/2026-10-04/abc", StatusCode::BAD_REQUEST),
+            ("/2026-10-04/0/extra", StatusCode::BAD_REQUEST),
+            ("/..%2Fetc/0", StatusCode::NOT_FOUND),
+            ("/2026-10-04/0", StatusCode::NOT_FOUND),
+        ] {
+            assert_eq!(frame_response(Some(&source), path).status(), status, "{path}");
+        }
     }
 }

@@ -1,0 +1,17 @@
+[package]
+name = "frame_source"
+version = "0.1.0"
+edition = "2021"
+description = "Answers \"frame N of day D\" for a timelapse library, from screenshots or videos"
+
+# Deliberately independent of Tauri and of the capture code (MagickWand,
+# screen capture), so `cargo test -p frame_source` builds and runs anywhere
+# ffmpeg is installed.
+[dependencies]
+chrono = "0.4"
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+thiserror = "1.0"
+
+[dev-dependencies]
+tempfile = "3.17"

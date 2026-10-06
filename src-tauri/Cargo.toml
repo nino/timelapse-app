@@ -22,7 +22,7 @@ tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tauri-plugin-fs = "2"
+tauri-plugin-fs = { version = "2", features = ["watch"] }
 thiserror = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "5.0"
@@ -32,9 +32,15 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 screenshots = "0.5"
 active-win-pos-rs = "0.8"
 rusqlite = { version = "0.32", features = ["bundled"] }
+frame_source = { path = "frame-source" }
 
 [dev-dependencies]
 tempfile = "3.17"
+
+# The frame source is its own crate so it can be built and tested without the
+# capture stack (screen capture): `cargo test -p frame_source`.
+[workspace]
+members = ["frame-source"]
 
 # The capture loop decodes, resizes and re-encodes a screen-sized PNG every
 # second. Unoptimized, that alone overruns the interval under `tauri dev`, so

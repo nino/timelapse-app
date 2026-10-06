@@ -28,78 +28,35 @@ directory and confirming nothing is created inside it.
 
 ### Test Files
 
-#### `src/hooks/useFolders.test.ts`
-Tests for custom React hooks that handle file system operations:
+#### `src/hooks/useLibrary.test.ts`
+`useDays` and `useDay`, with `invoke` and the fs `watch` mocked so a test can
+play the filesystem:
+- ✓ Lists days and picks up new ones when the library root changes
+- ✓ Keeps the same array when nothing changed
+- ✓ Reports errors and clears them on a successful reload
+- ✓ Loads a day and follows new captures in its folder
+- ✓ Never shows the previous day while a new one loads
+- ✓ Ignores a slow answer for a day that is no longer selected
 
-**useFolders hook:**
-- ✓ Loads folders successfully from Timelapse directory
-- ✓ Handles errors when loading folders
-- ✓ Filters out non-directory entries
-- ✓ Refreshes folders when requested
-- ✓ Clears errors on successful refresh
+#### `src/hooks/useDirectoryChanges.test.ts`
+- ✓ Calls back when the watcher reports a change, with a 500 ms debounce
+- ✓ Stops watching on unmount, even if the watcher arrives late
+- ✓ Falls back to polling every 3 s when the watcher cannot be created
+- ✓ `useLatestLoad` only lets the most recent call publish
 
-**useFiles hook:**
-- ✓ Loads files successfully when folder is provided
-- ✓ Returns empty array when folder is null
-- ✓ Handles errors when loading files
-- ✓ Filters out directories, only returns files
-- ✓ Reloads files when folder changes
-- ✓ Sorts files alphabetically
-
-**useVideos hook:**
-- ✓ Loads video files (.mov) successfully
-- ✓ Only includes .mov files (filters other formats)
-- ✓ Sorts videos chronologically (oldest first)
-- ✓ Handles errors when loading videos
-- ✓ Refreshes videos when requested
-- ✓ Clears errors on successful refresh
-- ✓ Filters out directories
+#### `src/frames.test.ts`
+- ✓ `frameUrl` uses `frames://localhost/…` on macOS and `http://frames.localhost/…` on Windows
 
 #### `src/App.test.tsx`
-Tests for the main App component:
-
-**Error Handling:**
-- ✓ Displays folders error
-- ✓ Displays files error
-- ✓ Displays videos error
-
-**View Modes:**
-- ✓ Renders in images mode by default
-- ✓ Switches to videos mode when clicking Videos button
-
-**Folder Selection:**
-- ✓ Auto-selects today's folder if it exists
-- ✓ Selects most recent folder if today's doesn't exist
-
-**Video Selection:**
-- ✓ Auto-selects most recent video when switching to videos mode
-
-**Image Loading:**
-- ✓ Loads image when folder and files are available
-- ✓ Handles image loading errors gracefully
-
-**Video Loading:**
-- ✓ Extracts frames and renders the first frame
-- ✓ Shows loading state while frames are being extracted
-- ✓ Handles frame extraction errors
-- ✓ Handles frame read errors
-- ✓ Cleans up blob URL when switching videos
-- ✓ Cleans up blob URL when switching away from video mode
-- ✓ Shows frame count and an enabled scrubber
-
-**Blob URL Cleanup:**
-- ✓ Revokes blob URLs on cleanup (prevents memory leaks)
-
-**Time Formatting:**
-- ✓ Formats time correctly for different indices
-
-**Refresh Functionality:**
-- ✓ Calls refreshFolders when refresh button clicked (images mode)
-- ✓ Calls refreshVideos when refresh button clicked (videos mode)
-
-**Empty States:**
-- ✓ Handles empty folders list
-- ✓ Handles empty files list
+The library hooks and `getFrameTime` are spied on, so App sees whatever
+library a test describes:
+- ✓ Library and day errors, an empty library, an empty day
+- ✓ One view: no tabs, no refresh button; a video day behaves like a screenshot day
+- ✓ Opens the newest day on its last frame; days listed newest first, today marked
+- ✓ Scrubbing by slider and keys (1 / Shift 10 / Option 100, also on a focused slider)
+- ✓ Only one frame loads at a time, then it skips to the latest position
+- ✓ Exact and estimated (`~HH:MM`) capture times
+- ✓ Follows new captures on the live edge, stays put when scrubbed back, rolls over at midnight only when following
 
 #### `src/timelapseRoot.test.ts`
 Guards the library-root contract:
@@ -117,8 +74,8 @@ literal fails the suite instead of passing silently.
 bun test
 
 # Run one file, or tests whose name matches a pattern
-bun test src/hooks/useFolders.test.ts
-bun test -t "useVideos"
+bun test src/hooks/useLibrary.test.ts
+bun test -t "useDay"
 
 # Run tests in watch mode
 bun run test:watch
@@ -169,8 +126,8 @@ Tests for core timelapse functionality:
 Tests for the Tauri command implementations. `tauri::State` wraps a private
 reference and has no public constructor, so each state-backed command is a thin
 shim over a `*_impl` function that takes `&PhotographerState`; the tests drive
-those directly. `evict_old_cache` and `extract_video_frames` are split the same
-way for a different reason — theirs take the library root as a `&Path`, so the
+those directly. `evict_old_cache` is split the same
+way for a different reason — it takes the library root as a `&Path`, so the
 tests can aim them at a `TempDir` instead of `$HOME`.
 
 **greet command:**
@@ -211,14 +168,20 @@ tests can aim them at a `TempDir` instead of `$HOME`.
 Ages are stamped onto the directories with `File::set_times` rather than waited
 for, so these tests neither sleep nor depend on when they run.
 
-**extract_video_frames command:**
-- ✓ Reuses a populated cache folder without invoking ffmpeg
-- ✓ Treats an *empty* cache folder as a miss, not a hit
-- ✓ Creates the cache folder before invoking ffmpeg
+**frames: protocol:**
+- ✓ Serves a screenshot with its MIME type
+- ✓ Answers 503 before the frame source is ready, 400 for a malformed path, 404 for a frame that doesn't exist
 
-Only the first of these needs the cache-hit branch; the other two fall through
-to ffmpeg and assert on the failure, which holds whether or not ffmpeg is
-installed.
+#### `src-tauri/frame-source/` (`cargo test -p frame_source`)
+Needs only ffmpeg, so it runs where the app crate can't build. The integration
+tests in `tests/frames.rs` render small videos whose frame N has gray level
+`4N`, so every check is against a known frame:
+- ✓ Exact frames across chunk and video boundaries
+- ✓ A day stitched from converted hours and remaining screenshots, in clock order, with split hours (`--hourly-2`) in part order
+- ✓ Screenshots win over an hourly video for the same hour; legacy whole-day videos only when there is nothing else
+- ✓ Broken and byte-identical duplicate videos are skipped
+- ✓ New screenshots are picked up on the next question
+- ✓ The decoded-chunk cache stays under its cap and re-decodes evicted chunks
 
 ### Running Rust Tests
 
