@@ -1,6 +1,7 @@
 mod converter;
 mod timelapse;
 mod database;
+mod ocr;
 mod paths;
 
 use frame_source::{DaySummary, FrameSource, FrameTime, Tools};
@@ -9,6 +10,7 @@ use tauri::http::{header, Response, StatusCode};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tauri::{Manager, State};
+use database::{OcrHit, ScreenshotDatabase};
 use timelapse::Photographer;
 
 // Shared state to manage the timelapse photographer
@@ -99,12 +101,13 @@ fn clear_error_logs_impl(state: &PhotographerState) -> Result<String, String> {
 fn get_screenshot_metadata_impl(
     state: &PhotographerState,
     frame_number: u32,
+    day: Option<&str>,
 ) -> Result<Option<(String, String)>, String> {
     let photographer_guard = state.lock().map_err(|e| e.to_string())?;
 
     if let Some(photographer) = &*photographer_guard {
         photographer
-            .get_screenshot_metadata(frame_number)
+            .get_screenshot_metadata(frame_number, day)
             .map_err(|e| e.to_string())
     } else {
         Err("Timelapse is not running".to_string())
@@ -212,8 +215,21 @@ fn frame_response(source: Option<&FrameSource>, path: &str) -> Response<Vec<u8>>
 async fn get_screenshot_metadata(
     state: State<'_, PhotographerState>,
     frame_number: u32,
+    day: Option<String>,
 ) -> Result<Option<(String, String)>, String> {
-    get_screenshot_metadata_impl(state.inner(), frame_number)
+    get_screenshot_metadata_impl(state.inner(), frame_number, day.as_deref())
+}
+
+/// Search the OCR text of every screenshot in `<root>`, newest first.
+fn search_ocr_impl(root: &Path, query: &str, limit: u32) -> Result<Vec<OcrHit>, String> {
+    let db = ScreenshotDatabase::new(root.join("screenshots.db")).map_err(|e| e.to_string())?;
+    db.search_ocr(query, limit).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn search_ocr(query: String, limit: Option<u32>) -> Result<Vec<OcrHit>, String> {
+    let timelapse_root = paths::timelapse_root().ok_or("Unable to find home directory")?;
+    search_ocr_impl(&timelapse_root, &query, limit.unwrap_or(100))
 }
 
 /// Delete every directory directly under `<root>/.cache` whose mtime is more
@@ -351,11 +367,25 @@ pub fn run() {
                 }
 
                 // Turn finished hours of screenshots into videos while on AC
-                // power. It runs for the life of the app, independently of the
-                // photographer, so it has no state or commands of its own yet.
+                // power, deleting an hour's PNGs only once OCR has read them.
+                // Both run for the life of the app, independently of the
+                // photographer, so they have no state or commands of their
+                // own yet.
                 match paths::timelapse_root() {
-                    Some(root) => converter::Converter::new_in(root).start(),
-                    None => eprintln!("Unable to find home directory; video conversion is off"),
+                    Some(root) => {
+                        converter::Converter::with_delete_check(
+                            root.clone(),
+                            ocr::delete_check(&root),
+                        )
+                        .start();
+
+                        if ocr::start_background_ocr(root) {
+                            println!("OCR started");
+                        } else {
+                            println!("OCR is not available on this platform");
+                        }
+                    }
+                    None => eprintln!("Unable to find home directory; video conversion and OCR are off"),
                 }
             });
 
@@ -373,7 +403,8 @@ pub fn run() {
             get_screenshot_metadata,
             list_days,
             get_day,
-            get_frame_time
+            get_frame_time,
+            search_ocr
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -532,7 +563,7 @@ mod tests {
     fn test_get_screenshot_metadata_not_running() {
         let state = idle_state();
 
-        let result = get_screenshot_metadata_impl(&state, 1);
+        let result = get_screenshot_metadata_impl(&state, 1, None);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), "Timelapse is not running");
     }
@@ -542,7 +573,7 @@ mod tests {
         let (_temp_dir, state) = running_state();
 
         // Nothing has been captured into this temp library yet.
-        let result = get_screenshot_metadata_impl(&state, 1);
+        let result = get_screenshot_metadata_impl(&state, 1, None);
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
     }
@@ -717,5 +748,18 @@ mod tests {
         ] {
             assert_eq!(frame_response(Some(&source), path).status(), status, "{path}");
         }
+    }
+
+    #[test]
+    fn test_search_ocr_reads_the_library_database() {
+        let temp_dir = TempDir::new().unwrap();
+        let db = ScreenshotDatabase::new(temp_dir.path().join("screenshots.db")).unwrap();
+        db.record_ocr_frame("2024-01-01", 4, Some(("cargo test", "[]"))).unwrap();
+
+        let hits = search_ocr_impl(temp_dir.path(), "cargo", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!((hits[0].day.as_str(), hits[0].frame_number), ("2024-01-01", 4));
+
+        assert!(search_ocr_impl(temp_dir.path(), "nothing", 10).unwrap().is_empty());
     }
 }

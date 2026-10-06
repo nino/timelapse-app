@@ -34,6 +34,12 @@ active-win-pos-rs = "0.8"
 rusqlite = { version = "0.32", features = ["bundled"] }
 frame_source = { path = "frame-source" }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSDictionary", "NSEnumerator", "NSError", "NSString", "NSURL"] }
+objc2-vision = { version = "0.3", default-features = false, features = ["std", "objc2-core-foundation", "VNObservation", "VNRecognizeTextRequest", "VNRequest", "VNRequestHandler", "VNTypes"] }
+
 [dev-dependencies]
 tempfile = "3.17"
 
