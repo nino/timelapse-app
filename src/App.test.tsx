@@ -42,6 +42,15 @@ function finishLoading(): void {
   fireEvent.load(image());
 }
 
+/**
+ * Let the frame-time lookup for the frame on screen resolve inside `act`.
+ * Every frame change starts one, and a test that ends before it resolves
+ * gets React's "not wrapped in act(...)" warning when it lands afterwards.
+ */
+async function settleFrameTime(): Promise<void> {
+  await act(async () => {});
+}
+
 function today(): string {
   const now = new Date();
   const pad = (n: number): string => String(n).padStart(2, '0');
@@ -86,11 +95,12 @@ describe('App', () => {
   });
 
   describe('One view for every day', () => {
-    it('has no Images/Videos tabs and no refresh button', () => {
+    it('has no Images/Videos tabs and no refresh button', async () => {
       mockLibrary({ '2024-12-20': 10, '2026-10-04': 3 });
       render(<App />);
       expect(screen.queryByRole('button')).not.toBeInTheDocument();
       expect(screen.queryByText(/Refresh/)).not.toBeInTheDocument();
+      await settleFrameTime();
     });
 
     it('opens the newest day on its last frame', async () => {
@@ -101,11 +111,12 @@ describe('App', () => {
       expect(screen.getByText('Frame 3 / 3')).toBeInTheDocument();
     });
 
-    it('lists days newest first and marks today', () => {
+    it('lists days newest first and marks today', async () => {
       mockLibrary({ '2024-12-20': 10, [today()]: 3 });
       render(<App />);
       const options = screen.getAllByRole('option').map((o) => o.textContent?.trim());
       expect(options).toEqual([`${today()} (Today)`, '2024-12-20']);
+      await settleFrameTime();
     });
 
     it('serves a video day exactly like a screenshot day', async () => {
@@ -167,6 +178,7 @@ describe('App', () => {
       fireEvent.keyDown(window, { key: 'ArrowRight', altKey: true });
       fireEvent.keyDown(window, { key: 'ArrowRight', altKey: true });
       expect(screen.getByText('Frame 500 / 500')).toBeInTheDocument();
+      await settleFrameTime();
     });
 
     it('keeps Shift and Option steps when the slider has focus', async () => {
@@ -178,6 +190,7 @@ describe('App', () => {
       const event = fireEvent.keyDown(slider, { key: 'ArrowLeft', shiftKey: true });
       expect(event).toBe(false); // default prevented: no extra native step
       expect(screen.getByText('Frame 490 / 500')).toBeInTheDocument();
+      await settleFrameTime();
     });
 
     it('says when a frame cannot be loaded', async () => {
