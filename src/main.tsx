@@ -5,11 +5,19 @@ import ReactDOM from "react-dom/client";
 import { ACTIVITY_WINDOW } from "./activity";
 import { ActivityView } from "./ActivityView";
 import { App } from "./App";
+import { SETTINGS_WINDOW } from "./settings";
+import { SettingsView } from "./SettingsView";
 import { initTimelapseRoot } from "./timelapseRoot";
 
 // The header doubles as the macOS title bar and leaves room for the traffic lights.
 if (navigator.userAgent.includes("Macintosh")) {
   document.documentElement.dataset.platform = "macos";
+}
+
+function view(label: string): React.ReactNode {
+  if (label === ACTIVITY_WINDOW) return <ActivityView />;
+  if (label === SETTINGS_WINDOW) return <SettingsView />;
+  return <App />;
 }
 
 // Resolve the library root from Rust before the first render — every path the
@@ -21,8 +29,8 @@ initTimelapseRoot().then(
       document.getElementById("root") as HTMLElement,
     ).render(
       <React.StrictMode>
-        {/* Window → Activity opens this same page in a window of its own. */}
-        {getCurrentWindow().label === ACTIVITY_WINDOW ? <ActivityView /> : <App />}
+        {/* Window → Activity and Settings… open this same page in windows of their own. */}
+        {view(getCurrentWindow().label)}
       </React.StrictMode>,
     );
   },
