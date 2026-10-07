@@ -129,6 +129,28 @@ impl ScreenshotDatabase {
             )?;
         }
 
+        // Migration 3: which screenshot each frame of an hourly video was
+        // made from, so a frame keeps its capture time once its PNG is gone.
+        if !Self::migration_applied(&tx, "add_video_frames")? {
+            tx.execute_batch(
+                "-- Written by the video converter. frame_index counts from 0
+                 -- within the video; local_time is the screenshot's row in
+                 -- `screenshots` when it has one, else the PNG's mtime.
+                 CREATE TABLE video_frames (
+                     video TEXT NOT NULL,
+                     frame_index INTEGER NOT NULL,
+                     day TEXT NOT NULL,
+                     frame_number INTEGER NOT NULL,
+                     local_time TEXT NOT NULL,
+                     PRIMARY KEY (video, frame_index)
+                 ) WITHOUT ROWID;",
+            )?;
+            tx.execute(
+                "INSERT INTO migrations (migration_name, applied_at) VALUES (?1, ?2)",
+                rusqlite::params!["add_video_frames", Utc::now().to_rfc3339()],
+            )?;
+        }
+
         tx.commit()?;
 
         Ok(())
@@ -279,6 +301,50 @@ impl ScreenshotDatabase {
                 |row| row.get(0),
             )
             .optional()
+    }
+
+    /// Record the screenshots `video` was encoded from, in video order, as
+    /// (frame number, mtime) in day folder `day`. Replaces whatever was
+    /// recorded for `video` before. Each frame's time is its `screenshots`
+    /// row's when there is one, so it does not change when the PNG gives way
+    /// to the video.
+    pub fn record_video_frames(
+        &self,
+        video: &str,
+        day: &str,
+        frames: &[(u32, DateTime<Local>)],
+    ) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM video_frames WHERE video = ?1", [video])?;
+        {
+            let mut insert = tx.prepare(
+                "INSERT INTO video_frames (video, frame_index, day, frame_number, local_time)
+                 VALUES (?1, ?2, ?3, ?4, COALESCE(
+                     (SELECT local_time FROM screenshots
+                      WHERE day = ?3 AND frame_number = ?4
+                      ORDER BY id DESC LIMIT 1),
+                     ?5))",
+            )?;
+            for (index, (frame_number, modified)) in frames.iter().enumerate() {
+                insert.execute(rusqlite::params![
+                    video,
+                    index,
+                    day,
+                    frame_number,
+                    modified.to_rfc3339()
+                ])?;
+            }
+        }
+        tx.commit()
+    }
+
+    /// Whether `record_video_frames` has run for `video`.
+    pub fn has_video_frames(&self, video: &str) -> Result<bool> {
+        self.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM video_frames WHERE video = ?1)",
+            [video],
+            |row| row.get(0),
+        )
     }
 
     /// Full-text search over OCR'd frames, newest first. Every word in `query`
@@ -697,6 +763,39 @@ mod tests {
             .into_iter()
             .map(|hit| (hit.day, hit.frame_number))
             .collect()
+    }
+
+    #[test]
+    fn test_record_video_frames_takes_times_from_screenshots() {
+        let temp_dir = TempDir::new().unwrap();
+        let db = ScreenshotDatabase::new(temp_dir.path().join("test.db")).unwrap();
+        let shot: DateTime<Local> = "2024-01-02T09:00:00.5+00:00".parse().unwrap();
+        let file: DateTime<Local> = "2024-01-02T09:00:01+00:00".parse().unwrap();
+        let other_day: DateTime<Local> = "2024-01-01T17:00:00+00:00".parse().unwrap();
+        db.insert_screenshot("2024-01-02", 1, shot.into(), shot).unwrap();
+        // Frame 2 of another day must not lend its time.
+        db.insert_screenshot("2024-01-01", 2, other_day.into(), other_day).unwrap();
+        let video = "2024-01-02--09-00-00--hourly.mov";
+
+        assert!(!db.has_video_frames(video).unwrap());
+        db.record_video_frames(video, "2024-01-02", &[(1, file), (2, file), (3, file)]).unwrap();
+        db.record_video_frames(video, "2024-01-02", &[(1, file), (2, file)]).unwrap();
+
+        assert!(db.has_video_frames(video).unwrap());
+        let mut statement = db
+            .conn
+            .prepare("SELECT frame_index, frame_number, local_time FROM video_frames ORDER BY frame_index")
+            .unwrap();
+        let rows: Vec<(u32, u32, String)> = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<Result<_>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![(0, 1, shot.to_rfc3339()), (1, 2, file.to_rfc3339())],
+            "a second record replaces the first"
+        );
     }
 
     #[test]

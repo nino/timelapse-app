@@ -284,6 +284,106 @@ fn stitches_converted_hours_and_remaining_screenshots_in_time_order() {
     );
 }
 
+/// Record `times` as the converter's `video_frames` rows for `video`.
+fn record_video(root: &Path, video: &str, times: &[&str]) {
+    let conn = rusqlite::Connection::open(root.join("screenshots.db")).unwrap();
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS video_frames (video TEXT, frame_index INTEGER, day TEXT,
+                                                  frame_number INTEGER, local_time TEXT)",
+        [],
+    )
+    .unwrap();
+    for (index, time) in times.iter().enumerate() {
+        conn.execute(
+            "INSERT INTO video_frames VALUES (?1, ?2, substr(?1, 1, 10), ?2 + 1, ?3)",
+            rusqlite::params![video, index, time],
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn times_hourly_videos_from_the_frames_the_converter_recorded() {
+    let lib = Library::new();
+    let root = lib.root.path();
+    make_video(&root.join("2026-10-04--09-00-05--hourly.mov"), 3, 0);
+    // The screen was locked from 09:00:07 to 09:40, so one second per frame
+    // would put the last frame at 09:00:07.
+    write_db(root, &[]);
+    record_video(
+        root,
+        "2026-10-04--09-00-05--hourly.mov",
+        &[
+            "2026-10-04T09:00:05.3+02:00",
+            "2026-10-04T09:00:06.7+02:00",
+            "2026-10-04T09:40:00.1+02:00",
+        ],
+    );
+    let source = lib.source(u64::MAX);
+
+    let time = |index| source.frame_time("2026-10-04", index).unwrap().unwrap();
+    assert_eq!(
+        (time(0).local_time.as_str(), time(0).exact),
+        ("2026-10-04T09:00:05.3+02:00", true)
+    );
+    assert_eq!(
+        (time(2).local_time.as_str(), time(2).exact),
+        ("2026-10-04T09:40:00.1+02:00", true)
+    );
+}
+
+#[test]
+fn ignores_a_record_that_does_not_match_the_video() {
+    let lib = Library::new();
+    let root = lib.root.path();
+    make_video(&root.join("2026-10-04--09-00-05--hourly.mov"), 3, 0);
+    write_db(root, &[]);
+    record_video(
+        root,
+        "2026-10-04--09-00-05--hourly.mov",
+        &["2026-10-04T09:00:05.3+02:00", "2026-10-04T09:40:00.1+02:00"],
+    );
+    let source = lib.source(u64::MAX);
+
+    let time = source.frame_time("2026-10-04", 1).unwrap().unwrap();
+    assert_eq!((time.local_time.as_str(), time.exact), ("2026-10-04T09:00:06", false));
+}
+
+#[test]
+fn lines_up_unrecorded_hourly_videos_with_the_database() {
+    let lib = Library::new();
+    let root = lib.root.path();
+    // Converted before frames were recorded. Named after its first frame's
+    // file time; each row is written a moment after its file.
+    make_video(&root.join("2026-10-04--09-00-05--hourly.mov"), 3, 0);
+    write_db(
+        root,
+        &[
+            "2026-10-04T08:59:59.9+02:00", // the hour before
+            "2026-10-04T09:00:03.6+02:00", // deleted before the conversion
+            "2026-10-04T09:00:05.9+02:00",
+            "2026-10-04T09:00:07.3+02:00",
+            "2026-10-04T09:40:00.1+02:00", // after the screen was locked
+            "2026-10-04T10:00:00.5+02:00", // the next hour
+        ],
+    );
+    let source = lib.source(u64::MAX);
+
+    let time = |index| {
+        let time = source.frame_time("2026-10-04", index).unwrap().unwrap();
+        assert!(!time.exact);
+        time.local_time
+    };
+    assert_eq!(
+        [time(0), time(1), time(2)],
+        [
+            "2026-10-04T09:00:05.9+02:00",
+            "2026-10-04T09:00:07.3+02:00",
+            "2026-10-04T09:40:00.1+02:00"
+        ]
+    );
+}
+
 #[test]
 fn reports_video_frames_that_are_not_decoded_yet() {
     let lib = Library::new();
