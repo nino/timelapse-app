@@ -3,6 +3,13 @@ import React from "react";
 import "./App.css";
 import { frameUrl, getFrameTime, type FrameTime } from "./frames";
 import { useDay, useDays } from "./hooks/useLibrary";
+import { useDayMatches, useMatchCounts } from "./hooks/useOcrSearch";
+import { nextStop, previousStop, rangeAt, toStops, type DayMatch, type Stop } from "./search";
+
+// How many other days the find bar names before folding the rest away.
+const OTHER_DAYS_SHOWN = 4;
+// Frames are captured at this size; used until the first one has loaded.
+const DEFAULT_FRAME_SIZE = { width: 1800, height: 1124 };
 
 export function App(): React.ReactNode {
   const { days, daysError } = useDays();
@@ -29,6 +36,18 @@ export function App(): React.ReactNode {
     [selectedDay, frameCount],
   );
   const [frameTime, setFrameTime] = React.useState<FrameTime | null>(null);
+
+  // Find bar: what is typed, and the (debounced) query actually searched.
+  const [typed, setTyped] = React.useState("");
+  const query = useDebounced(typed.trim(), 150);
+  const { matches, matchesError } = useDayMatches(selectedDay, query);
+  const stops = React.useMemo(() => toStops(matches ?? []), [matches]);
+  const counts = useMatchCounts(query);
+  const [showAllDays, setShowAllDays] = React.useState(false);
+  // A day picked from the "Also on" list opens on its first match once that
+  // day's matches have loaded.
+  const [jumpToFirstMatch, setJumpToFirstMatch] = React.useState<string | null>(null);
+  const findInput = React.useRef<HTMLInputElement>(null);
 
   // Today's day name. Recomputed whenever the day list changes so the
   // "(Today)" label moves over at midnight instead of sticking to launch day.
@@ -69,6 +88,40 @@ export function App(): React.ReactNode {
     }
   }, [newestDay]);
 
+  React.useEffect(() => {
+    if (
+      jumpToFirstMatch === null ||
+      jumpToFirstMatch !== selectedDay ||
+      matches === null ||
+      frameCount === 0
+    ) {
+      return;
+    }
+    setJumpToFirstMatch(null);
+    if (stops.length > 0) goTo(stops[0].index);
+  }, [jumpToFirstMatch, selectedDay, matches, stops, frameCount, goTo]);
+
+  const stepToMatch = React.useCallback(
+    (direction: 1 | -1): void => {
+      const stop =
+        direction === 1 ? nextStop(stops, currentIndex) : previousStop(stops, currentIndex);
+      if (stop) goTo(stop.index);
+    },
+    [stops, currentIndex, goTo],
+  );
+
+  // ⌘F / Ctrl+F jumps to the find bar.
+  React.useEffect(() => {
+    const handleKeydown = (e: KeyboardEvent): void => {
+      if (e.key.toLowerCase() !== "f" || !(e.metaKey || e.ctrlKey)) return;
+      e.preventDefault();
+      findInput.current?.focus();
+      findInput.current?.select();
+    };
+    window.addEventListener("keydown", handleKeydown);
+    return (): void => window.removeEventListener("keydown", handleKeydown);
+  }, []);
+
   // Keyboard: ←/→ by 1, Shift by 10, Option by 100.
   React.useEffect(() => {
     const handleKeydown = (e: KeyboardEvent): void => {
@@ -76,6 +129,8 @@ export function App(): React.ReactNode {
       if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
       // Arrows in the day picker change the day; leave those alone.
       if (e.target instanceof HTMLSelectElement) return;
+      // In the find bar they move the caret.
+      if (e.target instanceof HTMLInputElement && e.target.type !== "range") return;
       // Also stops a focused slider from taking its own 1-frame step on top.
       e.preventDefault();
       const step = e.altKey ? 100 : e.shiftKey ? 10 : 1;
@@ -89,6 +144,13 @@ export function App(): React.ReactNode {
   const wantedSrc =
     selectedDay && frameCount > 0 ? frameUrl(selectedDay, currentIndex) : null;
   const { src, frameFailed, onLoad, onError } = useGatedImage(wantedSrc);
+  const [frameSize, setFrameSize] = React.useState(DEFAULT_FRAME_SIZE);
+  // Outline the matching lines only while the frame on screen is the one the
+  // match was read from, or stands for.
+  const highlighted: DayMatch | null =
+    matches && src === wantedSrc && !frameFailed
+      ? (matches[rangeAt(matches, currentIndex)] ?? null)
+      : null;
 
   // Capture time of the frame on screen.
   React.useEffect(() => {
@@ -148,7 +210,77 @@ export function App(): React.ReactNode {
               Frame {currentIndex + 1} / {frameCount}
             </span>
           )}
+
+          <div className="ml-auto flex items-center gap-1.5">
+            <label className="flex items-center gap-2 w-72 h-8 px-2.5 bg-white border border-gray-300 rounded focus-within:border-blue-500 focus-within:ring-1 focus-within:ring-blue-500">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#6b7280" strokeWidth="2" aria-hidden="true">
+                <circle cx="11" cy="11" r="7" />
+                <path d="m20 20-3.5-3.5" />
+              </svg>
+              <input
+                ref={findInput}
+                type="search"
+                aria-label="Find text on screen"
+                placeholder="Find text on screen"
+                value={typed}
+                onChange={(e) => {
+                  setTyped(e.target.value);
+                  setShowAllDays(false);
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    stepToMatch(e.shiftKey ? -1 : 1);
+                  } else if (e.key === "Escape") {
+                    setTyped("");
+                    e.currentTarget.blur();
+                  }
+                }}
+                className="flex-1 min-w-0 bg-transparent text-sm focus:outline-none"
+              />
+              {query !== "" && (
+                <span className="text-xs text-gray-600 whitespace-nowrap tabular-nums" aria-live="polite">
+                  {matchLabel(stops, matches, matchesError, currentIndex)}
+                </span>
+              )}
+            </label>
+            <button
+              type="button"
+              aria-label="Previous match"
+              title="Previous match (Shift+Enter)"
+              disabled={stops.length === 0}
+              onClick={() => stepToMatch(-1)}
+              className="w-8 h-8 flex items-center justify-center bg-white border border-gray-300 rounded text-gray-700 disabled:opacity-40"
+            >
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+                <path d="m15 18-6-6 6-6" />
+              </svg>
+            </button>
+            <button
+              type="button"
+              aria-label="Next match"
+              title="Next match (Enter)"
+              disabled={stops.length === 0}
+              onClick={() => stepToMatch(1)}
+              className="w-8 h-8 flex items-center justify-center bg-white border border-gray-300 rounded text-gray-700 disabled:opacity-40"
+            >
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+                <path d="m9 18 6-6-6-6" />
+              </svg>
+            </button>
+          </div>
         </div>
+
+        <OtherDays
+          counts={counts.filter((c) => c.day !== selectedDay)}
+          today={today}
+          showAll={showAllDays}
+          onShowAll={() => setShowAllDays(true)}
+          onPick={(date) => {
+            setSelectedDay(date);
+            setJumpToFirstMatch(date);
+          }}
+        />
       </header>
 
       <div className="relative overflow-hidden">
@@ -156,12 +288,45 @@ export function App(): React.ReactNode {
           <img
             src={src}
             alt={`Frame ${currentIndex + 1}`}
-            onLoad={onLoad}
+            onLoad={(e) => {
+              const { naturalWidth: width, naturalHeight: height } = e.currentTarget;
+              if (width > 0 && height > 0) {
+                setFrameSize((size) =>
+                  size.width === width && size.height === height ? size : { width, height },
+                );
+              }
+              onLoad();
+            }}
             onError={onError}
             className={`w-full h-full object-contain absolute inset-0 ${
               frameFailed ? "invisible" : ""
             }`}
           />
+        )}
+        {highlighted && highlighted.lines.length > 0 && (
+          // Same box and aspect fitting as the <img>'s object-contain, so
+          // normalized line boxes land on the text.
+          <svg
+            data-testid="match-highlights"
+            viewBox={`0 0 ${frameSize.width} ${frameSize.height}`}
+            preserveAspectRatio="xMidYMid meet"
+            className="absolute inset-0 w-full h-full pointer-events-none"
+            aria-hidden="true"
+          >
+            {highlighted.lines.map((line, i) => (
+              <rect
+                key={i}
+                x={line.x * frameSize.width - 4}
+                y={line.y * frameSize.height - 4}
+                width={line.width * frameSize.width + 8}
+                height={line.height * frameSize.height + 8}
+                rx={4}
+                fill="rgba(250, 204, 21, 0.2)"
+                stroke="#facc15"
+                strokeWidth={4}
+              />
+            ))}
+          </svg>
         )}
         {(!src || frameFailed) && (
           <div className="flex items-center justify-center h-full text-gray-500 text-center">
@@ -180,7 +345,8 @@ export function App(): React.ReactNode {
 
       <div className="bg-gray-100 p-4">
         <div className="flex items-center gap-4">
-          <div className="flex-1 bg-gray-200 p-1 pt-0 rounded-full">
+          <div className="flex-1 bg-gray-200 p-1 pt-0 rounded-full relative">
+            <MatchMarks stops={stops} frameCount={frameCount} currentIndex={currentIndex} />
             <input
               type="range"
               aria-label="Position in day"
@@ -203,6 +369,101 @@ export function App(): React.ReactNode {
       </div>
     </main>
   );
+}
+
+/** "3 of 31" when on a match, otherwise how many there are. */
+function matchLabel(
+  stops: Array<Stop>,
+  matches: Array<DayMatch> | null,
+  error: Error | null,
+  currentIndex: number,
+): string {
+  if (error) return "Search failed";
+  if (matches === null) return "…";
+  if (stops.length === 0) return "No matches";
+  const current = rangeAt(stops, currentIndex);
+  if (current !== -1) return `${current + 1} of ${stops.length}`;
+  return stops.length === 1 ? "1 match" : `${stops.length} matches`;
+}
+
+/** Where the searched text was on screen, drawn just above the scrubber. */
+function MatchMarks({
+  stops,
+  frameCount,
+  currentIndex,
+}: {
+  stops: Array<Stop>;
+  frameCount: number;
+  currentIndex: number;
+}): React.ReactNode {
+  if (stops.length === 0 || frameCount === 0) return null;
+  const current = rangeAt(stops, currentIndex);
+  return (
+    <div data-testid="match-marks" className="absolute left-3 right-3 -top-3 h-3 pointer-events-none" aria-hidden="true">
+      {stops.map((stop, i) => (
+        <span
+          key={stop.index}
+          className={`absolute bottom-0 h-3 min-w-[3px] rounded-sm ${
+            i === current ? "bg-yellow-600" : "bg-yellow-400"
+          }`}
+          style={{
+            left: `${(stop.index / frameCount) * 100}%`,
+            width: `${((stop.endIndex - stop.index) / frameCount) * 100}%`,
+          }}
+        />
+      ))}
+    </div>
+  );
+}
+
+/** The other days the searched text appears on, as links to them. */
+function OtherDays({
+  counts,
+  today,
+  showAll,
+  onShowAll,
+  onPick,
+}: {
+  counts: Array<{ day: string; count: number }>;
+  today: string;
+  showAll: boolean;
+  onShowAll: () => void;
+  onPick: (date: string) => void;
+}): React.ReactNode {
+  if (counts.length === 0) return null;
+  const shown = showAll ? counts : counts.slice(0, OTHER_DAYS_SHOWN);
+  const hidden = counts.length - shown.length;
+  return (
+    <nav aria-label="Other days with matches" className="flex flex-wrap items-center gap-2 mt-2 text-sm">
+      <span className="text-gray-600">Also on</span>
+      {shown.map(({ day, count }) => (
+        <button
+          key={day}
+          type="button"
+          onClick={() => onPick(day)}
+          className="flex items-center gap-1.5 px-2.5 py-0.5 bg-white border border-gray-200 rounded-full hover:border-gray-400"
+        >
+          {day === today ? "Today" : day}
+          <span className="text-gray-500 tabular-nums">{count}</span>
+        </button>
+      ))}
+      {hidden > 0 && (
+        <button type="button" onClick={onShowAll} className="text-blue-700 hover:underline">
+          {hidden === 1 ? "1 more day" : `${hidden} more days`}
+        </button>
+      )}
+    </nav>
+  );
+}
+
+/** `value`, once it has stopped changing for `delayMs`. */
+function useDebounced<T>(value: T, delayMs: number): T {
+  const [settled, setSettled] = React.useState(value);
+  React.useEffect(() => {
+    const timer = setTimeout(() => setSettled(value), delayMs);
+    return (): void => clearTimeout(timer);
+  }, [value, delayMs]);
+  return settled;
 }
 
 /**

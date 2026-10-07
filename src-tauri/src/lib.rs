@@ -11,6 +11,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tauri::{Manager, State};
 use database::{OcrHit, ScreenshotDatabase};
+use serde::{Deserialize, Serialize};
 use timelapse::Photographer;
 
 // Shared state to manage the timelapse photographer
@@ -232,6 +233,143 @@ async fn search_ocr(query: String, limit: Option<u32>) -> Result<Vec<OcrHit>, St
     search_ocr_impl(&timelapse_root, &query, limit.unwrap_or(100))
 }
 
+/// Where one OCR match sits on a day's scrubber.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DayMatch {
+    /// The OCR'd frame whose text matched.
+    index: usize,
+    /// One past the last frame that frame's text stands for (OCR skips frames
+    /// that look the same as the last one it read).
+    end_index: usize,
+    /// The lines of that frame holding a search word.
+    lines: Vec<LineBox>,
+}
+
+/// A line of recognized text, normalized to the frame's size with the origin
+/// at the top-left corner, ready to draw over the image.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct LineBox {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+
+/// The fields of an `ocr::OcrLine` that a highlight needs.
+#[derive(Deserialize)]
+struct StoredLine {
+    text: String,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+
+/// The lines in `lines_json` containing any word of `query`, ignoring case.
+/// Vision's boxes have their origin at the bottom-left; these are flipped.
+fn matching_lines(lines_json: &str, query: &str) -> Vec<LineBox> {
+    let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+    let lines: Vec<StoredLine> = serde_json::from_str(lines_json).unwrap_or_default();
+    lines
+        .into_iter()
+        .filter(|line| {
+            let text = line.text.to_lowercase();
+            words.iter().any(|word| text.contains(word.as_str()))
+        })
+        .map(|line| LineBox {
+            x: line.x,
+            y: 1.0 - line.y - line.height,
+            width: line.width,
+            height: line.height,
+        })
+        .collect()
+}
+
+/// Every place on `date`'s scrubber where OCR read text matching `query`, in
+/// order. Matches whose frame the day no longer has are left out.
+fn search_ocr_day_impl(
+    root: &Path,
+    source: &FrameSource,
+    date: &str,
+    query: &str,
+) -> Result<Vec<DayMatch>, String> {
+    let db = ScreenshotDatabase::new(root.join("screenshots.db")).map_err(|e| e.to_string())?;
+    let found = db.search_ocr_in_day(date, query).map_err(|e| e.to_string())?;
+    if found.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Each match's own frame, then the frame its run is measured to: the next
+    // OCR'd frame (exclusive), or the last frame OCR handled (inclusive).
+    let numbers: Vec<u32> = found
+        .iter()
+        .flat_map(|m| [m.frame_number, m.next_frame.or(m.done_through).unwrap_or(m.frame_number)])
+        .collect();
+    let indices = source
+        .indices_of_frames(date, &numbers)
+        .map_err(|e| e.to_string())?;
+
+    let mut matches: Vec<DayMatch> = found
+        .iter()
+        .zip(indices.chunks(2))
+        .filter_map(|(m, pair)| {
+            let index = pair[0]?;
+            let end_index = match (m.next_frame, pair[1]) {
+                (Some(_), Some(next)) => next,
+                (None, Some(last)) => last + 1,
+                _ => index + 1,
+            };
+            Some(DayMatch {
+                index,
+                end_index: end_index.max(index + 1),
+                lines: matching_lines(&m.lines_json, query),
+            })
+        })
+        .collect();
+    matches.sort_by_key(|m| m.index);
+    Ok(matches)
+}
+
+#[tauri::command]
+async fn search_ocr_day(
+    source: State<'_, FrameSourceState>,
+    date: String,
+    query: String,
+) -> Result<Vec<DayMatch>, String> {
+    let timelapse_root = paths::timelapse_root().ok_or("Unable to find home directory")?;
+    let source = Arc::clone(source.inner());
+    // Mapping matches into video hours reads the database and probes videos.
+    tauri::async_runtime::spawn_blocking(move || {
+        search_ocr_day_impl(&timelapse_root, &source, &date, &query)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// How many OCR'd frames match on one day.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct DayCount {
+    day: String,
+    count: u32,
+}
+
+fn count_ocr_matches_impl(root: &Path, query: &str) -> Result<Vec<DayCount>, String> {
+    let db = ScreenshotDatabase::new(root.join("screenshots.db")).map_err(|e| e.to_string())?;
+    let counts = db.count_ocr_matches(query).map_err(|e| e.to_string())?;
+    Ok(counts
+        .into_iter()
+        .map(|(day, count)| DayCount { day, count })
+        .collect())
+}
+
+/// Days whose OCR text matches `query`, newest first, with how many frames.
+#[tauri::command]
+async fn count_ocr_matches(query: String) -> Result<Vec<DayCount>, String> {
+    let timelapse_root = paths::timelapse_root().ok_or("Unable to find home directory")?;
+    count_ocr_matches_impl(&timelapse_root, &query)
+}
+
 /// Delete every directory directly under `<root>/.cache` whose mtime is more
 /// than 15 days old, and report how many went.
 ///
@@ -404,7 +542,9 @@ pub fn run() {
             list_days,
             get_day,
             get_frame_time,
-            search_ocr
+            search_ocr,
+            search_ocr_day,
+            count_ocr_matches
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -748,6 +888,60 @@ mod tests {
         ] {
             assert_eq!(frame_response(Some(&source), path).status(), status, "{path}");
         }
+    }
+
+    #[test]
+    fn test_search_ocr_day_places_matches_on_the_scrubber() {
+        let library = TempDir::new().unwrap();
+        let day_dir = library.path().join("2026-10-04");
+        fs::create_dir(&day_dir).unwrap();
+        // Frame 4 was removed by hand, so frames 1-7 are indices 0-5.
+        for n in [1, 2, 3, 5, 6, 7] {
+            fs::write(day_dir.join(format!("{n:05}.png")), b"png").unwrap();
+        }
+        let db = ScreenshotDatabase::new(library.path().join("screenshots.db")).unwrap();
+        let lines = r#"[
+            {"text": "$ Cargo build", "confidence": 1.0, "x": 0.125, "y": 0.5, "width": 0.5, "height": 0.25},
+            {"text": "Finished", "confidence": 1.0, "x": 0.0, "y": 0.0, "width": 1.0, "height": 0.1}
+        ]"#;
+        db.record_ocr_frame("2026-10-04", 2, Some(("$ Cargo build\nFinished", lines))).unwrap();
+        db.record_ocr_frame("2026-10-04", 3, None).unwrap();
+        db.record_ocr_frame("2026-10-04", 4, Some(("cargo check", "[]"))).unwrap();
+        db.record_ocr_frame("2026-10-04", 5, Some(("bun test", "[]"))).unwrap();
+        db.record_ocr_frame("2026-10-04", 6, Some(("cargo test", "[]"))).unwrap();
+        db.record_ocr_frame("2026-10-04", 7, None).unwrap();
+        let (_cache, source) = frame_source_in(library.path());
+
+        let matches = search_ocr_day_impl(library.path(), &source, "2026-10-04", "cargo").unwrap();
+        assert_eq!(
+            matches,
+            vec![
+                DayMatch {
+                    index: 1,
+                    // Its run ends at frame 4, which is gone, so it covers
+                    // only itself.
+                    end_index: 2,
+                    lines: vec![LineBox { x: 0.125, y: 0.25, width: 0.5, height: 0.25 }],
+                },
+                // Frame 4 is left out; frame 6 runs to the last frame OCR handled.
+                DayMatch { index: 4, end_index: 6, lines: vec![] },
+            ]
+        );
+        assert!(search_ocr_day_impl(library.path(), &source, "2026-10-04", "")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn test_count_ocr_matches_reads_the_library_database() {
+        let temp_dir = TempDir::new().unwrap();
+        let db = ScreenshotDatabase::new(temp_dir.path().join("screenshots.db")).unwrap();
+        db.record_ocr_frame("2024-01-01", 4, Some(("cargo test", "[]"))).unwrap();
+
+        assert_eq!(
+            count_ocr_matches_impl(temp_dir.path(), "cargo").unwrap(),
+            vec![DayCount { day: "2024-01-01".to_string(), count: 1 }]
+        );
     }
 
     #[test]

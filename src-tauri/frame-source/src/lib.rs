@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
-use chrono::{Duration, NaiveDate};
+use chrono::{DateTime, Duration, NaiveDate, NaiveDateTime, Timelike};
 use serde::Serialize;
 
 use cache::ChunkCache;
@@ -287,6 +287,118 @@ impl FrameSource {
         }
     }
 
+    /// Where frames recorded by number (as OCR records them) sit in the day:
+    /// for each of `numbers`, the day-wide index of screenshot `NNNNN`, or
+    /// `None` if the day no longer has that frame.
+    ///
+    /// A screenshot still on disk is found exactly. Once its hour has been
+    /// converted, the hourly video holds the hour's screenshots in frame-number
+    /// order, so the frame's rank among the database rows for that hour is its
+    /// place in the video. That is an estimate: a row and its file can fall in
+    /// different hours by a fraction of a second.
+    ///
+    /// A day served only from legacy videos has no frame numbers, so there a
+    /// number is taken to be a 1-based position in the day, which is how OCR
+    /// counts the frames it reads from those videos.
+    pub fn indices_of_frames(
+        &self,
+        date: &str,
+        numbers: &[u32],
+    ) -> Result<Vec<Option<usize>>, Error> {
+        let day = parse_date(date)?;
+        let segments = self.plan(day)?;
+        let total: usize = segments.iter().map(Segment::len).sum();
+        let legacy_only = segments.iter().all(
+            |s| matches!(s, Segment::Video { file, .. } if file.kind == VideoKind::Legacy),
+        );
+        if legacy_only {
+            return Ok(numbers
+                .iter()
+                .map(|&n| (n as usize).checked_sub(1).filter(|&i| i < total))
+                .collect());
+        }
+
+        let mut by_number = HashMap::new();
+        // Clock hour -> (first index, length) of each part of its video.
+        let mut video_hours: HashMap<NaiveDateTime, Vec<(usize, usize)>> = HashMap::new();
+        let mut start = 0;
+        for segment in &segments {
+            match segment {
+                Segment::Screenshots { shots, range } => {
+                    for (i, shot) in shots[range.clone()].iter().enumerate() {
+                        by_number.insert(shot.number, start + i);
+                    }
+                }
+                Segment::Video { file, .. } => {
+                    video_hours
+                        .entry(file.hour())
+                        .or_default()
+                        .push((start, segment.len()));
+                }
+            }
+            start += segment.len();
+        }
+
+        let needs_db =
+            !video_hours.is_empty() && numbers.iter().any(|n| !by_number.contains_key(n));
+        let hours = if needs_db {
+            self.frame_hours(date)?
+        } else {
+            FrameHours::default()
+        };
+
+        Ok(numbers
+            .iter()
+            .map(|n| {
+                if let Some(&index) = by_number.get(n) {
+                    return Some(index);
+                }
+                let hour = hours.hour_of.get(n)?;
+                let mut rank = hours.numbers[hour].binary_search(n).ok()?;
+                let parts = video_hours.get(hour)?;
+                for &(first, len) in parts {
+                    if rank < len {
+                        return Some(first + rank);
+                    }
+                    rank -= len;
+                }
+                // More rows than the video has frames: the end of the hour is
+                // the closest place there is.
+                parts.last().and_then(|&(first, len)| (first + len).checked_sub(1))
+            })
+            .collect())
+    }
+
+    /// The day's database rows grouped by the local clock hour they were
+    /// captured in.
+    fn frame_hours(&self, date: &str) -> Result<FrameHours, Error> {
+        let mut hours = FrameHours::default();
+        let Some(conn) = self.open_db()? else {
+            return Ok(hours);
+        };
+        let mut statement = conn.prepare(
+            "SELECT frame_number, local_time FROM screenshots
+             WHERE substr(local_time, 1, 10) = ?1
+             ORDER BY frame_number",
+        )?;
+        let rows = statement.query_map([date], |row| {
+            Ok((row.get::<_, u32>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (number, time) = row?;
+            let Some(hour) = local_hour(&time) else {
+                continue;
+            };
+            // A number listed twice (an old library's reused black frame)
+            // counts once, in the hour it was first captured.
+            if let std::collections::hash_map::Entry::Vacant(entry) = hours.hour_of.entry(number) {
+                entry.insert(hour);
+                hours.numbers.entry(hour).or_default().push(number);
+            }
+        }
+        Ok(hours)
+    }
+
     fn day_dir(&self, day: NaiveDate) -> PathBuf {
         self.root.join(day.format("%Y-%m-%d").to_string())
     }
@@ -441,6 +553,24 @@ impl FrameSource {
             Err(e) => Err(e.into()),
         }
     }
+}
+
+/// Frame numbers of one day by capture hour; see `FrameSource::frame_hours`.
+#[derive(Default)]
+struct FrameHours {
+    hour_of: HashMap<u32, NaiveDateTime>,
+    /// Ascending within each hour.
+    numbers: HashMap<NaiveDateTime, Vec<u32>>,
+}
+
+/// The local clock hour of a database timestamp: RFC 3339 with an offset, as
+/// the capture loop writes it, or a naive local time.
+fn local_hour(time: &str) -> Option<NaiveDateTime> {
+    let local = DateTime::parse_from_rfc3339(time)
+        .map(|t| t.naive_local())
+        .or_else(|_| NaiveDateTime::parse_from_str(time, "%Y-%m-%dT%H:%M:%S%.f"))
+        .ok()?;
+    local.date().and_hms_opt(local.hour(), 0, 0)
 }
 
 fn parse_date(date: &str) -> Result<NaiveDate, Error> {
