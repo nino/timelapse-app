@@ -97,6 +97,13 @@ function image(): HTMLImageElement {
   return screen.getByRole('img') as HTMLImageElement;
 }
 
+/** Where the scrubber is, as "frame / frames", both counted from 1. */
+function position(): string {
+  // `hidden`: an open day picker hides the rest of the page from queries.
+  const slider = screen.getByRole('slider', { hidden: true }) as HTMLInputElement;
+  return `${Number(slider.value) + 1} / ${Number(slider.max) + 1}`;
+}
+
 /** The frame currently requested by the `<img>`, as [day, index]. */
 function shownFrame(): string {
   return image().getAttribute('src') ?? '';
@@ -175,7 +182,7 @@ describe('App', () => {
       render(<App />);
       await waitFor(() => expect(shownFrame()).toBe(frameUrl('2026-10-04', 2)));
       expect(dayPicker()).toHaveTextContent('2026-10-04');
-      expect(screen.getByText('Frame 3 / 3')).toBeInTheDocument();
+      expect(position()).toBe('3 / 3');
     });
 
     it('lists days newest first and marks today', async () => {
@@ -206,11 +213,11 @@ describe('App', () => {
     it('leaves the arrow keys to the day picker, open or closed', async () => {
       mockLibrary({ '2024-12-20': 10, '2026-10-04': 3 });
       render(<App />);
-      await waitFor(() => expect(screen.getByText('Frame 3 / 3')).toBeInTheDocument());
+      await waitFor(() => expect(position()).toBe('3 / 3'));
       fireEvent.keyDown(dayPicker(), { key: 'ArrowLeft' });
       await openDayPicker();
       fireEvent.keyDown(screen.getByRole('listbox'), { key: 'ArrowLeft' });
-      expect(screen.getByText('Frame 3 / 3')).toBeInTheDocument();
+      expect(position()).toBe('3 / 3');
       await settleFrameTime();
     });
   });
@@ -224,7 +231,7 @@ describe('App', () => {
 
       fireEvent.change(screen.getByRole('slider'), { target: { value: '5' } });
       await waitFor(() => expect(shownFrame()).toBe(frameUrl('2026-10-04', 5)));
-      expect(screen.getByText('Frame 6 / 100')).toBeInTheDocument();
+      expect(position()).toBe('6 / 100');
     });
 
     it('waits for the current frame before requesting the next, then skips to the latest', async () => {
@@ -246,29 +253,29 @@ describe('App', () => {
     it('steps with the arrow keys: 1, Shift 10, Option 100', async () => {
       mockLibrary({ '2026-10-04': 500 });
       render(<App />);
-      await waitFor(() => expect(screen.getByText('Frame 500 / 500')).toBeInTheDocument());
+      await waitFor(() => expect(position()).toBe('500 / 500'));
 
       fireEvent.keyDown(window, { key: 'ArrowLeft' });
-      expect(screen.getByText('Frame 499 / 500')).toBeInTheDocument();
+      expect(position()).toBe('499 / 500');
       fireEvent.keyDown(window, { key: 'ArrowLeft', shiftKey: true });
-      expect(screen.getByText('Frame 489 / 500')).toBeInTheDocument();
+      expect(position()).toBe('489 / 500');
       fireEvent.keyDown(window, { key: 'ArrowLeft', altKey: true });
-      expect(screen.getByText('Frame 389 / 500')).toBeInTheDocument();
+      expect(position()).toBe('389 / 500');
       fireEvent.keyDown(window, { key: 'ArrowRight', altKey: true });
       fireEvent.keyDown(window, { key: 'ArrowRight', altKey: true });
-      expect(screen.getByText('Frame 500 / 500')).toBeInTheDocument();
+      expect(position()).toBe('500 / 500');
       await settleFrameTime();
     });
 
     it('keeps Shift and Option steps when the slider has focus', async () => {
       mockLibrary({ '2026-10-04': 500 });
       render(<App />);
-      await waitFor(() => expect(screen.getByText('Frame 500 / 500')).toBeInTheDocument());
+      await waitFor(() => expect(position()).toBe('500 / 500'));
 
       const slider = screen.getByRole('slider');
       const event = fireEvent.keyDown(slider, { key: 'ArrowLeft', shiftKey: true });
       expect(event).toBe(false); // default prevented: no extra native step
-      expect(screen.getByText('Frame 490 / 500')).toBeInTheDocument();
+      expect(position()).toBe('490 / 500');
       await settleFrameTime();
     });
 
@@ -313,7 +320,7 @@ describe('App', () => {
       mockLibrary({ '2026-10-04': 4 });
       rerender(<App />);
       await waitFor(() => expect(shownFrame()).toBe(frameUrl('2026-10-04', 3)));
-      expect(screen.getByText('Frame 4 / 4')).toBeInTheDocument();
+      expect(position()).toBe('4 / 4');
     });
 
     it('stays on a scrubbed-back frame when new captures arrive', async () => {
@@ -327,7 +334,7 @@ describe('App', () => {
 
       mockLibrary({ '2026-10-04': 11 });
       rerender(<App />);
-      await waitFor(() => expect(screen.getByText('Frame 3 / 11')).toBeInTheDocument());
+      await waitFor(() => expect(position()).toBe('3 / 11'));
       expect(shownFrame()).toBe(frameUrl('2026-10-04', 2));
     });
 
@@ -360,7 +367,7 @@ describe('App', () => {
       mockLibrary({ '2026-10-04': 100 });
       mockSearch('cargo', { '2026-10-04': [match(10, 12), match(12, 15), match(40), match(70, 75)] });
       render(<App />);
-      await waitFor(() => expect(screen.getByText('Frame 100 / 100')).toBeInTheDocument());
+      await waitFor(() => expect(position()).toBe('100 / 100'));
 
       await search('cargo');
       // Back-to-back matches count as one stretch.
@@ -368,18 +375,18 @@ describe('App', () => {
 
       // From the live edge, Enter wraps round to the first match.
       fireEvent.keyDown(findBar(), { key: 'Enter' });
-      expect(screen.getByText('Frame 11 / 100')).toBeInTheDocument();
+      expect(position()).toBe('11 / 100');
       expect(screen.getByText('1 of 3')).toBeInTheDocument();
       fireEvent.keyDown(findBar(), { key: 'Enter' });
-      expect(screen.getByText('Frame 41 / 100')).toBeInTheDocument();
+      expect(position()).toBe('41 / 100');
       fireEvent.keyDown(findBar(), { key: 'Enter', shiftKey: true });
-      expect(screen.getByText('Frame 11 / 100')).toBeInTheDocument();
+      expect(position()).toBe('11 / 100');
       fireEvent.keyDown(findBar(), { key: 'Enter', shiftKey: true });
-      expect(screen.getByText('Frame 71 / 100')).toBeInTheDocument();
+      expect(position()).toBe('71 / 100');
       expect(screen.getByText('3 of 3')).toBeInTheDocument();
 
       fireEvent.click(screen.getByRole('button', { name: 'Next match' }));
-      expect(screen.getByText('Frame 11 / 100')).toBeInTheDocument();
+      expect(position()).toBe('11 / 100');
       await settleFrameTime();
     });
 
@@ -414,9 +421,9 @@ describe('App', () => {
     it('leaves the arrow keys to the find bar while typing', async () => {
       mockLibrary({ '2026-10-04': 100 });
       render(<App />);
-      await waitFor(() => expect(screen.getByText('Frame 100 / 100')).toBeInTheDocument());
+      await waitFor(() => expect(position()).toBe('100 / 100'));
       fireEvent.keyDown(findBar(), { key: 'ArrowLeft' });
-      expect(screen.getByText('Frame 100 / 100')).toBeInTheDocument();
+      expect(position()).toBe('100 / 100');
       await settleFrameTime();
     });
 
@@ -469,7 +476,7 @@ describe('App', () => {
       const otherDays = screen.getByRole('navigation', { name: 'Other days with matches' });
       expect(otherDays).toHaveTextContent('Also on2026-10-0222026-10-011');
       fireEvent.click(screen.getByRole('button', { name: /2026-10-02/ }));
-      await waitFor(() => expect(screen.getByText('Frame 8 / 50')).toBeInTheDocument());
+      await waitFor(() => expect(position()).toBe('8 / 50'));
       expect(dayPicker()).toHaveTextContent('2026-10-02');
       await settleFrameTime();
     });
@@ -485,7 +492,7 @@ describe('App', () => {
       await search('cargo');
       fireEvent.click(screen.getByRole('button', { name: /2026-10-02/ }));
       await pickDay('2026-10-03');
-      await waitFor(() => expect(screen.getByText('Frame 50 / 50')).toBeInTheDocument());
+      await waitFor(() => expect(position()).toBe('50 / 50'));
 
       // Now the matches are there, and 10-02 is opened from the picker.
       useDayMatches.mockImplementation((date: string | null) => ({
@@ -495,7 +502,7 @@ describe('App', () => {
       await pickDay('2026-10-02');
       await waitFor(() => expect(dayPicker()).toHaveTextContent('2026-10-02'));
       await settleFrameTime();
-      expect(screen.getByText('Frame 50 / 50')).toBeInTheDocument();
+      expect(position()).toBe('50 / 50');
     });
 
     it('folds away all but the first few other days', async () => {
