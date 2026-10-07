@@ -18,6 +18,7 @@ const useDayMatches = spyOn(ocrSearch, 'useDayMatches');
 const useMatchCounts = spyOn(ocrSearch, 'useMatchCounts');
 const useMatchLines = spyOn(ocrSearch, 'useMatchLines');
 const useOcrVersion = spyOn(ocrSearch, 'useOcrVersion');
+const getPendingFrames = spyOn(frames, 'getPendingFrames');
 
 afterAll(() => {
   useDays.mockRestore();
@@ -27,6 +28,7 @@ afterAll(() => {
   useMatchCounts.mockRestore();
   useMatchLines.mockRestore();
   useOcrVersion.mockRestore();
+  getPendingFrames.mockRestore();
 });
 
 /**
@@ -110,6 +112,7 @@ describe('App', () => {
     mock.clearAllMocks();
     getFrameTime.mockResolvedValue(null);
     mockSearch('', {});
+    getPendingFrames.mockResolvedValue({ frameCount: 0, ranges: [] });
   });
 
   describe('Library states', () => {
@@ -323,6 +326,7 @@ describe('App', () => {
       expect(screen.getByLabelText('Day')).toHaveValue('2026-10-03');
     });
   });
+
   describe('Find in timeline', () => {
     it('counts matches and steps through them with Enter and Shift+Enter', async () => {
       mockLibrary({ '2026-10-04': 100 });
@@ -475,6 +479,23 @@ describe('App', () => {
       expect(screen.queryByRole('button', { name: /2026-09-02/ })).not.toBeInTheDocument();
       fireEvent.click(screen.getByRole('button', { name: '2 more days' }));
       expect(screen.getByRole('button', { name: /2026-09-02/ })).toBeInTheDocument();
+      await settleFrameTime();
+    });
+  });
+
+  describe('Decoding progress', () => {
+    it('pales the stretches of the scrubber that are not decoded yet', async () => {
+      getPendingFrames.mockResolvedValue({ frameCount: 300, ranges: [{ start: 150, end: 300 }] });
+      mockLibrary({ '2026-10-01': 300 }, 'video');
+      render(<App />);
+      const slider = screen.getByRole('slider');
+      await waitFor(() => expect(slider.style.background).toContain('linear-gradient'));
+      expect(getPendingFrames).toHaveBeenCalledWith('2026-10-01');
+
+      // Showing a frame decodes its chunk, so the scrubber asks again.
+      getPendingFrames.mockResolvedValue({ frameCount: 300, ranges: [] });
+      finishLoading();
+      await waitFor(() => expect(slider.style.background).toBe(''));
       await settleFrameTime();
     });
   });

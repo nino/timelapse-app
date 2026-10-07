@@ -3,6 +3,7 @@ import React from "react";
 import "./App.css";
 import { frameUrl, getFrameTime, type FrameTime } from "./frames";
 import { useDay, useDays } from "./hooks/useLibrary";
+import { pendingTrackBackground, usePendingFrames } from "./hooks/usePendingFrames";
 import {
   useDayMatches,
   useMatchCounts,
@@ -153,7 +154,9 @@ export function App(): React.ReactNode {
 
   const wantedSrc =
     selectedDay && frameCount > 0 ? frameUrl(selectedDay, currentIndex) : null;
-  const { src, loadedSrc, frameFailed, onLoad, onError } = useGatedImage(wantedSrc);
+  const { src, frameFailed, loaded, onLoad, onError } = useGatedImage(wantedSrc);
+  // Stretches still to be decoded from video are drawn paler on the scrubber.
+  const pendingFrames = usePendingFrames(day, loaded);
   const [frameSize, setFrameSize] = React.useState(DEFAULT_FRAME_SIZE);
   const currentMatch: DayMatch | null = matches?.[rangeAt(matches, currentIndex)] ?? null;
   const matchLines = useMatchLines(selectedDay, currentMatch?.frame ?? null, query);
@@ -161,7 +164,7 @@ export function App(): React.ReactNode {
   // match was read from, or stands for: until a new frame has loaded, the
   // browser keeps showing the old one.
   const highlights =
-    currentMatch && loadedSrc === wantedSrc && !frameFailed ? (matchLines ?? []) : [];
+    currentMatch && loaded === wantedSrc && !frameFailed ? (matchLines ?? []) : [];
 
   // Capture time of the frame on screen.
   React.useEffect(() => {
@@ -366,6 +369,7 @@ export function App(): React.ReactNode {
               value={currentIndex}
               onChange={(e) => goTo(parseInt(e.target.value, 10))}
               disabled={frameCount === 0}
+              style={{ background: pendingTrackBackground(pendingFrames) }}
               className="w-full h-2 bg-gray-300 rounded-lg appearance-none cursor-pointer
                          disabled:opacity-50 disabled:cursor-not-allowed"
             />
@@ -493,15 +497,15 @@ function useDebounced<T>(value: T, delayMs: number): T {
  */
 function useGatedImage(wanted: string | null): {
   src: string | null;
-  /** The last src that finished loading, i.e. what is on screen. */
-  loadedSrc: string | null;
   frameFailed: boolean;
+  /** The last frame that finished loading successfully. */
+  loaded: string | null;
   onLoad: () => void;
   onError: () => void;
 } {
   const [src, setSrc] = React.useState<string | null>(null);
   const [frameFailed, setFrameFailed] = React.useState(false);
-  const [loadedSrc, setLoadedSrc] = React.useState<string | null>(null);
+  const [loaded, setLoaded] = React.useState<string | null>(null);
   const srcRef = React.useRef<string | null>(null);
   const wantedRef = React.useRef<string | null>(wanted);
   const inFlight = React.useRef(false);
@@ -523,7 +527,7 @@ function useGatedImage(wanted: string | null): {
     (failed: boolean): void => {
       inFlight.current = false;
       setFrameFailed(failed);
-      setLoadedSrc(failed ? null : srcRef.current);
+      if (!failed) setLoaded(srcRef.current);
       if (wantedRef.current !== srcRef.current) {
         show(wantedRef.current);
       }
@@ -533,8 +537,8 @@ function useGatedImage(wanted: string | null): {
 
   return {
     src,
-    loadedSrc,
     frameFailed,
+    loaded,
     onLoad: React.useCallback((): void => settle(false), [settle]),
     onError: React.useCallback((): void => settle(true), [settle]),
   };
