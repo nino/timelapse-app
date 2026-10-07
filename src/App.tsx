@@ -1,6 +1,7 @@
 import React from "react";
 
 import "./App.css";
+import { DayPicker } from "./DayPicker";
 import { frameUrl, getFrameTime, type FrameTime } from "./frames";
 import { useDay, useDays } from "./hooks/useLibrary";
 import {
@@ -140,8 +141,13 @@ export function App(): React.ReactNode {
     const handleKeydown = (e: KeyboardEvent): void => {
       if (frameCount === 0) return;
       if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
-      // Arrows in the day picker change the day; leave those alone.
-      if (e.target instanceof HTMLSelectElement) return;
+      // Leave the day picker alone, open or closed.
+      if (
+        e.target instanceof Element &&
+        e.target.closest('[role="listbox"], [aria-haspopup="listbox"]')
+      ) {
+        return;
+      }
       // In the find bar they move the caret.
       if (e.target instanceof HTMLInputElement && e.target.type !== "range") return;
       // Also stops a focused slider from taking its own 1-frame step on top.
@@ -205,24 +211,7 @@ export function App(): React.ReactNode {
     <main className="h-screen overflow-hidden grid grid-rows-[min-content_1fr_auto] bg-page text-fg">
       <header className="bg-card px-4 py-2.5 border-b border-border">
         <div className="flex items-center gap-4">
-          <div className="relative">
-            <select
-              aria-label="Day"
-              value={selectedDay ?? ""}
-              onChange={(e) => setSelectedDay(e.target.value || null)}
-              className={`${fieldFrame} appearance-none h-9 pl-3 pr-8 text-sm font-medium ${focusRing}`}
-            >
-              {selectedDay === null && <option value="">Select a day…</option>}
-              {[...days].reverse().map((date) => (
-                <option key={date} value={date}>
-                  {date} {date === today ? "(Today)" : ""}
-                </option>
-              ))}
-            </select>
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true" className="absolute right-2.5 top-1/2 -translate-y-1/2 pointer-events-none text-muted-fg">
-              <path d="m6 9 6 6 6-6" />
-            </svg>
-          </div>
+          <DayPicker days={days} today={today} value={selectedDay} onChange={setSelectedDay} />
 
           {frameCount > 0 && (
             <span className="text-muted-fg text-sm tabular-nums">
