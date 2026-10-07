@@ -675,6 +675,7 @@ mod tests {
             start: chrono::Local::now(),
             part: 0,
             frames: frames.iter().map(|name| root.join(DAY_1).join(name)).collect(),
+            captured: Vec::new(),
         };
 
         assert!(!check(&batch(&["00001.png", "00002.png"])));

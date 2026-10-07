@@ -17,12 +17,16 @@
 //!    `00001.png, 00002.png, …` sequence. Screenshot numbering has gaps (black
 //!    frames are deleted), and ffmpeg's `%05d` input stops at the first gap.
 //! 2. Encode that folder into `.cache/.convert-<video>/out.mov`.
-//! 3. Rename the finished video into the library root, where `useVideos`
+//! 3. Record in `video_frames` which screenshot each video frame came from,
+//!    so the frame source can show a frame's capture time once its PNG is
+//!    gone.
+//! 4. Rename the finished video into the library root, where `useVideos`
 //!    lists it.
 //!
 //! An interrupted batch leaves only a staging folder behind, which the next
 //! run clears.
 
+use crate::database::ScreenshotDatabase;
 use chrono::{DateTime, Local, NaiveDate, Timelike};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -72,6 +76,8 @@ pub struct HourBatch {
     pub part: usize,
     /// The PNGs, in frame-number order.
     pub frames: Vec<PathBuf>,
+    /// The frame number and modification time of each of `frames`.
+    pub captured: Vec<(u32, DateTime<Local>)>,
 }
 
 impl HourBatch {
@@ -186,6 +192,22 @@ pub fn find_deletable_hours(
         .collect())
 }
 
+/// Record in the library's database which screenshots each of `parts` was
+/// encoded from, so the frame source can time a video's frames once the PNGs
+/// are gone. With `only_missing`, a part that already has a record is left
+/// alone.
+pub fn record_frames(root: &Path, parts: &[HourBatch], only_missing: bool) -> rusqlite::Result<()> {
+    let db = ScreenshotDatabase::new(root.join("screenshots.db"))?;
+    for batch in parts {
+        let video = batch.video_name();
+        if only_missing && db.has_video_frames(&video)? {
+            continue;
+        }
+        db.record_video_frames(&video, &batch.day, &batch.captured)?;
+    }
+    Ok(())
+}
+
 /// Delete the PNGs of a converted hour, and return how many went.
 pub fn delete_frames(parts: &[HourBatch]) -> usize {
     let mut deleted = 0;
@@ -272,6 +294,7 @@ fn find_ended_hours(root: &Path, now: DateTime<Local>) -> std::io::Result<Vec<En
                     start: chunk[0].2,
                     part,
                     frames: chunk.iter().map(|(_, path, _)| path.clone()).collect(),
+                    captured: chunk.iter().map(|(number, _, modified)| (*number, *modified)).collect(),
                 })
                 .collect();
             hours.push(EndedHour {
@@ -371,6 +394,11 @@ pub fn convert_batch(
         if published.exists() {
             return Err(ConvertError::Failed(format!("{} already exists", video_name)));
         }
+
+        // Before publishing, so a video never exists without its record.
+        record_frames(root, std::slice::from_ref(batch), false).map_err(|e| {
+            ConvertError::Failed(format!("Failed to record the frames of {}: {}", video_name, e))
+        })?;
         std::fs::rename(&staged_video, &published)
             .map_err(|e| failed("Failed to publish video", e))?;
         Ok(video_name.clone())
@@ -520,6 +548,12 @@ impl Converter {
         match find_deletable_hours(root, now, may_delete) {
             Ok(hours) => {
                 for parts in hours {
+                    // Videos converted before frames were recorded get their
+                    // record here, while the PNGs still say what is in them.
+                    if let Err(e) = record_frames(root, &parts, true) {
+                        eprintln!("Kept the frames of {} {:02}:00: could not record them: {}", parts[0].day, parts[0].hour, e);
+                        continue;
+                    }
                     let deleted = delete_frames(&parts);
                     println!("Deleted {} converted frames from {} {:02}:00", deleted, parts[0].day, parts[0].hour);
                 }
@@ -806,6 +840,83 @@ mod tests {
             fs::read_dir(root.join(".cache")).unwrap().next().is_none(),
             "the staging folder is cleaned up"
         );
+    }
+
+    /// The recorded (day, frame number, local time) of each frame of `video`,
+    /// in video order.
+    fn recorded(root: &Path, video: &str) -> Vec<(String, u32, String)> {
+        let conn = rusqlite::Connection::open(root.join("screenshots.db")).unwrap();
+        let mut statement = conn
+            .prepare("SELECT day, frame_number, local_time FROM video_frames WHERE video = ?1 ORDER BY frame_index")
+            .unwrap();
+        let rows = statement
+            .query_map([video], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        rows
+    }
+
+    #[test]
+    fn converting_records_which_screenshot_each_video_frame_is() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        frame(root, "2026-10-01", 1, at("2026-10-01", 9, 0));
+        frame(root, "2026-10-01", 7, at("2026-10-01", 9, 40));
+        // Frame 1 has a database row, written a moment after its file; frame
+        // 7 has none, so its file time stands in.
+        let captured = at("2026-10-01", 9, 0) + chrono::Duration::milliseconds(300);
+        ScreenshotDatabase::new(root.join("screenshots.db"))
+            .unwrap()
+            .insert_screenshot("2026-10-01", 1, captured.into(), captured)
+            .unwrap();
+        let batch = find_ready_batches(root, at("2026-10-02", 0, 0)).unwrap().remove(0);
+
+        let mut seen = 0;
+        let name = convert_batch(root, &batch, fake_encode(&mut seen)).unwrap();
+
+        assert_eq!(
+            recorded(root, &name),
+            vec![
+                ("2026-10-01".to_string(), 1, captured.to_rfc3339()),
+                ("2026-10-01".to_string(), 7, at("2026-10-01", 9, 40).to_rfc3339()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_failed_encode_records_nothing() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        frame(root, "2026-10-01", 1, at("2026-10-01", 9, 0));
+        let batch = find_ready_batches(root, at("2026-10-02", 0, 0)).unwrap().remove(0);
+
+        let _ = convert_batch(root, &batch, |_, _| Err(ConvertError::Interrupted));
+
+        assert!(!root.join("screenshots.db").exists() || recorded(root, &batch.video_name()).is_empty());
+    }
+
+    #[test]
+    fn records_videos_converted_before_frames_were_recorded() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        frame(root, "2026-10-01", 3, at("2026-10-01", 9, 0));
+        frame(root, "2026-10-01", 4, at("2026-10-01", 9, 1));
+        fs::write(root.join("2026-10-01--09-00-00--hourly.mov"), b"video").unwrap();
+        let hours = find_deletable_hours(root, at("2026-10-02", 0, 0), &always(true)).unwrap();
+
+        record_frames(root, &hours[0], true).unwrap();
+        let numbers: Vec<u32> = recorded(root, "2026-10-01--09-00-00--hourly.mov")
+            .into_iter()
+            .map(|(_, number, _)| number)
+            .collect();
+        assert_eq!(numbers, vec![3, 4]);
+
+        // An existing record is what the video was encoded from; it stays.
+        let mut fewer = hours[0].clone();
+        fewer[0].captured.truncate(1);
+        record_frames(root, &fewer, true).unwrap();
+        assert_eq!(recorded(root, "2026-10-01--09-00-00--hourly.mov").len(), 2);
     }
 
     #[test]

@@ -285,6 +285,60 @@ fn stitches_converted_hours_and_remaining_screenshots_in_time_order() {
 }
 
 #[test]
+fn times_hourly_videos_from_the_frames_the_converter_recorded() {
+    let lib = Library::new();
+    let root = lib.root.path();
+    make_video(&root.join("2026-10-04--09-00-05--hourly.mov"), 3, 0);
+    // The screen was locked from 09:00:06 to 09:40, so one second per frame
+    // would put the last frame at 09:00:07.
+    write_db(root, &[]);
+    let conn = rusqlite::Connection::open(root.join("screenshots.db")).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE video_frames (video TEXT, frame_index INTEGER, day TEXT,
+                                    frame_number INTEGER, local_time TEXT);
+         INSERT INTO video_frames VALUES
+             ('2026-10-04--09-00-05--hourly.mov', 0, '2026-10-04', 1, '2026-10-04T09:00:04.6+02:00'),
+             ('2026-10-04--09-00-05--hourly.mov', 1, '2026-10-04', 2, '2026-10-04T09:00:05.6+02:00'),
+             ('2026-10-04--09-00-05--hourly.mov', 2, '2026-10-04', 4, '2026-10-04T09:40:00.1+02:00');",
+    )
+    .unwrap();
+    let source = lib.source(u64::MAX);
+
+    let time = |index| source.frame_time("2026-10-04", index).unwrap().unwrap();
+    assert_eq!(
+        (time(2).local_time.as_str(), time(2).exact),
+        ("2026-10-04T09:40:00.1+02:00", true)
+    );
+}
+
+#[test]
+fn lines_up_unrecorded_hourly_videos_with_the_database() {
+    let lib = Library::new();
+    let root = lib.root.path();
+    // Converted before frames were recorded. Named after its first frame's
+    // file time; each row is written a moment after its file.
+    make_video(&root.join("2026-10-04--09-00-05--hourly.mov"), 3, 0);
+    write_db(
+        root,
+        &[
+            "2026-10-04T08:59:59.9+02:00", // the hour before
+            "2026-10-04T09:00:05.9+02:00",
+            "2026-10-04T09:00:07.3+02:00",
+            "2026-10-04T09:40:00.1+02:00", // after the screen was locked
+            "2026-10-04T10:00:00.5+02:00", // the next hour
+        ],
+    );
+    let source = lib.source(u64::MAX);
+
+    let time = |index| source.frame_time("2026-10-04", index).unwrap().unwrap();
+    assert_eq!(time(0).local_time, "2026-10-04T09:00:05.9+02:00");
+    assert_eq!(
+        (time(2).local_time.as_str(), time(2).exact),
+        ("2026-10-04T09:40:00.1+02:00", false)
+    );
+}
+
+#[test]
 fn serves_a_fully_converted_day_from_its_hourly_videos() {
     let lib = Library::new();
     make_video(
