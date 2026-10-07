@@ -4,7 +4,7 @@ import { getDay, listDays, type Day } from "../frames";
 import { timelapseRoot } from "../timelapseRoot";
 import { useDirectoryChanges, useLatestLoad } from "./useDirectoryChanges";
 
-function ensureError(val: unknown): Error {
+export function ensureError(val: unknown): Error {
   if (val instanceof Error) {
     return val;
   }
