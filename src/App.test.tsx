@@ -283,14 +283,17 @@ describe('App', () => {
       getPendingFrames.mockResolvedValue({ frameCount: 300, ranges: [{ start: 150, end: 300 }] });
       mockLibrary({ '2026-10-01': 300 }, 'video');
       render(<App />);
-      const slider = screen.getByRole('slider');
-      await waitFor(() => expect(slider.style.background).toContain('linear-gradient'));
+      const stretches = (): NodeListOf<HTMLElement> =>
+        document.querySelectorAll<HTMLElement>('[data-pending-stretch]');
+      await waitFor(() => expect(stretches()).toHaveLength(1));
+      expect(stretches()[0].style.left).toBe('50%');
+      expect(stretches()[0].style.width).toBe('50%');
       expect(getPendingFrames).toHaveBeenCalledWith('2026-10-01');
 
       // Showing a frame decodes its chunk, so the scrubber asks again.
       getPendingFrames.mockResolvedValue({ frameCount: 300, ranges: [] });
       finishLoading();
-      await waitFor(() => expect(slider.style.background).toBe(''));
+      await waitFor(() => expect(stretches()).toHaveLength(0));
       await settleFrameTime();
     });
   });

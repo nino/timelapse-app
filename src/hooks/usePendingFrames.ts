@@ -64,24 +64,3 @@ function frameIndex(url: string, date: string): number | null {
   const index = Number(url.slice(prefix.length));
   return Number.isInteger(index) ? index : null;
 }
-
-/**
- * A background for the scrubber that pales the stretches in `pending`, or
- * undefined when nothing is pending.
- */
-export function pendingTrackBackground(pending: PendingFrames | null): string | undefined {
-  if (!pending || pending.ranges.length === 0 || pending.frameCount === 0) return undefined;
-  const at = (index: number): string =>
-    `${((Math.min(index, pending.frameCount) / pending.frameCount) * 100).toFixed(3)}%`;
-  const stops = pending.ranges.flatMap(({ start, end }) => [
-    `transparent ${at(start)}`,
-    `${PENDING_COLOR} ${at(start)}`,
-    `${PENDING_COLOR} ${at(end)}`,
-    `transparent ${at(end)}`,
-  ]);
-  return `linear-gradient(to right, ${stops.join(", ")})`;
-}
-
-// Opaque white: the track is the gray-200 pill around the slider, so a
-// translucent white is too faint to read against it.
-const PENDING_COLOR = "rgb(255, 255, 255)";

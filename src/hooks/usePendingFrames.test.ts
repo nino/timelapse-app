@@ -4,7 +4,7 @@ import { renderHook, waitFor } from '@testing-library/react';
 
 import { frameUrl, type Day, type PendingFrames } from '../frames';
 import { mocked } from '../test/mocked';
-import { pendingTrackBackground, usePendingFrames } from './usePendingFrames';
+import { usePendingFrames } from './usePendingFrames';
 
 // invoke is replaced with a mock in src/test/setup.ts.
 
@@ -84,29 +84,5 @@ describe('usePendingFrames', () => {
     mocked(invoke).mockReturnValueOnce(new Promise(() => {}));
     rerender({ d: day('2026-10-02', 'mixed') });
     expect(result.current).toBeNull();
-  });
-});
-
-describe('pendingTrackBackground', () => {
-  it('has nothing to draw when everything is ready', () => {
-    expect(pendingTrackBackground(null)).toBeUndefined();
-    expect(pendingTrackBackground({ frameCount: 100, ranges: [] })).toBeUndefined();
-  });
-
-  it('pales each pending stretch in proportion to the day it was measured against', () => {
-    const background = pendingTrackBackground({
-      frameCount: 200,
-      ranges: [
-        { start: 0, end: 50 },
-        { start: 100, end: 200 },
-      ],
-    });
-    expect(background).toBe(
-      'linear-gradient(to right, ' +
-        'transparent 0.000%, rgb(255, 255, 255) 0.000%, ' +
-        'rgb(255, 255, 255) 25.000%, transparent 25.000%, ' +
-        'transparent 50.000%, rgb(255, 255, 255) 50.000%, ' +
-        'rgb(255, 255, 255) 100.000%, transparent 100.000%)',
-    );
   });
 });
