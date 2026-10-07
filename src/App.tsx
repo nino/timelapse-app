@@ -210,8 +210,17 @@ export function App(): React.ReactNode {
   return (
     <main className="h-screen overflow-hidden grid grid-rows-[min-content_1fr_auto] bg-page text-fg">
       {/* On macOS this is also the title bar (tauri.macos.conf.json overlays the
-          traffic lights on it), so it drags the window and leaves room for them. */}
-      <header data-tauri-drag-region className="bg-titlebar px-4 py-2 border-b border-border [[data-platform=macos]_&]:pl-[88px]">
+          traffic lights on it), so it drags the window and leaves room for them.
+          Tauri's drag handler cancels the mousedown, so a click there would no
+          longer take focus away from the find field; blur it by hand. */}
+      <header
+        data-tauri-drag-region
+        onMouseDown={(e): void => {
+          if (e.target instanceof HTMLElement && e.target.hasAttribute("data-tauri-drag-region") && document.activeElement instanceof HTMLElement) {
+            document.activeElement.blur();
+          }
+        }}
+        className="bg-titlebar px-4 py-2 border-b border-border [[data-platform=macos]_&]:pl-[88px]">
         <div data-tauri-drag-region className="flex items-center gap-4">
           <DayPicker days={days} today={today} value={selectedDay} onChange={setSelectedDay} />
 

@@ -435,6 +435,15 @@ describe('App', () => {
       await settleFrameTime();
     });
 
+    it('unfocuses the find bar when the header, which drags the window, is clicked', async () => {
+      mockLibrary({ '2026-10-04': 100 });
+      render(<App />);
+      findBar().focus();
+      fireEvent.mouseDown(screen.getByRole('banner'));
+      expect(document.activeElement).not.toBe(findBar());
+      await settleFrameTime();
+    });
+
     it('outlines the matching lines on the frame the match stands for', async () => {
       mockLibrary({ '2026-10-04': 100 });
       const line = { x: 0.5, y: 0.25, width: 0.25, height: 0.125 };
