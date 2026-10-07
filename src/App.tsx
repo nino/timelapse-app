@@ -247,7 +247,7 @@ export function App(): React.ReactNode {
                 </span>
               )}
             </label>
-            <div className="flex h-9 shrink-0 rounded-xl border border-border bg-card shadow-xs">
+            <div className="flex h-9 shrink-0 rounded-xl border border-border bg-card">
               <button
                 type="button"
                 aria-label="Previous match"
@@ -350,7 +350,7 @@ export function App(): React.ReactNode {
 
       <div className="bg-card px-4 py-3 border-t border-border">
         <div className="flex items-center gap-4">
-          <div className="relative flex-1 bg-track shadow-track p-1 pt-0 rounded-full">
+          <div className="relative flex-1 scrub-track p-1 pt-0 rounded-full">
             <PendingStretches pending={pendingFrames} />
             <MatchMarks stops={stops} frameCount={frameCount} currentIndex={currentIndex} />
             <input
@@ -455,7 +455,7 @@ function OtherDays({
           key={day}
           type="button"
           onClick={() => onPick(day)}
-          className={`flex items-center gap-1.5 px-2.5 py-0.5 bg-card border border-border rounded-full shadow-xs transition-colors hover:bg-muted ${focusRing}`}
+          className={`flex items-center gap-1.5 px-2.5 py-0.5 bg-card border border-border rounded-full transition-colors hover:bg-muted ${focusRing}`}
         >
           {day === today ? "Today" : day}
           <span className="text-muted-fg tabular-nums">{count}</span>
