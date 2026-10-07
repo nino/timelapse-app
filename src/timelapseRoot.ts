@@ -1,3 +1,5 @@
+import { invoke } from "@tauri-apps/api/core";
+
 /**
  * Name of the directory under `$HOME` holding screenshots, rendered videos and
  * the extracted-frame cache.
@@ -12,14 +14,8 @@
  */
 let root: string | null = null;
 
-/**
- * Resolve the root from Rust. Must run before the first render.
- *
- * `invoke` is imported lazily so that merely importing this module does not
- * pull the Tauri bridge into the graph — which keeps it usable from tests.
- */
+/** Resolve the root from Rust. Must run before the first render. */
 export async function initTimelapseRoot(): Promise<void> {
-  const { invoke } = await import("@tauri-apps/api/core");
   root = await invoke<string>("get_timelapse_root_name");
 }
 
