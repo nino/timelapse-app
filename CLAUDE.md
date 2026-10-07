@@ -22,6 +22,8 @@ Tests:
 - `cd src-tauri && cargo test` — Rust unit + Tauri command tests (uses `tempfile` for filesystem isolation). Runs in cloud sessions: the SessionStart hook installs Tauri's Linux libraries and ffmpeg. On a Mac, run `bun run fetch:ffmpeg` once first, because the build needs the bundled ffmpeg (see below)
 - Single Rust test: `cargo test <test_name>` from `src-tauri/`
 
+CI: `.github/workflows/ci.yml` runs on every PR and push to `main`. A Linux job runs lint, `bun run build` (tsc + Vite) and `bun test`; a macOS job fetches the bundled ffmpeg, puts it on `PATH` for the tests, and runs `cargo test --workspace` (the app and `frame_source`). The Rust job builds the frontend first, because `generate_context!` needs `dist/` to exist.
+
 Note: Vite and oxlint run under **Node**; the frontend tests run under the **Bun** runtime via `bun test`. There is no Vitest.
 
 **Frontend test setup.** `bunfig.toml` preloads `src/test/happydom.ts` (registers happy-dom globals; must load first) and then `src/test/setup.ts` (jest-dom matchers, Tauri mocks, `URL.createObjectURL` stubs, `cleanup`). Import test APIs from `bun:test`. Two Bun-specific rules:
