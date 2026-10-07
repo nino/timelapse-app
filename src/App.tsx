@@ -213,11 +213,6 @@ export function App(): React.ReactNode {
         <div className="flex items-center gap-4">
           <DayPicker days={days} today={today} value={selectedDay} onChange={setSelectedDay} />
 
-          {frameCount > 0 && (
-            <span className="text-muted-fg text-sm tabular-nums">
-              Frame {currentIndex + 1} / {frameCount}
-            </span>
-          )}
 
           <div className="ml-auto flex items-center gap-1.5">
             <label className={`${fieldFrame} flex items-center gap-2 w-72 h-9 px-2.5`}>
