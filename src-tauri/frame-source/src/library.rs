@@ -45,15 +45,21 @@ pub struct Shot {
 
 impl Shot {
     /// The clock hour this screenshot belongs to in day folder `day`, the
-    /// same way `converter.rs` decides which hourly video it goes into: by
-    /// its mtime, kept within the folder's date. A screenshot taken just
-    /// before midnight can be written just after it, and still belongs to
-    /// the day's last hour.
+    /// same way `converter.rs` decides which hourly video it goes into.
     pub fn hour(&self, day: NaiveDate) -> NaiveDateTime {
-        let first = day.and_hms_opt(0, 0, 0).expect("midnight exists");
-        let last = day.and_hms_opt(23, 59, 59).expect("23:59:59 exists");
-        truncate_to_hour(self.modified.clamp(first, last))
+        truncate_to_hour(filed_at(self.modified, day))
     }
+}
+
+/// The local time a screenshot in day folder `day` is filed under, by the
+/// converter and here alike: its modification time, kept within the
+/// folder's date. A screenshot taken just before midnight is written into
+/// that day's folder but can land just after midnight, and belongs to the
+/// day's last hour, not its first.
+pub fn filed_at(modified: NaiveDateTime, day: NaiveDate) -> NaiveDateTime {
+    let first = day.and_hms_opt(0, 0, 0).expect("midnight exists");
+    let last = day.and_hms_opt(23, 59, 59).expect("23:59:59 exists");
+    modified.clamp(first, last)
 }
 
 fn truncate_to_hour(time: NaiveDateTime) -> NaiveDateTime {

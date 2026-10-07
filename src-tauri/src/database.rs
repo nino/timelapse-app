@@ -338,6 +338,15 @@ impl ScreenshotDatabase {
         tx.commit()
     }
 
+    /// The frame numbers recorded for `video`, in video order.
+    pub fn video_frame_numbers(&self, video: &str) -> Result<Vec<u32>> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT frame_number FROM video_frames WHERE video = ?1 ORDER BY frame_index")?;
+        let numbers = statement.query_map([video], |row| row.get(0))?.collect();
+        numbers
+    }
+
     /// Whether `record_video_frames` has run for `video`.
     pub fn has_video_frames(&self, video: &str) -> Result<bool> {
         self.conn.query_row(

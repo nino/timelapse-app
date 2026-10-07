@@ -440,6 +440,22 @@ fn reports_video_frames_that_are_not_decoded_yet() {
 }
 
 #[test]
+fn plays_the_parts_of_an_hour_in_order_when_they_start_together() {
+    let lib = Library::new();
+    let root = lib.root.path();
+    // Frames written after midnight are filed at 23:59:59, so every part of
+    // such an hour has the same start.
+    make_video(&root.join("2026-10-04--23-59-59--hourly-2.mov"), 1, 100);
+    make_video(&root.join("2026-10-04--23-59-59--hourly.mov"), 2, 0);
+    let source = lib.source(u64::MAX);
+
+    let scratch = lib.scratch.path();
+    assert_frame(&source, "2026-10-04", 0, 0, scratch);
+    assert_frame(&source, "2026-10-04", 1, LEVEL_STEP, scratch);
+    assert_frame(&source, "2026-10-04", 2, 100, scratch);
+}
+
+#[test]
 fn serves_a_fully_converted_day_from_its_hourly_videos() {
     let lib = Library::new();
     make_video(

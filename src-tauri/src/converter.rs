@@ -27,7 +27,8 @@
 //! run clears.
 
 use crate::database::ScreenshotDatabase;
-use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, Timelike};
+use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, TimeZone, Timelike};
+use frame_source::filed_at;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -160,20 +161,30 @@ fn parse_pmset_power_source(output: &str) -> Option<bool> {
 
 /// Is `name` a day folder name (`YYYY-MM-DD`)?
 pub(crate) fn is_day_folder_name(name: &str) -> bool {
-    name.len() == 10 && NaiveDate::parse_from_str(name, "%Y-%m-%d").is_ok()
+    parse_day_folder_name(name).is_some()
 }
 
-/// The local time a screenshot is filed under: its modification time, kept
-/// within its day folder's date. A screenshot taken just before midnight is
-/// written into that day's folder but can land just after midnight; filed by
-/// its mtime alone it would join the folder's 00:00 hour, and could be taken
-/// for part of that hour's video and deleted without ever being encoded.
-///
-/// `frame_source::library` files screenshots the same way.
-pub(crate) fn filed_at(modified: DateTime<Local>, day: NaiveDate) -> NaiveDateTime {
-    let first = day.and_hms_opt(0, 0, 0).expect("midnight exists");
-    let last = day.and_hms_opt(23, 59, 59).expect("23:59:59 exists");
-    modified.naive_local().clamp(first, last)
+/// The date of a day folder name (`YYYY-MM-DD`).
+fn parse_day_folder_name(name: &str) -> Option<NaiveDate> {
+    if name.len() != 10 {
+        return None;
+    }
+    NaiveDate::parse_from_str(name, "%Y-%m-%d").ok()
+}
+
+/// Whether clock hour `hour` of `date` ended, with `LATE_WRITE_GRACE_SECS`
+/// to spare, by `now`. Measured in real time, so a clock change at the end
+/// of the hour doesn't skip the grace; when the clock goes back, the hour's
+/// end is the later of its two.
+fn hour_has_ended(date: NaiveDate, hour: u32, now: DateTime<Local>) -> bool {
+    let start = date.and_hms_opt(hour, 0, 0).expect("every hour exists as a naive time");
+    let grace = chrono::Duration::seconds(LATE_WRITE_GRACE_SECS);
+    match Local.from_local_datetime(&start).latest() {
+        Some(start) => start + chrono::Duration::hours(1) + grace <= now,
+        // The hour was skipped when the clock went forward: no frame can be
+        // filed in it, but fall back to wall-clock time all the same.
+        None => start + chrono::Duration::hours(1) + grace <= now.naive_local(),
+    }
 }
 
 /// Frame number of a screenshot file name such as `00042.png`.
@@ -235,6 +246,20 @@ pub fn record_frames(root: &Path, parts: &[HourBatch], only_missing: bool) -> ru
     Ok(())
 }
 
+/// Whether each of `parts` holds exactly the frames its video was recorded
+/// with. A frame that joined the hour after its video was made is in no
+/// video, so none of that hour's PNGs may go.
+pub fn matches_record(root: &Path, parts: &[HourBatch]) -> rusqlite::Result<bool> {
+    let db = ScreenshotDatabase::new(root.join("screenshots.db"))?;
+    for batch in parts {
+        let numbers: Vec<u32> = batch.frames.iter().map(|frame| frame.number).collect();
+        if db.video_frame_numbers(&batch.video_name())? != numbers {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// Delete the PNGs of a converted hour, and return how many went.
 pub fn delete_frames(parts: &[HourBatch]) -> usize {
     let mut deleted = 0;
@@ -256,26 +281,26 @@ struct EndedHour {
 }
 
 /// Every hour that has ended, oldest first.
+///
+/// Frames are bucketed by `frame_source::filed_at`: the local hour of their
+/// mtime, kept within the day folder's date. An hour ends a minute after its
+/// last second, so a frame written a moment late still makes it in.
 fn find_ended_hours(root: &Path, now: DateTime<Local>) -> std::io::Result<Vec<EndedHour>> {
     let today = now.format("%Y-%m-%d").to_string();
     let mut hours = Vec::new();
 
-    let mut day_names: Vec<String> = std::fs::read_dir(root)?
+    let mut days: Vec<(String, NaiveDate)> = std::fs::read_dir(root)?
         .filter_map(|entry| entry.ok())
         .filter(|entry| entry.file_type().map(|t| t.is_dir()).unwrap_or(false))
         .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
-        .filter(|name| is_day_folder_name(name))
+        .filter_map(|name| parse_day_folder_name(&name).map(|date| (name, date)))
         .collect();
-    day_names.sort();
+    days.sort();
 
-    for day in day_names {
+    for (day, date) in days {
         let day_dir = root.join(&day);
-        let Ok(date) = NaiveDate::parse_from_str(&day, "%Y-%m-%d") else {
-            continue;
-        };
 
-        // (frame number, path, mtime, filed at) for every screenshot.
-        let mut frames: Vec<(u32, PathBuf, DateTime<Local>, NaiveDateTime)> = Vec::new();
+        let mut frames: Vec<Frame> = Vec::new();
         for entry in std::fs::read_dir(&day_dir)?.filter_map(|entry| entry.ok()) {
             let Some(number) = entry.file_name().to_str().and_then(frame_number) else {
                 continue;
@@ -283,45 +308,41 @@ fn find_ended_hours(root: &Path, now: DateTime<Local>) -> std::io::Result<Vec<En
             let Ok(modified) = entry.metadata().and_then(|m| m.modified()) else {
                 continue;
             };
-            let modified: DateTime<Local> = modified.into();
-            frames.push((number, entry.path(), modified, filed_at(modified, date)));
+            frames.push(Frame {
+                number,
+                path: entry.path(),
+                modified: modified.into(),
+            });
         }
-        frames.sort_by_key(|(number, _, _, _)| *number);
+        frames.sort_by_key(|frame| frame.number);
 
         let todays_newest = if day == today {
-            frames.last().map(|(number, _, _, _)| *number)
+            frames.last().map(|frame| frame.number)
         } else {
             None
         };
 
-        // Keyed by the hour plus the filed time of each frame, in frame order.
-        let mut by_hour: BTreeMap<u32, Vec<(Frame, NaiveDateTime)>> = BTreeMap::new();
-        for (number, path, modified, filed) in frames {
-            by_hour
-                .entry(filed.hour())
-                .or_default()
-                .push((Frame { number, path, modified }, filed));
+        let filed = |frame: &Frame| filed_at(frame.modified.naive_local(), date);
+        let mut by_hour: BTreeMap<u32, Vec<Frame>> = BTreeMap::new();
+        for frame in frames {
+            by_hour.entry(filed(&frame).hour()).or_default().push(frame);
         }
 
         for (hour, hour_frames) in by_hour {
-            let hour_start = date.and_hms_opt(hour, 0, 0).expect("every hour exists as a naive time");
-            let ended = hour_start
-                + chrono::Duration::hours(1)
-                + chrono::Duration::seconds(LATE_WRITE_GRACE_SECS);
-            if ended > now.naive_local() {
+            if !hour_has_ended(date, hour, now) {
                 continue;
             }
             let holds_todays_newest_frame =
-                todays_newest.is_some_and(|newest| hour_frames.iter().any(|(frame, _)| frame.number == newest));
+                todays_newest.is_some_and(|newest| hour_frames.iter().any(|frame| frame.number == newest));
             let parts = hour_frames
                 .chunks(MAX_FRAMES_PER_BATCH)
                 .enumerate()
                 .map(|(part, chunk)| HourBatch {
                     day: day.clone(),
                     hour,
-                    start: chunk[0].1,
+                    start: filed(&chunk[0]),
                     part,
-                    frames: chunk.iter().map(|(frame, _)| frame.clone()).collect(),
+                    frames: chunk.to_vec(),
                 })
                 .collect();
             hours.push(EndedHour {
@@ -337,13 +358,14 @@ fn find_ended_hours(root: &Path, now: DateTime<Local>) -> std::io::Result<Vec<En
 /// Remove day folders that are empty, except today's, which the photographer
 /// is writing into. `all-timelapses-to-video` did the same.
 pub fn remove_empty_day_folders(root: &Path, now: DateTime<Local>) -> std::io::Result<usize> {
-    let today = now.format("%Y-%m-%d").to_string();
     let mut removed = 0;
     for entry in std::fs::read_dir(root)?.filter_map(|entry| entry.ok()) {
-        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+        let Some(date) = entry.file_name().to_str().and_then(parse_day_folder_name) else {
             continue;
         };
-        if !is_day_folder_name(&name) || name == today || !entry.path().is_dir() {
+        // Yesterday's folder can still be about to receive the frame taken
+        // in its last second.
+        if !hour_has_ended(date, 23, now) || !entry.path().is_dir() {
             continue;
         }
         if std::fs::read_dir(entry.path())?.next().is_none() {
@@ -582,6 +604,17 @@ impl Converter {
                     if let Err(e) = record_frames(root, &parts, true) {
                         eprintln!("Kept the frames of {} {:02}:00: could not record them: {}", parts[0].day, parts[0].hour, e);
                         continue;
+                    }
+                    match matches_record(root, &parts) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            eprintln!("Kept the frames of {} {:02}:00: some are not in its video", parts[0].day, parts[0].hour);
+                            continue;
+                        }
+                        Err(e) => {
+                            eprintln!("Kept the frames of {} {:02}:00: could not check its video: {}", parts[0].day, parts[0].hour, e);
+                            continue;
+                        }
                     }
                     let deleted = delete_frames(&parts);
                     println!("Deleted {} converted frames from {} {:02}:00", deleted, parts[0].day, parts[0].hour);
@@ -1081,6 +1114,37 @@ mod tests {
         assert!(root.join("2026-10-04").exists(), "today's folder stays");
         assert!(root.join("2026-10-02").exists(), "folders with frames stay");
         assert!(root.join(".cache").exists());
+    }
+
+    #[test]
+    fn keeps_yesterdays_empty_folder_for_a_minute_after_midnight() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        fs::create_dir_all(root.join("2026-10-01")).unwrap();
+        let just_after = at("2026-10-02", 0, 0) + chrono::Duration::seconds(30);
+
+        assert_eq!(remove_empty_day_folders(root, just_after).unwrap(), 0);
+        assert_eq!(remove_empty_day_folders(root, at("2026-10-02", 0, 1)).unwrap(), 1);
+    }
+
+    #[test]
+    fn a_frame_that_joined_after_conversion_keeps_its_hour() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        frame(root, "2026-10-01", 1, at("2026-10-01", 23, 30));
+        let now = at("2026-10-02", 0, 5);
+        let batch = find_ready_batches(root, now).unwrap().remove(0);
+        let mut seen = 0;
+        convert_batch(root, &batch, fake_encode(&mut seen)).unwrap();
+        let hours = find_deletable_hours(root, now, &always(true)).unwrap();
+        assert!(matches_record(root, &hours[0]).unwrap());
+
+        // Written very late, after its hour was converted.
+        frame(root, "2026-10-01", 2, at("2026-10-02", 0, 3));
+
+        let hours = find_deletable_hours(root, now, &always(true)).unwrap();
+        assert_eq!(hours[0][0].frames.len(), 2);
+        assert!(!matches_record(root, &hours[0]).unwrap());
     }
 
     #[test]
