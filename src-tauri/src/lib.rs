@@ -12,7 +12,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tauri::{Manager, State};
 use database::{OcrHit, ScreenshotDatabase};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use timelapse::Photographer;
 
 // Shared state to manage the timelapse photographer
@@ -343,36 +343,29 @@ struct LineBox {
     height: f64,
 }
 
-/// The fields of an `ocr::OcrLine` that a highlight needs.
-#[derive(Deserialize)]
-struct StoredLine {
-    text: String,
-    x: f64,
-    y: f64,
-    width: f64,
-    height: f64,
-}
-
 /// The lines of OCR'd frame `frame` of `date` holding a word of `query`.
 fn match_lines_impl(root: &Path, date: &str, frame: u32, query: &str) -> Result<Vec<LineBox>, String> {
     let Some(db) = library_db(root)? else {
         return Ok(Vec::new());
     };
-    let Some(lines_json) = db.ocr_lines(date, frame).map_err(|e| e.to_string())? else {
+    let Some((text, boxes)) = db.ocr_lines(date, frame).map_err(|e| e.to_string())? else {
         return Ok(Vec::new());
     };
-    let lines: Vec<StoredLine> = serde_json::from_str(&lines_json).map_err(|e| e.to_string())?;
-    let texts: Vec<&str> = lines.iter().map(|line| line.text.as_str()).collect();
+    let texts: Vec<&str> = text.split('\n').collect();
+    // Line N of the text has box N; a row that lost its boxes has none.
+    if texts.len() != boxes.len() {
+        return Ok(Vec::new());
+    }
     let matching = database::lines_matching(&texts, query).map_err(|e| e.to_string())?;
     // Vision's boxes have their origin at the bottom-left.
     Ok(matching
         .into_iter()
-        .map(|i| &lines[i])
-        .map(|line| LineBox {
-            x: line.x,
-            y: 1.0 - line.y - line.height,
-            width: line.width,
-            height: line.height,
+        .map(|i| boxes[i])
+        .map(|[x, y, width, height]| LineBox {
+            x,
+            y: 1.0 - y - height,
+            width,
+            height,
         })
         .collect())
 }
@@ -564,9 +557,9 @@ pub fn run() {
                 // own yet.
                 match paths::timelapse_root() {
                     Some(root) => {
-                        converter::Converter::with_delete_check(
+                        converter::Converter::with_ocr_check(
                             root.clone(),
-                            ocr::delete_check(&root),
+                            ocr::ocr_check(&root),
                         )
                         .start();
 
@@ -956,11 +949,11 @@ mod tests {
             fs::write(day_dir.join(format!("{n:05}.png")), b"png").unwrap();
         }
         let db = ScreenshotDatabase::new(library.path().join("screenshots.db")).unwrap();
-        db.record_ocr_frame("2026-10-04", 2, Some(("cargo build", "[]"))).unwrap();
+        db.record_ocr_frame("2026-10-04", 2, Some(("cargo build", &[]))).unwrap();
         db.record_ocr_frame("2026-10-04", 3, None).unwrap();
-        db.record_ocr_frame("2026-10-04", 4, Some(("cargo check", "[]"))).unwrap();
-        db.record_ocr_frame("2026-10-04", 5, Some(("bun test", "[]"))).unwrap();
-        db.record_ocr_frame("2026-10-04", 6, Some(("cargo test", "[]"))).unwrap();
+        db.record_ocr_frame("2026-10-04", 4, Some(("cargo check", &[]))).unwrap();
+        db.record_ocr_frame("2026-10-04", 5, Some(("bun test", &[]))).unwrap();
+        db.record_ocr_frame("2026-10-04", 6, Some(("cargo test", &[]))).unwrap();
         db.record_ocr_frame("2026-10-04", 7, None).unwrap();
         let (_cache, source) = frame_source_in(library.path());
 
@@ -997,16 +990,16 @@ mod tests {
     fn test_match_lines_flips_vision_boxes() {
         let library = TempDir::new().unwrap();
         let db = ScreenshotDatabase::new(library.path().join("screenshots.db")).unwrap();
-        let lines = r#"[
-            {"text": "$ Cargo build", "confidence": 1.0, "x": 0.125, "y": 0.5, "width": 0.5, "height": 0.25},
-            {"text": "Finished", "confidence": 1.0, "x": 0.0, "y": 0.0, "width": 1.0, "height": 0.1}
-        ]"#;
-        db.record_ocr_frame("2026-10-04", 2, Some(("$ Cargo build\nFinished", lines))).unwrap();
+        let boxes = [[0.125, 0.5, 0.5, 0.25], [0.0, 0.0, 1.0, 0.1]];
+        db.record_ocr_frame("2026-10-04", 2, Some(("$ Cargo build\nFinished", &boxes))).unwrap();
 
-        assert_eq!(
-            match_lines_impl(library.path(), "2026-10-04", 2, "cargo").unwrap(),
-            vec![LineBox { x: 0.125, y: 0.25, width: 0.5, height: 0.25 }]
-        );
+        let found = match_lines_impl(library.path(), "2026-10-04", 2, "cargo").unwrap();
+        assert_eq!(found.len(), 1);
+        // Stored to a 65535th, so compare to well under a pixel.
+        let LineBox { x, y, width, height } = found[0];
+        for (got, want) in [(x, 0.125), (y, 0.25), (width, 0.5), (height, 0.25)] {
+            assert!((got - want).abs() < 1e-4, "{got} vs {want}");
+        }
         assert!(match_lines_impl(library.path(), "2026-10-04", 3, "cargo").unwrap().is_empty());
     }
 
@@ -1014,7 +1007,7 @@ mod tests {
     fn test_count_ocr_matches_reads_the_library_database() {
         let temp_dir = TempDir::new().unwrap();
         let db = ScreenshotDatabase::new(temp_dir.path().join("screenshots.db")).unwrap();
-        db.record_ocr_frame("2024-01-01", 4, Some(("cargo test", "[]"))).unwrap();
+        db.record_ocr_frame("2024-01-01", 4, Some(("cargo test", &[]))).unwrap();
 
         assert_eq!(
             count_ocr_matches_impl(temp_dir.path(), "cargo").unwrap(),
@@ -1026,7 +1019,7 @@ mod tests {
     fn test_search_ocr_reads_the_library_database() {
         let temp_dir = TempDir::new().unwrap();
         let db = ScreenshotDatabase::new(temp_dir.path().join("screenshots.db")).unwrap();
-        db.record_ocr_frame("2024-01-01", 4, Some(("cargo test", "[]"))).unwrap();
+        db.record_ocr_frame("2024-01-01", 4, Some(("cargo test", &[]))).unwrap();
 
         let hits = search_ocr_impl(temp_dir.path(), "cargo", 10).unwrap();
         assert_eq!(hits.len(), 1);

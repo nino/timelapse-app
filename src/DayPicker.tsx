@@ -26,7 +26,7 @@ export function DayPicker({
     <Listbox value={value} onChange={(date: string | null) => date && onChange(date)}>
       <ListboxButton
         aria-label="Day"
-        className={`flex h-9 items-center gap-3 rounded-2xl border border-input bg-field pr-3 pl-3.5 text-sm font-medium tabular-nums shadow-xs ${focusRing}`}
+        className={`flex h-7.5 items-center gap-3 rounded-full border border-input bg-field pr-3.5 pl-4 text-sm font-medium tabular-nums ${focusRing}`}
       >
         {value === null ? <span className="text-muted-fg">Select a day…</span> : label(value)}
         <Chevron />
@@ -36,14 +36,12 @@ export function DayPicker({
         className="z-10 max-h-96 min-w-(--button-width) overflow-y-auto rounded-2xl border border-border bg-card p-1 text-sm text-fg tabular-nums shadow-md outline-none"
       >
         {/* Options are concentric with the list: 16px minus the 1px border
-            and 4px padding. A plain rounded-[11px] rather than rounded-xl,
-            which App.css turns into a squircle that reads much tighter than
-            the list's round corners. */}
+            and 4px padding. */}
         {[...days].reverse().map((date) => (
           <ListboxOption
             key={date}
             value={date}
-            className="flex h-8 cursor-default items-center justify-between gap-3 rounded-[11px] px-2.5 select-none data-focus:bg-muted data-selected:font-semibold"
+            className="flex h-7 cursor-default items-center justify-between gap-3 rounded-[11px] px-2.5 select-none data-focus:bg-muted data-selected:font-semibold"
           >
             {label(date)}
             <Check />

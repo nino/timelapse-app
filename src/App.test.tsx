@@ -427,11 +427,44 @@ describe('App', () => {
       await settleFrameTime();
     });
 
+    it('opens the previous and next day on Cmd+Left and Cmd+Right', async () => {
+      mockLibrary({ '2026-10-03': 5, '2026-10-04': 100 });
+      render(<App />);
+      await waitFor(() => expect(dayPicker()).toHaveTextContent('2026-10-04'));
+      fireEvent.keyDown(window, { key: 'ArrowLeft', metaKey: true });
+      await waitFor(() => expect(dayPicker()).toHaveTextContent('2026-10-03'));
+      expect(position()).toBe('5 / 5');
+      // The oldest day has nothing before it.
+      fireEvent.keyDown(window, { key: 'ArrowLeft', metaKey: true });
+      expect(dayPicker()).toHaveTextContent('2026-10-03');
+      fireEvent.keyDown(window, { key: 'ArrowRight', metaKey: true });
+      await waitFor(() => expect(dayPicker()).toHaveTextContent('2026-10-04'));
+      await settleFrameTime();
+    });
+
+    it('leaves Cmd+Left to the find bar while it has focus', async () => {
+      mockLibrary({ '2026-10-03': 5, '2026-10-04': 100 });
+      render(<App />);
+      await waitFor(() => expect(dayPicker()).toHaveTextContent('2026-10-04'));
+      fireEvent.keyDown(findBar(), { key: 'ArrowLeft', metaKey: true });
+      expect(dayPicker()).toHaveTextContent('2026-10-04');
+      await settleFrameTime();
+    });
+
     it('focuses the find bar on Cmd+F', async () => {
       mockLibrary({ '2026-10-04': 100 });
       render(<App />);
       fireEvent.keyDown(window, { key: 'f', metaKey: true });
       expect(document.activeElement).toBe(findBar());
+      await settleFrameTime();
+    });
+
+    it('unfocuses the find bar when the header, which drags the window, is clicked', async () => {
+      mockLibrary({ '2026-10-04': 100 });
+      render(<App />);
+      findBar().focus();
+      fireEvent.mouseDown(screen.getByRole('banner'));
+      expect(document.activeElement).not.toBe(findBar());
       await settleFrameTime();
     });
 

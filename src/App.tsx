@@ -13,7 +13,7 @@ import {
 import { usePendingFrames } from "./hooks/usePendingFrames";
 import { PendingStretches } from "./PendingStretches";
 import { nextStop, previousStop, rangeAt, toStops, type DayMatch, type Stop } from "./search";
-import { fieldFrame, focusRing, outlineButton } from "./ui";
+import { fieldFrame, focusRing, segmentButton } from "./ui";
 
 // How many other days the find bar names before folding the rest away.
 const OTHER_DAYS_SHOWN = 4;
@@ -136,10 +136,10 @@ export function App(): React.ReactNode {
     return (): void => window.removeEventListener("keydown", handleKeydown);
   }, []);
 
-  // Keyboard: ←/→ by 1, Shift by 10, Option by 100.
+  // Keyboard: ←/→ by 1, Shift by 10, Option by 100; ⌘←/⌘→ (Ctrl elsewhere)
+  // to the previous/next day.
   React.useEffect(() => {
     const handleKeydown = (e: KeyboardEvent): void => {
-      if (frameCount === 0) return;
       if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
       // Leave the day picker alone, open or closed.
       if (
@@ -150,15 +150,24 @@ export function App(): React.ReactNode {
       }
       // In the find bar they move the caret.
       if (e.target instanceof HTMLInputElement && e.target.type !== "range") return;
+      const direction = e.key === "ArrowLeft" ? -1 : 1;
+      if (e.metaKey || e.ctrlKey) {
+        e.preventDefault();
+        // `days` runs oldest to newest.
+        const at = selectedDay === null ? -1 : days.indexOf(selectedDay);
+        const next = at === -1 ? undefined : days[at + direction];
+        if (next !== undefined) setSelectedDay(next);
+        return;
+      }
+      if (frameCount === 0) return;
       // Also stops a focused slider from taking its own 1-frame step on top.
       e.preventDefault();
       const step = e.altKey ? 100 : e.shiftKey ? 10 : 1;
-      const direction = e.key === "ArrowLeft" ? -1 : 1;
       goTo(Math.min(frameCount - 1, Math.max(0, currentIndex + direction * step)));
     };
     window.addEventListener("keydown", handleKeydown);
     return (): void => window.removeEventListener("keydown", handleKeydown);
-  }, [frameCount, currentIndex, goTo]);
+  }, [days, selectedDay, frameCount, currentIndex, goTo]);
 
   const wantedSrc =
     selectedDay && frameCount > 0 ? frameUrl(selectedDay, currentIndex) : null;
@@ -209,13 +218,24 @@ export function App(): React.ReactNode {
 
   return (
     <main className="h-screen overflow-hidden grid grid-rows-[min-content_1fr_auto] bg-page text-fg">
-      <header className="bg-card px-4 py-2.5 border-b border-border">
-        <div className="flex items-center gap-4">
+      {/* On macOS this is also the title bar (tauri.macos.conf.json overlays the
+          traffic lights on it), so it drags the window and leaves room for them.
+          Tauri's drag handler cancels the mousedown, so a click there would no
+          longer take focus away from the find field; blur it by hand. */}
+      <header
+        data-tauri-drag-region
+        onMouseDown={(e): void => {
+          if (e.target instanceof HTMLElement && e.target.hasAttribute("data-tauri-drag-region") && document.activeElement instanceof HTMLElement) {
+            document.activeElement.blur();
+          }
+        }}
+        className="bg-titlebar px-4 py-2 border-b border-border [[data-platform=macos]_&]:pl-[88px]">
+        <div data-tauri-drag-region className="flex items-center gap-4">
           <DayPicker days={days} today={today} value={selectedDay} onChange={setSelectedDay} />
 
 
-          <div className="ml-auto flex items-center gap-1.5">
-            <label className={`${fieldFrame} flex items-center gap-2 w-72 h-9 px-2.5`}>
+          <div data-tauri-drag-region className="ml-auto flex items-center gap-1.5">
+            <label className={`${fieldFrame} flex items-center gap-2 w-72 h-7.5 px-2.5`}>
               <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true" className="shrink-0 text-muted-fg">
                 <circle cx="11" cy="11" r="7" />
                 <path d="m20 20-3.5-3.5" />
@@ -247,30 +267,32 @@ export function App(): React.ReactNode {
                 </span>
               )}
             </label>
-            <button
-              type="button"
-              aria-label="Previous match"
-              title="Previous match (Shift+Enter)"
-              disabled={stops.length === 0}
-              onClick={() => stepToMatch(-1)}
-              className={`${outlineButton} size-9`}
-            >
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
-                <path d="m15 18-6-6 6-6" />
-              </svg>
-            </button>
-            <button
-              type="button"
-              aria-label="Next match"
-              title="Next match (Enter)"
-              disabled={stops.length === 0}
-              onClick={() => stepToMatch(1)}
-              className={`${outlineButton} size-9`}
-            >
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
-                <path d="m9 18 6-6-6-6" />
-              </svg>
-            </button>
+            <div className="flex h-7.5 shrink-0 rounded-xl border border-border bg-card">
+              <button
+                type="button"
+                aria-label="Previous match"
+                title="Previous match (Shift+Enter)"
+                disabled={stops.length === 0}
+                onClick={() => stepToMatch(-1)}
+                className={`${segmentButton} rounded-l-[11px]`}
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+                  <path d="m15 18-6-6 6-6" />
+                </svg>
+              </button>
+              <button
+                type="button"
+                aria-label="Next match"
+                title="Next match (Enter)"
+                disabled={stops.length === 0}
+                onClick={() => stepToMatch(1)}
+                className={`${segmentButton} rounded-r-[11px] border-l border-border`}
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+                  <path d="m9 18 6-6-6-6" />
+                </svg>
+              </button>
+            </div>
           </div>
         </div>
 
@@ -348,7 +370,7 @@ export function App(): React.ReactNode {
 
       <div className="bg-card px-4 py-3 border-t border-border">
         <div className="flex items-center gap-4">
-          <div className="relative flex-1 bg-border p-1 pt-0 rounded-full">
+          <div className="relative flex-1 scrub-track p-1 pt-0 rounded-full">
             <PendingStretches pending={pendingFrames} />
             <MatchMarks stops={stops} frameCount={frameCount} currentIndex={currentIndex} />
             <input
@@ -407,9 +429,9 @@ function MatchMarks({
   return (
     <div
       data-testid="match-marks"
-      // Inset by the track's padding (4px) plus half the 20px thumb, the
-      // range the thumb's centre moves over.
-      className="absolute left-[14px] right-[14px] -top-3 h-3 pointer-events-none"
+      // Inset by the track's padding (4px) plus half the 6px playhead, the
+      // range the playhead's centre moves over.
+      className="absolute left-[7px] right-[7px] -top-3 h-3 pointer-events-none"
       aria-hidden="true"
     >
       {stops.map((stop, i) => (
@@ -453,7 +475,7 @@ function OtherDays({
           key={day}
           type="button"
           onClick={() => onPick(day)}
-          className={`flex items-center gap-1.5 px-2.5 py-0.5 bg-card border border-border rounded-full shadow-xs transition-colors hover:bg-muted ${focusRing}`}
+          className={`flex items-center gap-1.5 px-2.5 py-0.5 bg-card border border-border rounded-full transition-colors hover:bg-muted ${focusRing}`}
         >
           {day === today ? "Today" : day}
           <span className="text-muted-fg tabular-nums">{count}</span>

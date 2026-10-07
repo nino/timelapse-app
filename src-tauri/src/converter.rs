@@ -2,16 +2,14 @@
 //!
 //! This replaces the `all-timelapses-to-video` / `timelapse-to-video` scripts,
 //! which encoded whole days at once. Here the unit of work is one clock hour of
-//! screenshots, and one batch runs at a time, starting at most once every
-//! half hour, so a backlog (say, after a stretch on battery) is worked off at
-//! a steady two hours of screenshots per hour of AC power. Nothing is encoded unless
-//! the machine is on AC power, and an encode in progress is killed if the
-//! power is unplugged.
+//! screenshots. An hour is converted only once it has ended and OCR has read
+//! all of it, and one batch runs at a time, starting at most once every ten
+//! minutes, so a backlog (say, after a stretch on battery) is worked off
+//! quickly once OCR has caught up. Nothing is encoded unless the machine is on
+//! AC power, and an encode in progress is killed if the power is unplugged.
 //!
-//! An hour whose video exists counts as converted. Its PNGs are deleted, as
-//! the scripts did, but only once `DeleteCheck` agrees: the PNGs have to be
-//! read by OCR first, and nothing marks that yet, so for now the default check
-//! keeps every PNG.
+//! An hour whose video exists counts as converted. Its PNGs are then deleted,
+//! as the scripts did, once `OcrCheck` still agrees that OCR has read them.
 //!
 //! A batch is converted like this:
 //! 1. Hard-link its PNGs into `.cache/.convert-<video>/` as a gapless
@@ -50,10 +48,10 @@ const MAX_FRAMES_PER_BATCH: usize = 3600;
 /// is converted a late frame would be deleted without being in the video.
 const LATE_WRITE_GRACE_SECS: i64 = 60;
 
-/// How often a batch may start. When the converter is behind, the next batch
+/// How often a batch may start. When more hours are ready, the next batch
 /// starts this long after the previous one started; an encode that takes
 /// longer than this is followed by the next one straight away.
-const BATCH_INTERVAL: Duration = Duration::from_secs(30 * 60);
+const BATCH_INTERVAL: Duration = Duration::from_secs(10 * 60);
 
 /// How long to wait before looking again when there is nothing to convert.
 const IDLE_POLL: Duration = Duration::from_secs(5 * 60);
@@ -67,9 +65,10 @@ const ENCODE_POWER_CHECK: Duration = Duration::from_secs(30);
 /// Prefix of the staging folders under `.cache`.
 const STAGING_PREFIX: &str = ".convert-";
 
-/// Decides whether a converted batch's PNGs may be deleted. Every part of an
-/// hour has to pass before any of that hour's PNGs go.
-pub type DeleteCheck = Arc<dyn Fn(&HourBatch) -> bool + Send + Sync>;
+/// Decides whether OCR has read every PNG of a batch. A batch is converted
+/// only once it passes, and a converted hour's PNGs are deleted only once
+/// every part of it passes.
+pub type OcrCheck = Arc<dyn Fn(&HourBatch) -> bool + Send + Sync>;
 
 /// One clock hour of screenshots from one day folder.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -207,18 +206,25 @@ pub fn find_ready_batches(root: &Path, now: DateTime<Local>) -> std::io::Result<
         .collect())
 }
 
+/// The oldest batch that is ready to convert and that OCR has read in full.
+/// Hours OCR has not finished wait, so the video is only made once the text
+/// has been read from the full-quality PNGs.
+pub fn next_batch(root: &Path, now: DateTime<Local>, ocr_done: &OcrCheck) -> std::io::Result<Option<HourBatch>> {
+    Ok(find_ready_batches(root, now)?.into_iter().find(|batch| ocr_done(batch)))
+}
+
 /// Find every hour whose PNGs may be deleted, oldest first, as the batches
 /// that make it up.
 ///
 /// That is an hour that has ended, has a video for every part, and passes
-/// `may_delete` for every part. In today's folder the hour holding the
+/// `ocr_done` for every part. In today's folder the hour holding the
 /// highest-numbered frame is kept regardless: `next_filename` numbers new
 /// screenshots as `max + 1`, so deleting the newest frame would restart
 /// today's numbering at `00001`.
 pub fn find_deletable_hours(
     root: &Path,
     now: DateTime<Local>,
-    may_delete: &DeleteCheck,
+    ocr_done: &OcrCheck,
 ) -> std::io::Result<Vec<Vec<HourBatch>>> {
     Ok(find_ended_hours(root, now)?
         .into_iter()
@@ -226,7 +232,7 @@ pub fn find_deletable_hours(
         .filter(|hour| {
             hour.parts
                 .iter()
-                .all(|batch| root.join(batch.video_name()).exists() && may_delete(batch))
+                .all(|batch| root.join(batch.video_name()).exists() && ocr_done(batch))
         })
         .map(|hour| hour.parts)
         .collect())
@@ -549,15 +555,15 @@ fn encode_with_ffmpeg(frames_dir: &Path, output: &Path, running: &AtomicBool) ->
 pub struct Converter {
     root: PathBuf,
     running: Arc<AtomicBool>,
-    may_delete: DeleteCheck,
+    ocr_done: OcrCheck,
 }
 
 impl Converter {
-    pub fn with_delete_check(root: PathBuf, may_delete: DeleteCheck) -> Self {
+    pub fn with_ocr_check(root: PathBuf, ocr_done: OcrCheck) -> Self {
         Converter {
             root,
             running: Arc::new(AtomicBool::new(false)),
-            may_delete,
+            ocr_done,
         }
     }
 
@@ -568,7 +574,7 @@ impl Converter {
         self.running.store(true, Ordering::SeqCst);
         let root = self.root.clone();
         let running = Arc::clone(&self.running);
-        let may_delete = Arc::clone(&self.may_delete);
+        let ocr_done = Arc::clone(&self.ocr_done);
 
         tokio::spawn(async move {
             println!("Starting video conversion background task...");
@@ -577,7 +583,7 @@ impl Converter {
             }
 
             while running.load(Ordering::SeqCst) {
-                let wait = Self::run_once(&root, &running, &may_delete).await;
+                let wait = Self::run_once(&root, &running, &ocr_done).await;
                 tokio::time::sleep(wait).await;
             }
 
@@ -595,11 +601,11 @@ impl Converter {
 
     /// Delete the PNGs of every hour that may go, convert at most one batch,
     /// and return how long to wait before the next attempt.
-    async fn run_once(root: &Path, running: &Arc<AtomicBool>, may_delete: &DeleteCheck) -> Duration {
+    async fn run_once(root: &Path, running: &Arc<AtomicBool>, ocr_done: &OcrCheck) -> Duration {
         let now = Local::now();
 
         // Deleting is cheap, so it does not wait for AC power.
-        match find_deletable_hours(root, now, may_delete) {
+        match find_deletable_hours(root, now, ocr_done) {
             Ok(hours) => {
                 for parts in hours {
                     // Videos converted before frames were recorded get their
@@ -633,15 +639,13 @@ impl Converter {
             return ON_BATTERY_POLL;
         }
 
-        let batches = match find_ready_batches(root, now) {
-            Ok(batches) => batches,
+        let batch = match next_batch(root, now, ocr_done) {
+            Ok(Some(batch)) => batch,
+            Ok(None) => return IDLE_POLL,
             Err(e) => {
                 eprintln!("Failed to scan for screenshots to convert: {}", e);
                 return IDLE_POLL;
             }
-        };
-        let Some(batch) = batches.into_iter().next() else {
-            return IDLE_POLL;
         };
 
         println!(
@@ -832,7 +836,7 @@ mod tests {
         assert!(find_deletable_hours(root, now, &always(true)).unwrap().is_empty());
     }
 
-    fn always(answer: bool) -> DeleteCheck {
+    fn always(answer: bool) -> OcrCheck {
         Arc::new(move |_| answer)
     }
 
@@ -1173,12 +1177,39 @@ mod tests {
     }
 
     #[test]
-    fn batches_start_every_half_hour_while_behind() {
+    fn batches_start_every_ten_minutes_while_behind() {
         let minutes = |m: u64| Duration::from_secs(m * 60);
-        assert_eq!(rest_after(minutes(12)), minutes(18));
-        assert_eq!(rest_after(Duration::ZERO), minutes(30));
-        assert_eq!(rest_after(minutes(30)), Duration::ZERO);
-        assert_eq!(rest_after(minutes(45)), Duration::ZERO);
+        assert_eq!(rest_after(minutes(4)), minutes(6));
+        assert_eq!(rest_after(Duration::ZERO), minutes(10));
+        assert_eq!(rest_after(minutes(10)), Duration::ZERO);
+        assert_eq!(rest_after(minutes(25)), Duration::ZERO);
+    }
+
+    #[test]
+    fn converts_only_hours_ocr_has_read() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        frame(root, "2026-10-01", 1, at("2026-10-01", 8, 0));
+        frame(root, "2026-10-01", 2, at("2026-10-01", 9, 0));
+        frame(root, "2026-10-01", 3, at("2026-10-01", 10, 0));
+        let now = at("2026-10-02", 0, 0);
+
+        assert_eq!(next_batch(root, now, &always(false)).unwrap(), None);
+
+        let read_through = |last: u32| -> OcrCheck {
+            Arc::new(move |batch: &HourBatch| batch.frames.iter().all(|f| f.number <= last))
+        };
+        assert_eq!(next_batch(root, now, &read_through(2)).unwrap().unwrap().hour, 8);
+
+        fs::write(root.join("2026-10-01--08-00-00--hourly.mov"), b"video").unwrap();
+        assert_eq!(next_batch(root, now, &read_through(2)).unwrap().unwrap().hour, 9);
+
+        fs::write(root.join("2026-10-01--09-00-00--hourly.mov"), b"video").unwrap();
+        assert_eq!(
+            next_batch(root, now, &read_through(2)).unwrap(),
+            None,
+            "10:00 waits for OCR"
+        );
     }
 
     #[test]
