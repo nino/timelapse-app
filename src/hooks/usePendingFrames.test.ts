@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, mock } from 'bun:test';
 import { invoke } from '@tauri-apps/api/core';
-import { renderHook, waitFor } from '@testing-library/react';
+import { listen, type EventCallback } from '@tauri-apps/api/event';
+import { act, renderHook, waitFor } from '@testing-library/react';
 
 import { frameUrl, type Day, type PendingFrames } from '../frames';
 import { mocked } from '../test/mocked';
@@ -40,6 +41,30 @@ describe('usePendingFrames', () => {
     rerender({ loaded: frameUrl('2026-10-01', 20) });
     await waitFor(() => expect(result.current).toEqual(pending()));
     expect(invoke).toHaveBeenCalledTimes(2);
+  });
+
+  it('asks again when read-ahead decodes part of the day', async () => {
+    let decoded: EventCallback<string> = () => {};
+    const unlisten = mock((): void => {});
+    mocked(listen).mockImplementationOnce((_event, handler) => {
+      decoded = handler as EventCallback<string>;
+      return Promise.resolve(unlisten);
+    });
+    mocked(invoke).mockResolvedValueOnce(pending([0, 300]));
+    const { result, unmount } = renderHook(() => usePendingFrames(day('2026-10-01', 'video'), null));
+    await waitFor(() => expect(result.current).toEqual(pending([0, 300])));
+    expect(listen).toHaveBeenCalledWith('frames-decoded', expect.any(Function));
+
+    // Another day's decode changes nothing here.
+    decoded({ event: 'frames-decoded', id: 1, payload: '2026-09-30' });
+    expect(invoke).toHaveBeenCalledTimes(1);
+
+    mocked(invoke).mockResolvedValueOnce(pending([0, 150]));
+    act(() => decoded({ event: 'frames-decoded', id: 2, payload: '2026-10-01' }));
+    await waitFor(() => expect(result.current).toEqual(pending([0, 150])));
+
+    unmount();
+    expect(unlisten).toHaveBeenCalled();
   });
 
   it('asks again when the day grows', async () => {

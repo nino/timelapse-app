@@ -12,7 +12,7 @@ use tauri::http::{header, Response, StatusCode};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tauri::menu::{Menu, MenuItem, MenuItemKind, PredefinedMenuItem, WINDOW_SUBMENU_ID};
-use tauri::{AppHandle, Manager, Runtime, State, WebviewUrl, WebviewWindowBuilder};
+use tauri::{AppHandle, Emitter, Manager, Runtime, State, WebviewUrl, WebviewWindowBuilder};
 use activity::{Activity, Snapshot};
 use database::{OcrHit, ScreenshotDatabase};
 use serde::Serialize;
@@ -34,6 +34,9 @@ const ACTIVITY_WINDOW: &str = "activity";
 /// Decoded video frames are disposable, so the cache lives in the OS cache
 /// directory rather than in the (possibly synced) library.
 const FRAME_CACHE_CAP_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Event sent with a day's date when read-ahead has decoded a chunk of it.
+const FRAMES_DECODED: &str = "frames-decoded";
 
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 #[tauri::command]
@@ -584,6 +587,16 @@ pub fn run() {
                             let dir = dir.join(paths::TIMELAPSE_DIR_NAME).join("frames");
                             FrameSource::new(root, dir, FRAME_CACHE_CAP_BYTES, Tools::new(paths::ffmpeg()))
                                 .map_err(|e| e.to_string())
+                        })
+                        .map(|source| {
+                            // Tell the viewer, so the scrubber stops drawing
+                            // the read-ahead stretch as not decoded yet.
+                            let app = app.handle().clone();
+                            source.read_ahead(move |date| {
+                                if let Err(e) = app.emit(FRAMES_DECODED, date) {
+                                    eprintln!("Could not report decoded frames: {}", e);
+                                }
+                            })
                         });
                     match source {
                         Ok(source) => {

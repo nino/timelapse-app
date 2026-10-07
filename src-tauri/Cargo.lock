@@ -1318,6 +1318,7 @@ name = "frame_source"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "libc",
  "rusqlite",
  "serde",
  "tempfile",
