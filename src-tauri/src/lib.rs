@@ -4,7 +4,7 @@ mod database;
 mod ocr;
 mod paths;
 
-use frame_source::{DaySummary, FrameSource, FrameTime, Tools};
+use frame_source::{DaySummary, FrameRange, FrameSource, FrameTime, Tools};
 use tauri::http::{header, Response, StatusCode};
 
 use std::path::Path;
@@ -174,6 +174,15 @@ async fn get_frame_time(
     index: usize,
 ) -> Result<Option<FrameTime>, String> {
     with_frame_source(source.inner(), move |s| s.frame_time(&date, index)).await
+}
+
+/// Frame ranges of `date` that still have to be decoded from video.
+#[tauri::command]
+async fn get_pending_frames(
+    source: State<'_, FrameSourceState>,
+    date: String,
+) -> Result<Vec<FrameRange>, String> {
+    with_frame_source(source.inner(), move |s| s.pending(&date)).await
 }
 
 /// The response for a `frames://localhost/<YYYY-MM-DD>/<index>` request.
@@ -404,6 +413,7 @@ pub fn run() {
             list_days,
             get_day,
             get_frame_time,
+            get_pending_frames,
             search_ocr
         ])
         .run(tauri::generate_context!())

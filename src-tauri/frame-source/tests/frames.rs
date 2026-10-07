@@ -6,7 +6,7 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
-use frame_source::{FrameSource, Source, Tools, CHUNK_FRAMES};
+use frame_source::{FrameRange, FrameSource, Source, Tools, CHUNK_FRAMES};
 use tempfile::TempDir;
 
 const LEVEL_STEP: usize = 4;
@@ -281,6 +281,44 @@ fn stitches_converted_hours_and_remaining_screenshots_in_time_order() {
     assert_eq!(
         (time(6).local_time.as_str(), time(6).exact),
         ("2026-10-04T10:00:01", true)
+    );
+}
+
+#[test]
+fn reports_video_frames_that_are_not_decoded_yet() {
+    let lib = Library::new();
+    let root = lib.root.path();
+    let day_dir = root.join("2026-10-04");
+    fs::create_dir(&day_dir).unwrap();
+    // 09:00 is video, two chunks and a bit; 10:00 is still screenshots.
+    let long = 2 * CHUNK_FRAMES + 10;
+    make_video(&root.join("2026-10-04--09-00-00--hourly.mov"), long, 0);
+    write_shot(&day_dir, "03601.png", b"ten", "2026-10-04 10:00:00");
+    make_video(&root.join("2026-10-04--11-00-00--hourly.mov"), 5, 0);
+    let source = lib.source(u64::MAX);
+    let range = |start, end| FrameRange { start, end };
+
+    // Nothing decoded: both videos are pending, the screenshot between them isn't.
+    assert_eq!(
+        source.pending("2026-10-04").unwrap(),
+        vec![range(0, long), range(long + 1, long + 6)]
+    );
+
+    // Showing a frame decodes its whole chunk.
+    source.frame("2026-10-04", CHUNK_FRAMES + 3).unwrap();
+    assert_eq!(
+        source.pending("2026-10-04").unwrap(),
+        vec![
+            range(0, CHUNK_FRAMES),
+            range(2 * CHUNK_FRAMES, long),
+            range(long + 1, long + 6),
+        ]
+    );
+
+    source.frame("2026-10-04", long + 1).unwrap();
+    assert_eq!(
+        source.pending("2026-10-04").unwrap(),
+        vec![range(0, CHUNK_FRAMES), range(2 * CHUNK_FRAMES, long)]
     );
 }
 

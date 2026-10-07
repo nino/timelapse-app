@@ -16,6 +16,12 @@ export type FrameTime = {
   exact: boolean;
 };
 
+/** Day-wide frame indices `start..end` (end exclusive). Mirrors `FrameRange` in Rust. */
+export type FrameRange = {
+  start: number;
+  end: number;
+};
+
 export function listDays(): Promise<Array<string>> {
   return invoke<Array<string>>("list_days");
 }
@@ -29,6 +35,11 @@ export function getFrameTime(
   index: number,
 ): Promise<FrameTime | null> {
   return invoke<FrameTime | null>("get_frame_time", { date, index });
+}
+
+/** The stretches of `date` that still have to be decoded from video. */
+export function getPendingFrames(date: string): Promise<Array<FrameRange>> {
+  return invoke<Array<FrameRange>>("get_pending_frames", { date });
 }
 
 /**
