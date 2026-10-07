@@ -2,8 +2,6 @@ import { afterEach, expect, mock } from 'bun:test';
 import * as matchers from '@testing-library/jest-dom/matchers';
 import { cleanup } from '@testing-library/react';
 
-import { setTimelapseRootForTests } from '../timelapseRoot';
-
 // Extend Bun's expect with jest-dom matchers (toBeInTheDocument etc.)
 expect.extend(matchers);
 
@@ -24,7 +22,10 @@ mock.module('@tauri-apps/api/core', () => ({
 // Production resolves this from Rust at startup; tests pin it to a value that
 // is deliberately NOT the production name, so any path built from a hardcoded
 // "Timelapse" literal shows up as a failure.
+// Imported only after the mocks above are installed: timelapseRoot.ts imports
+// `invoke` statically, and a static import here would be hoisted above them.
 export const TEST_ROOT = 'Timelapse_test_root';
+const { setTimelapseRootForTests } = await import('../timelapseRoot');
 setTimelapseRootForTests(TEST_ROOT);
 
 // Mock URL.createObjectURL and URL.revokeObjectURL
