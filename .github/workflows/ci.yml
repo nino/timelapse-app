@@ -44,15 +44,17 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
 
+      # Dependencies only, keyed on Cargo.lock and the compiler version: the
+      # app's own crates are cleaned out before saving, since they change on
+      # every commit anyway. Saved even when the job fails, so a red run still
+      # leaves the next one a warm cache. CI and the release job keep separate
+      # caches, because only the release job also builds the release profile.
       - name: Cache cargo
-        uses: actions/cache@v6
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            src-tauri/target
-          key: ci-cargo-${{ runner.os }}-${{ hashFiles('src-tauri/Cargo.lock') }}
-          restore-keys: ci-cargo-${{ runner.os }}-
+          workspaces: src-tauri -> target
+          shared-key: ci
+          cache-on-failure: true
 
       - name: Install frontend dependencies
         run: bun install --frozen-lockfile
