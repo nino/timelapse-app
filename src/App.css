@@ -34,6 +34,8 @@
   /* The scrubber: its track, and the playhead bar that marks the position. */
   --color-track: oklch(0.86 0.006 264);
   --color-playhead: oklch(0.6 0.13 225);
+  /* The header, which is also the macOS title bar: the system title bar's grey. */
+  --color-titlebar: oklch(0.925 0.003 264);
 }
 
 :root {
@@ -59,6 +61,7 @@
     --color-success: oklch(0.792 0.209 151.711);
     --color-track: oklch(0.35 0.012 264);
     --color-playhead: oklch(0.8 0.12 215);
+    --color-titlebar: oklch(0.3 0.008 264);
     --track-shade: oklch(0 0 0 / 65%);
     --track-edge: oklch(0 0 0 / 25%);
   }

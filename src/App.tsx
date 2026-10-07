@@ -209,12 +209,14 @@ export function App(): React.ReactNode {
 
   return (
     <main className="h-screen overflow-hidden grid grid-rows-[min-content_1fr_auto] bg-page text-fg">
-      <header className="bg-card px-4 py-2.5 border-b border-border">
-        <div className="flex items-center gap-4">
+      {/* On macOS this is also the title bar (tauri.macos.conf.json overlays the
+          traffic lights on it), so it drags the window and leaves room for them. */}
+      <header data-tauri-drag-region className="bg-titlebar px-4 py-2.5 border-b border-border [[data-platform=macos]_&]:pl-[88px]">
+        <div data-tauri-drag-region className="flex items-center gap-4">
           <DayPicker days={days} today={today} value={selectedDay} onChange={setSelectedDay} />
 
 
-          <div className="ml-auto flex items-center gap-1.5">
+          <div data-tauri-drag-region className="ml-auto flex items-center gap-1.5">
             <label className={`${fieldFrame} flex items-center gap-2 w-72 h-9 px-3`}>
               <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true" className="shrink-0 text-muted-fg">
                 <circle cx="11" cy="11" r="7" />
