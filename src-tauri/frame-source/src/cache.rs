@@ -124,6 +124,14 @@ impl ChunkCache {
         Ok(chunk_dir)
     }
 
+    /// Whether chunk `chunk` of the video `key` is decoded, without counting
+    /// as a use of it. A chunk deleted behind our back counts as not decoded,
+    /// as it does in `touch`.
+    pub fn contains(&self, key: &str, chunk: usize) -> bool {
+        let chunk_dir = self.dir.join(key).join(format!("{chunk:06}"));
+        self.state.lock().unwrap().entries.contains_key(&chunk_dir) && chunk_dir.is_dir()
+    }
+
     #[cfg(test)]
     pub fn total_bytes(&self) -> u64 {
         self.state.lock().unwrap().total_bytes
