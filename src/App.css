@@ -1,7 +1,7 @@
 @import "tailwindcss";
 
 /* The Ninoes design system (github.com/nino/ninoes, app/app.css), copied here:
-   the same tokens, fonts and corner shapes. The fonts are bundled through
+   the same tokens and fonts. The fonts are bundled through
    @fontsource rather than loaded from Bunny Fonts, because this is an offline
    desktop app. */
 @import "@fontsource/bricolage-grotesque/400.css";
@@ -34,10 +34,6 @@
   /* The scrubber: its track, and the playhead bar that marks the position. */
   --color-track: oklch(0.86 0.006 264);
   --color-playhead: oklch(0.6 0.13 225);
-  /* Unblurred, unlike Tailwind's default: see "No blurred shadows" below. */
-  --shadow-xs: 0 1px 0 0 rgb(0 0 0 / 0.05);
-  /* Soft halo drawn outside the focus ring. */
-  --shadow-glow: 0 0 12px 2px color-mix(in oklab, var(--color-ring) 35%, transparent);
 }
 
 :root {
@@ -79,26 +75,17 @@ body {
   box-sizing: border-box;
 }
 
-/* No blurred shadows on anything that is on screen all the time. WebKit paints
-   a blurred box-shadow on the CPU and repaints it on every frame of a window
-   resize, which made resizing the window sluggish. Unblurred shadows (spread
-   only) and gradients are as cheap as no shadow at all. The focus glow keeps
-   its blur because it only shows on a focused control.
+/* Performance comes first: no blurred shadows and no squircle corners. WebKit
+   paints a blurred box-shadow on the CPU and repaints it on every frame of a
+   window resize, which made resizing sluggish, and Chromium's squircle
+   corners tripled paint time. Unblurred shadows (spread only) and gradients
+   are as cheap as no shadow at all.
 
    The scrubber's inset track: a shade fading down from the top edge, and a
    hairline ring. */
 @utility scrub-track {
   background: linear-gradient(var(--track-shade), transparent 5px), var(--color-track);
   box-shadow: inset 0 0 0 1px var(--track-edge);
-}
-
-/* Squircle corners where supported; other engines ignore the property and
-   keep the plain rounded corners. Pills and circles (rounded-full) stay round. */
-.rounded-sm,
-.rounded-md,
-.rounded-lg,
-.rounded-xl {
-  corner-shape: squircle;
 }
 
 /* The scrubber. The track is drawn by its container (see App.tsx), so the
@@ -147,15 +134,13 @@ input[type="range"]:focus-visible {
 input[type="range"]:focus-visible::-webkit-slider-thumb {
   box-shadow:
     0 0 0 2px var(--color-card),
-    0 0 0 5px color-mix(in oklab, var(--color-ring) 60%, transparent),
-    var(--shadow-glow);
+    0 0 0 5px color-mix(in oklab, var(--color-ring) 60%, transparent);
 }
 
 input[type="range"]:focus-visible::-moz-range-thumb {
   box-shadow:
     0 0 0 2px var(--color-card),
-    0 0 0 5px color-mix(in oklab, var(--color-ring) 60%, transparent),
-    var(--shadow-glow);
+    0 0 0 5px color-mix(in oklab, var(--color-ring) 60%, transparent);
 }
 
 input[type="range"]:disabled::-webkit-slider-thumb {

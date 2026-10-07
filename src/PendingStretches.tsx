@@ -22,7 +22,7 @@ export function stretchPositions(
  * The stretches of the day still to be decoded from video, drawn as soft
  * white bands under the scrubber. Each is its own rounded, glowing element
  * so it reads as a deliberate mark rather than a hard-edged gap in the track.
- * The glow is 1px rings stacked to fade out, rather than a blurred shadow, which WebKit would
+ * The glow is an unblurred ring rather than a blurred shadow, which WebKit would
  * repaint on the CPU on every frame of a window resize.
  * Centred vertically in the bar it sits in. Goes inside a `relative`
  * container, before the range input.
@@ -40,7 +40,7 @@ export function PendingStretches({
         <div
           key={left}
           data-pending-stretch
-          className="absolute top-1/2 h-2 -translate-y-1/2 min-w-2 rounded-full bg-white/90 shadow-[0_0_0_1px_rgb(255_255_255/0.16),0_0_0_2px_rgb(255_255_255/0.16),0_0_0_3px_rgb(255_255_255/0.16),0_0_0_4px_rgb(255_255_255/0.16),0_0_0_5px_rgb(255_255_255/0.16)]"
+          className="absolute top-1/2 h-2 -translate-y-1/2 min-w-2 rounded-full bg-white/90 shadow-[0_0_0_2px_rgb(255_255_255/0.35)]"
           style={{ left: `${left}%`, width: `${width}%` }}
         />
       ))}
