@@ -12,6 +12,7 @@ use std::{
 };
 use thiserror::Error;
 use tokio::time::{sleep, Duration};
+use crate::activity::Activity;
 use crate::database::ScreenshotDatabase;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,6 +50,7 @@ pub struct Photographer {
     running: Arc<AtomicBool>,
     error_logs: Arc<Mutex<Vec<ErrorLogEntry>>>,
     db: Arc<Mutex<ScreenshotDatabase>>,
+    activity: Arc<Activity>,
 }
 
 impl Photographer {
@@ -75,7 +77,14 @@ impl Photographer {
             running: Arc::new(AtomicBool::new(false)),
             error_logs: Arc::new(Mutex::new(Vec::new())),
             db: Arc::new(Mutex::new(db)),
+            activity: Arc::default(),
         })
+    }
+
+    /// Report captures to `activity`, for the Activity window.
+    pub fn reporting_to(mut self, activity: Arc<Activity>) -> Self {
+        self.activity = activity;
+        self
     }
 
     pub fn start(&self) -> Arc<AtomicBool> {
@@ -86,23 +95,25 @@ impl Photographer {
         let running_clone = Arc::clone(&running);
         let error_logs_clone = Arc::clone(&self.error_logs);
         let db_clone = Arc::clone(&self.db);
+        let activity = Arc::clone(&self.activity);
 
         tokio::spawn(async move {
             println!("Starting timelapse background task...");
 
             while running_clone.load(Ordering::SeqCst) {
                 match Self::do_screenshot(&timelapse_root_path, &db_clone).await {
-                    Ok(is_black) => {
-                        if is_black {
-                            // Image was all black and deleted, wait 10 seconds
-                            sleep(Duration::from_secs(10)).await;
-                        } else {
-                            // Normal screenshot, wait 1 second
-                            sleep(Duration::from_secs(1)).await;
-                        }
+                    Ok(Captured::Saved { day, number }) => {
+                        activity.frame_saved(&day, number);
+                        sleep(Duration::from_secs(1)).await;
+                    }
+                    Ok(Captured::Black) => {
+                        // The screen was off or locked: wait 10 seconds.
+                        activity.black_frame_dropped();
+                        sleep(Duration::from_secs(10)).await;
                     }
                     Err(error) => {
                         eprintln!("Screenshot error: {}", error);
+                        activity.capture_failed(error.to_string());
 
                         // Log the error
                         let entry = ErrorLogEntry {
@@ -168,7 +179,7 @@ impl Photographer {
     async fn do_screenshot(
         timelapse_root_path: &PathBuf,
         db: &Arc<Mutex<ScreenshotDatabase>>,
-    ) -> Result<bool, Error> {
+    ) -> Result<Captured, Error> {
         let (day, day_dir) = Self::create_day_dir_if_needed(timelapse_root_path)?;
         let filename = next_filename(&day_dir)?;
         let screenshot_path = String::from(
@@ -192,7 +203,7 @@ impl Photographer {
 
         if is_black {
             println!("Screenshot is all black, skipping: {}", screenshot_path);
-            Ok(true) // Return true to indicate image was black and dropped
+            Ok(Captured::Black)
         } else {
             // Extract frame number from filename (e.g., "00001.png" -> 1)
             let frame_number: u32 = filename
@@ -207,9 +218,16 @@ impl Photographer {
                 db_guard.insert_screenshot(&day, frame_number, created_at, local_time)?;
             }
 
-            Ok(false) // Return false for normal screenshots
+            Ok(Captured::Saved { day, number: frame_number })
         }
     }
+}
+
+/// What one capture produced.
+enum Captured {
+    Saved { day: String, number: u32 },
+    /// The frame was all black, so nothing was written.
+    Black,
 }
 
 fn next_filename(day_dir: &PathBuf) -> Result<String, Error> {
