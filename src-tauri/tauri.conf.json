@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "timelapse-app",
+  "productName": "Timelapse App",
   "version": "0.1.3",
   "identifier": "com.timelapse-app.app",
   "build": {
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "timelapse-app",
+        "title": "Timelapse App",
         "width": 800,
         "height": 600
       }

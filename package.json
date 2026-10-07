@@ -17,6 +17,8 @@
     "fetch:ffmpeg": "bun scripts/fetch-ffmpeg.ts"
   },
   "dependencies": {
+    "@fontsource/bevan": "^5.3.0",
+    "@fontsource/bricolage-grotesque": "^5.3.0",
     "@tauri-apps/api": "^2.11.1",
     "@tauri-apps/plugin-fs": "^2.5.1",
     "@tauri-apps/plugin-opener": "^2.5.4",
