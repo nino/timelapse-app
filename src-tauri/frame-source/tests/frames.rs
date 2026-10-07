@@ -298,16 +298,17 @@ fn reports_video_frames_that_are_not_decoded_yet() {
     let source = lib.source(u64::MAX);
     let range = |start, end| FrameRange { start, end };
 
+    assert_eq!(source.pending("2026-10-04").unwrap().frame_count, long + 6);
     // Nothing decoded: both videos are pending, the screenshot between them isn't.
     assert_eq!(
-        source.pending("2026-10-04").unwrap(),
+        source.pending("2026-10-04").unwrap().ranges,
         vec![range(0, long), range(long + 1, long + 6)]
     );
 
     // Showing a frame decodes its whole chunk.
     source.frame("2026-10-04", CHUNK_FRAMES + 3).unwrap();
     assert_eq!(
-        source.pending("2026-10-04").unwrap(),
+        source.pending("2026-10-04").unwrap().ranges,
         vec![
             range(0, CHUNK_FRAMES),
             range(2 * CHUNK_FRAMES, long),
@@ -317,8 +318,24 @@ fn reports_video_frames_that_are_not_decoded_yet() {
 
     source.frame("2026-10-04", long + 1).unwrap();
     assert_eq!(
-        source.pending("2026-10-04").unwrap(),
+        source.pending("2026-10-04").unwrap().ranges,
         vec![range(0, CHUNK_FRAMES), range(2 * CHUNK_FRAMES, long)]
+    );
+
+    // A chunk cleared from the cache behind the source's back is pending again.
+    for video in fs::read_dir(lib.cache.path()).unwrap() {
+        let chunk = video.unwrap().path().join("000000");
+        if chunk.is_dir() {
+            fs::remove_dir_all(chunk).unwrap();
+        }
+    }
+    assert_eq!(
+        source.pending("2026-10-04").unwrap().ranges,
+        vec![
+            range(0, CHUNK_FRAMES),
+            range(2 * CHUNK_FRAMES, long),
+            range(long + 1, long + 6)
+        ]
     );
 }
 

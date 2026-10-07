@@ -63,7 +63,7 @@ describe('App', () => {
   beforeEach(() => {
     mock.clearAllMocks();
     getFrameTime.mockResolvedValue(null);
-    getPendingFrames.mockResolvedValue([]);
+    getPendingFrames.mockResolvedValue({ frameCount: 0, ranges: [] });
   });
 
   describe('Library states', () => {
@@ -280,7 +280,7 @@ describe('App', () => {
 
   describe('Decoding progress', () => {
     it('pales the stretches of the scrubber that are not decoded yet', async () => {
-      getPendingFrames.mockResolvedValue([{ start: 0, end: 150 }]);
+      getPendingFrames.mockResolvedValue({ frameCount: 300, ranges: [{ start: 150, end: 300 }] });
       mockLibrary({ '2026-10-01': 300 }, 'video');
       render(<App />);
       const slider = screen.getByRole('slider');
@@ -288,7 +288,7 @@ describe('App', () => {
       expect(getPendingFrames).toHaveBeenCalledWith('2026-10-01');
 
       // Showing a frame decodes its chunk, so the scrubber asks again.
-      getPendingFrames.mockResolvedValue([]);
+      getPendingFrames.mockResolvedValue({ frameCount: 300, ranges: [] });
       finishLoading();
       await waitFor(() => expect(slider.style.background).toBe(''));
       await settleFrameTime();

@@ -1,53 +1,79 @@
 import React from "react";
 
-import { getPendingFrames, type Day, type FrameRange } from "../frames";
-
-const NONE: Array<FrameRange> = [];
+import { frameUrl, getPendingFrames, type Day, type PendingFrames } from "../frames";
 
 /**
- * The frame ranges of `day` that would have to be decoded from video before
- * they can be shown. Re-asked whenever the day's frame count changes and
- * whenever `loadedFrames` does, since showing a frame decodes (and may evict) a chunk.
- * Days served only from screenshots have nothing pending, so they never ask.
+ * The stretches of `day` that would have to be decoded from video before
+ * they can be shown, with the frame count they were measured against. Days
+ * served only from screenshots have nothing pending, so they never ask.
+ *
+ * Re-asked when the day's frame count changes and when `loaded` (the last
+ * frame the viewer finished loading) was in a pending stretch, since that
+ * load decoded its chunk. Loading a frame that was already decoded changes
+ * nothing, so it doesn't ask.
  */
-export function usePendingFrames(day: Day | null, loadedFrames: number): Array<FrameRange> {
-  const [pending, setPending] = React.useState<{ date: string; ranges: Array<FrameRange> } | null>(
-    null,
-  );
+export function usePendingFrames(day: Day | null, loaded: string | null): PendingFrames | null {
+  const [state, setState] = React.useState<{ date: string; pending: PendingFrames } | null>(null);
+  const [decodes, setDecodes] = React.useState(0);
   const date = day?.date ?? null;
   const frameCount = day?.frameCount ?? 0;
   const hasVideo = day?.source === "video" || day?.source === "mixed";
+  const current = hasVideo && state?.date === date ? state.pending : null;
 
+  // A finished load of a pending frame means its chunk is decoded now.
+  const currentRef = React.useRef(current);
+  React.useEffect(() => {
+    currentRef.current = current;
+  }, [current]);
+  React.useEffect(() => {
+    const pending = currentRef.current;
+    const index = date && loaded ? frameIndex(loaded, date) : null;
+    if (index === null || !pending) return;
+    if (pending.ranges.some(({ start, end }) => start <= index && index < end)) {
+      setDecodes((n) => n + 1);
+    }
+  }, [date, loaded]);
+
+  // Answers may land out of order. Each one is published unless a newer
+  // request has already published, so a burst of requests still shows the
+  // latest answer that arrived rather than none at all.
+  const asked = React.useRef(0);
+  const published = React.useRef(0);
   React.useEffect(() => {
     if (!date || !hasVideo) return;
-    let cancelled = false;
+    const mine = ++asked.current;
     getPendingFrames(date).then(
-      (ranges) => {
-        if (!cancelled) setPending({ date, ranges });
+      (pending) => {
+        if (mine < published.current) return;
+        published.current = mine;
+        setState({ date, pending });
       },
       (error: unknown) => {
-        if (!cancelled) console.error("Error fetching pending frames:", error);
+        console.error("Error fetching pending frames:", error);
       },
     );
-    return (): void => {
-      cancelled = true;
-    };
-  }, [date, hasVideo, frameCount, loadedFrames]);
+  }, [date, hasVideo, frameCount, decodes]);
 
-  return hasVideo && pending?.date === date ? pending.ranges : NONE;
+  return current;
+}
+
+/** The index in `url` if it is a frame of `date`, else null. */
+function frameIndex(url: string, date: string): number | null {
+  const prefix = frameUrl(date, 0).slice(0, -1);
+  if (!url.startsWith(prefix)) return null;
+  const index = Number(url.slice(prefix.length));
+  return Number.isInteger(index) ? index : null;
 }
 
 /**
  * A background for the scrubber that pales the stretches in `pending`, or
  * undefined when nothing is pending.
  */
-export function pendingTrackBackground(
-  pending: Array<FrameRange>,
-  frameCount: number,
-): string | undefined {
-  if (pending.length === 0 || frameCount === 0) return undefined;
-  const at = (index: number): string => `${((index / frameCount) * 100).toFixed(3)}%`;
-  const stops = pending.flatMap(({ start, end }) => [
+export function pendingTrackBackground(pending: PendingFrames | null): string | undefined {
+  if (!pending || pending.ranges.length === 0 || pending.frameCount === 0) return undefined;
+  const at = (index: number): string =>
+    `${((Math.min(index, pending.frameCount) / pending.frameCount) * 100).toFixed(3)}%`;
+  const stops = pending.ranges.flatMap(({ start, end }) => [
     `transparent ${at(start)}`,
     `${PENDING_COLOR} ${at(start)}`,
     `${PENDING_COLOR} ${at(end)}`,
@@ -56,4 +82,6 @@ export function pendingTrackBackground(
   return `linear-gradient(to right, ${stops.join(", ")})`;
 }
 
-const PENDING_COLOR = "rgba(255, 255, 255, 0.75)";
+// Opaque white: the track is the gray-200 pill around the slider, so a
+// translucent white is too faint to read against it.
+const PENDING_COLOR = "rgb(255, 255, 255)";

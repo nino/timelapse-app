@@ -4,7 +4,7 @@ mod database;
 mod ocr;
 mod paths;
 
-use frame_source::{DaySummary, FrameRange, FrameSource, FrameTime, Tools};
+use frame_source::{DaySummary, FrameSource, FrameTime, PendingFrames, Tools};
 use tauri::http::{header, Response, StatusCode};
 
 use std::path::Path;
@@ -181,7 +181,7 @@ async fn get_frame_time(
 async fn get_pending_frames(
     source: State<'_, FrameSourceState>,
     date: String,
-) -> Result<Vec<FrameRange>, String> {
+) -> Result<PendingFrames, String> {
     with_frame_source(source.inner(), move |s| s.pending(&date)).await
 }
 

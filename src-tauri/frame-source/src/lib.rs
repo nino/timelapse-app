@@ -80,6 +80,16 @@ pub struct FrameRange {
     pub end: usize,
 }
 
+/// What `FrameSource::pending` found, with the frame count it found it
+/// against, so callers can scale the ranges even if the day has changed since
+/// they last asked for its summary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingFrames {
+    pub frame_count: usize,
+    pub ranges: Vec<FrameRange>,
+}
+
 pub struct Frame {
     pub bytes: Vec<u8>,
     pub mime: &'static str,
@@ -248,7 +258,7 @@ impl FrameSource {
     /// The stretches of `date` whose frames would have to be decoded from
     /// video before they can be shown, in order and merged where they touch.
     /// Screenshots are always ready.
-    pub fn pending(&self, date: &str) -> Result<Vec<FrameRange>, Error> {
+    pub fn pending(&self, date: &str) -> Result<PendingFrames, Error> {
         let segments = self.plan(parse_date(date)?)?;
         let mut pending: Vec<FrameRange> = Vec::new();
         let mut offset = 0;
@@ -269,7 +279,10 @@ impl FrameSource {
             }
             offset += segment.len();
         }
-        Ok(pending)
+        Ok(PendingFrames {
+            frame_count: offset,
+            ranges: pending,
+        })
     }
 
     pub fn frame_time(&self, date: &str, index: usize) -> Result<Option<FrameTime>, Error> {
