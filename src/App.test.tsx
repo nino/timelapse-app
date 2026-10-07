@@ -57,6 +57,21 @@ function match(index: number, endIndex = index + 1): DayMatch {
   return { index, endIndex, frame: index + 1 };
 }
 
+function dayPicker(): HTMLElement {
+  return screen.getByRole('button', { name: 'Day' });
+}
+
+/** Open the day picker and choose `date`. */
+async function pickDay(date: string): Promise<void> {
+  await openDayPicker();
+  fireEvent.click(screen.getByRole('option', { name: new RegExp(date) }));
+}
+
+async function openDayPicker(): Promise<void> {
+  fireEvent.click(dayPicker());
+  await screen.findByRole('listbox');
+}
+
 function findBar(): HTMLInputElement {
   return screen.getByLabelText('Find text on screen') as HTMLInputElement;
 }
@@ -159,13 +174,14 @@ describe('App', () => {
       mockLibrary({ '2024-12-20': 10, '2026-10-04': 3 });
       render(<App />);
       await waitFor(() => expect(shownFrame()).toBe(frameUrl('2026-10-04', 2)));
-      expect(screen.getByLabelText('Day')).toHaveValue('2026-10-04');
+      expect(dayPicker()).toHaveTextContent('2026-10-04');
       expect(screen.getByText('Frame 3 / 3')).toBeInTheDocument();
     });
 
     it('lists days newest first and marks today', async () => {
       mockLibrary({ '2024-12-20': 10, [today()]: 3 });
       render(<App />);
+      await openDayPicker();
       const options = screen.getAllByRole('option').map((o) => o.textContent?.trim());
       expect(options).toEqual([`${today()} (Today)`, '2024-12-20']);
       await settleFrameTime();
@@ -183,8 +199,19 @@ describe('App', () => {
       await waitFor(() => expect(shownFrame()).toBe(frameUrl('2026-10-04', 2)));
       finishLoading();
 
-      fireEvent.change(screen.getByLabelText('Day'), { target: { value: '2024-12-20' } });
+      await pickDay('2024-12-20');
       await waitFor(() => expect(shownFrame()).toBe(frameUrl('2024-12-20', 9)));
+    });
+
+    it('leaves the arrow keys to the day picker, open or closed', async () => {
+      mockLibrary({ '2024-12-20': 10, '2026-10-04': 3 });
+      render(<App />);
+      await waitFor(() => expect(screen.getByText('Frame 3 / 3')).toBeInTheDocument());
+      fireEvent.keyDown(dayPicker(), { key: 'ArrowLeft' });
+      await openDayPicker();
+      fireEvent.keyDown(screen.getByRole('listbox'), { key: 'ArrowLeft' });
+      expect(screen.getByText('Frame 3 / 3')).toBeInTheDocument();
+      await settleFrameTime();
     });
   });
 
@@ -307,23 +334,24 @@ describe('App', () => {
     it('moves to the new day at midnight when following the live edge', async () => {
       mockLibrary({ '2026-10-04': 3 });
       const { rerender } = render(<App />);
-      await waitFor(() => expect(screen.getByLabelText('Day')).toHaveValue('2026-10-04'));
+      await waitFor(() => expect(dayPicker()).toHaveTextContent('2026-10-04'));
 
       mockLibrary({ '2026-10-04': 3, '2026-10-05': 1 });
       rerender(<App />);
-      await waitFor(() => expect(screen.getByLabelText('Day')).toHaveValue('2026-10-05'));
+      await waitFor(() => expect(dayPicker()).toHaveTextContent('2026-10-05'));
     });
 
     it('stays on an older day when a new day appears', async () => {
       mockLibrary({ '2026-10-03': 3, '2026-10-04': 3 });
       const { rerender } = render(<App />);
-      await waitFor(() => expect(screen.getByLabelText('Day')).toHaveValue('2026-10-04'));
-      fireEvent.change(screen.getByLabelText('Day'), { target: { value: '2026-10-03' } });
+      await waitFor(() => expect(dayPicker()).toHaveTextContent('2026-10-04'));
+      await pickDay('2026-10-03');
 
       mockLibrary({ '2026-10-03': 3, '2026-10-04': 3, '2026-10-05': 1 });
       await act(async () => rerender(<App />));
+      await openDayPicker();
       expect(screen.getByRole('option', { name: /2026-10-05/ })).toBeInTheDocument();
-      expect(screen.getByLabelText('Day')).toHaveValue('2026-10-03');
+      expect(dayPicker()).toHaveTextContent('2026-10-03');
     });
   });
 
@@ -435,14 +463,14 @@ describe('App', () => {
         ],
       );
       render(<App />);
-      await waitFor(() => expect(screen.getByLabelText('Day')).toHaveValue('2026-10-04'));
+      await waitFor(() => expect(dayPicker()).toHaveTextContent('2026-10-04'));
       await search('cargo');
 
       const otherDays = screen.getByRole('navigation', { name: 'Other days with matches' });
       expect(otherDays).toHaveTextContent('Also on2026-10-0222026-10-011');
       fireEvent.click(screen.getByRole('button', { name: /2026-10-02/ }));
       await waitFor(() => expect(screen.getByText('Frame 8 / 50')).toBeInTheDocument());
-      expect(screen.getByLabelText('Day')).toHaveValue('2026-10-02');
+      expect(dayPicker()).toHaveTextContent('2026-10-02');
       await settleFrameTime();
     });
 
@@ -456,7 +484,7 @@ describe('App', () => {
       render(<App />);
       await search('cargo');
       fireEvent.click(screen.getByRole('button', { name: /2026-10-02/ }));
-      fireEvent.change(screen.getByLabelText('Day'), { target: { value: '2026-10-03' } });
+      await pickDay('2026-10-03');
       await waitFor(() => expect(screen.getByText('Frame 50 / 50')).toBeInTheDocument());
 
       // Now the matches are there, and 10-02 is opened from the picker.
@@ -464,8 +492,8 @@ describe('App', () => {
         matches: date === '2026-10-02' ? [match(7)] : [],
         matchesError: null,
       }));
-      fireEvent.change(screen.getByLabelText('Day'), { target: { value: '2026-10-02' } });
-      await waitFor(() => expect(screen.getByLabelText('Day')).toHaveValue('2026-10-02'));
+      await pickDay('2026-10-02');
+      await waitFor(() => expect(dayPicker()).toHaveTextContent('2026-10-02'));
       await settleFrameTime();
       expect(screen.getByText('Frame 50 / 50')).toBeInTheDocument();
     });
