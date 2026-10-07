@@ -3,7 +3,8 @@ import React from "react";
 import "./App.css";
 import { frameUrl, getFrameTime, type FrameTime } from "./frames";
 import { useDay, useDays } from "./hooks/useLibrary";
-import { pendingTrackBackground, usePendingFrames } from "./hooks/usePendingFrames";
+import { usePendingFrames } from "./hooks/usePendingFrames";
+import { PendingStretches } from "./PendingStretches";
 
 export function App(): React.ReactNode {
   const { days, daysError } = useDays();
@@ -183,7 +184,8 @@ export function App(): React.ReactNode {
 
       <div className="bg-gray-100 p-4">
         <div className="flex items-center gap-4">
-          <div className="flex-1 bg-gray-200 p-1 pt-0 rounded-full">
+          <div className="relative flex-1 bg-gray-200 p-1 pt-0 rounded-full">
+            <PendingStretches pending={pendingFrames} />
             <input
               type="range"
               aria-label="Position in day"
@@ -192,8 +194,7 @@ export function App(): React.ReactNode {
               value={currentIndex}
               onChange={(e) => goTo(parseInt(e.target.value, 10))}
               disabled={frameCount === 0}
-              style={{ background: pendingTrackBackground(pendingFrames) }}
-              className="w-full h-2 bg-gray-300 rounded-lg appearance-none cursor-pointer
+              className="relative w-full h-2 bg-gray-300 rounded-lg appearance-none cursor-pointer
                          disabled:opacity-50 disabled:cursor-not-allowed"
             />
           </div>
