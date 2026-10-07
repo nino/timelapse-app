@@ -350,7 +350,7 @@ export function App(): React.ReactNode {
 
       <div className="bg-card px-4 py-3 border-t border-border">
         <div className="flex items-center gap-4">
-          <div className="relative flex-1 bg-border p-1 pt-0 rounded-full">
+          <div className="relative flex-1 bg-track shadow-track p-1 pt-0 rounded-full">
             <PendingStretches pending={pendingFrames} />
             <MatchMarks stops={stops} frameCount={frameCount} currentIndex={currentIndex} />
             <input
@@ -409,9 +409,9 @@ function MatchMarks({
   return (
     <div
       data-testid="match-marks"
-      // Inset by the track's padding (4px) plus half the 20px thumb, the
-      // range the thumb's centre moves over.
-      className="absolute left-[14px] right-[14px] -top-3 h-3 pointer-events-none"
+      // Inset by the track's padding (4px) plus half the 6px playhead, the
+      // range the playhead's centre moves over.
+      className="absolute left-[7px] right-[7px] -top-3 h-3 pointer-events-none"
       aria-hidden="true"
     >
       {stops.map((stop, i) => (
