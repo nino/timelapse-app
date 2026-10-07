@@ -26,7 +26,7 @@ export function DayPicker({
     <Listbox value={value} onChange={(date: string | null) => date && onChange(date)}>
       <ListboxButton
         aria-label="Day"
-        className={`flex h-9 items-center gap-3 rounded-2xl border border-input bg-field pr-3 pl-3.5 text-sm font-medium tabular-nums shadow-xs ${focusRing}`}
+        className={`flex h-9 items-center gap-3 rounded-full border border-input bg-field pr-3.5 pl-4 text-sm font-medium tabular-nums shadow-xs ${focusRing}`}
       >
         {value === null ? <span className="text-muted-fg">Select a day…</span> : label(value)}
         <Chevron />

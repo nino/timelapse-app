@@ -215,7 +215,7 @@ export function App(): React.ReactNode {
 
 
           <div className="ml-auto flex items-center gap-1.5">
-            <label className={`${fieldFrame} flex items-center gap-2 w-72 h-9 px-2.5`}>
+            <label className={`${fieldFrame} flex items-center gap-2 w-72 h-9 px-3`}>
               <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true" className="shrink-0 text-muted-fg">
                 <circle cx="11" cy="11" r="7" />
                 <path d="m20 20-3.5-3.5" />

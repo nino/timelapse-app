@@ -8,4 +8,4 @@ export const outlineButton = `inline-flex shrink-0 items-center justify-center g
 
 /** A text field's frame. Goes on a wrapper `<label>` when the field has an icon. */
 export const fieldFrame =
-  "rounded-md border border-input bg-field shadow-xs transition-[color,box-shadow] focus-within:border-ring focus-within:ring-[3px] focus-within:ring-ring/50 focus-within:shadow-glow";
+  "rounded-xl border border-input bg-field shadow-xs transition-[color,box-shadow] focus-within:border-ring focus-within:ring-[3px] focus-within:ring-ring/50 focus-within:shadow-glow";
