@@ -4,6 +4,7 @@ mod timelapse;
 mod database;
 mod ocr;
 mod paths;
+mod settings;
 mod updater;
 
 use frame_source::{DaySummary, FrameSource, FrameTime, PendingFrames, Tools};
@@ -16,7 +17,9 @@ use tauri::{AppHandle, Manager, Runtime, State, WebviewUrl, WebviewWindowBuilder
 use activity::{Activity, Snapshot};
 use database::{OcrHit, ScreenshotDatabase};
 use serde::Serialize;
+use settings::{Settings, SettingsStore};
 use timelapse::Photographer;
+use updater::UpdaterState;
 
 // Shared state to manage the timelapse photographer
 type PhotographerState = Arc<Mutex<Option<Photographer>>>;
@@ -30,6 +33,10 @@ type ActivityState = Arc<Activity>;
 
 /// Label of the Activity window, and id of the menu item that opens it.
 const ACTIVITY_WINDOW: &str = "activity";
+/// Label of the Settings window, and id of the menu item that opens it.
+const SETTINGS_WINDOW: &str = "settings";
+/// Id of the "Check for Updates…" menu item.
+const CHECK_FOR_UPDATES: &str = "check-for-updates";
 
 /// Decoded video frames are disposable, so the cache lives in the OS cache
 /// directory rather than in the (possibly synced) library.
@@ -497,15 +504,69 @@ async fn get_activity(
     run_blocking(move || Ok(activity.snapshot(capturing, converter::on_ac_power))).await
 }
 
-/// The standard menu bar, with "Activity" added to the Window menu.
+/// The app's settings. Changes apply at once and are saved straight away.
+#[tauri::command]
+fn get_settings(settings: State<'_, SettingsStore>) -> Settings {
+    settings.get()
+}
+
+#[tauri::command]
+fn set_update_automatically(
+    enabled: bool,
+    settings: State<'_, SettingsStore>,
+    updater: State<'_, UpdaterState>,
+) -> Result<Settings, String> {
+    let saved = settings.update(|s| s.update_automatically = enabled);
+    updater.setting_changed();
+    saved
+}
+
+/// The standard menu bar, with "Check for Updates…" and "Settings…" (⌘,)
+/// under About in the app menu, and "Activity" added to the Window menu.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn app_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     let menu = Menu::default(app)?;
+    // On macOS the first submenu is the app menu, which starts with About.
+    if let Some(MenuItemKind::Submenu(app_submenu)) = menu.items()?.first() {
+        app_submenu.insert(
+            &MenuItem::with_id(
+                app,
+                CHECK_FOR_UPDATES,
+                "Check for Updates…",
+                true,
+                None::<&str>,
+            )?,
+            1,
+        )?;
+        app_submenu.insert(&PredefinedMenuItem::separator(app)?, 2)?;
+        app_submenu.insert(
+            &MenuItem::with_id(app, SETTINGS_WINDOW, "Settings…", true, Some("CmdOrCtrl+,"))?,
+            3,
+        )?;
+    }
     if let Some(MenuItemKind::Submenu(window)) = menu.get(WINDOW_SUBMENU_ID) {
         window.append(&PredefinedMenuItem::separator(app)?)?;
         window.append(&MenuItem::with_id(app, ACTIVITY_WINDOW, "Activity", true, None::<&str>)?)?;
     }
     Ok(menu)
+}
+
+/// Bring the Settings window to the front, opening it if it isn't open. Like
+/// a macOS settings window it has no Save button and doesn't resize.
+fn show_settings_window<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
+    if let Some(window) = app.get_webview_window(SETTINGS_WINDOW) {
+        window.unminimize()?;
+        window.show()?;
+        return window.set_focus();
+    }
+    WebviewWindowBuilder::new(app, SETTINGS_WINDOW, WebviewUrl::App("index.html".into()))
+        .title("Settings")
+        .inner_size(440.0, 170.0)
+        .resizable(false)
+        .minimizable(false)
+        .maximizable(false)
+        .build()?;
+    Ok(())
 }
 
 /// Bring the Activity window to the front, opening it if it isn't open. It
@@ -539,13 +600,22 @@ pub fn run() {
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_dialog::init())
         .manage(photographer_state)
         .manage(activity)
+        .manage(UpdaterState::default())
         .on_menu_event(|app, event| {
-            if event.id() == ACTIVITY_WINDOW {
-                if let Err(e) = show_activity_window(app) {
-                    eprintln!("Could not open the Activity window: {}", e);
+            let opened = match event.id().as_ref() {
+                ACTIVITY_WINDOW => show_activity_window(app),
+                SETTINGS_WINDOW => show_settings_window(app),
+                CHECK_FOR_UPDATES => {
+                    updater::check_from_menu(app.clone());
+                    Ok(())
                 }
+                _ => Ok(()),
+            };
+            if let Err(e) = opened {
+                eprintln!("Could not open the {} window: {}", event.id().as_ref(), e);
             }
         })
         .register_asynchronous_uri_scheme_protocol("frames", |ctx, request, responder| {
@@ -561,6 +631,7 @@ pub fn run() {
             });
         })
         .setup(|app| {
+            app.manage(SettingsStore::load(app.path().app_config_dir().ok()));
             updater::spawn(app.handle().clone());
 
             // Create the library up front. The frontend calls readDir on it
@@ -667,7 +738,9 @@ pub fn run() {
             get_match_lines,
             count_ocr_matches,
             get_ocr_version,
-            get_activity
+            get_activity,
+            get_settings,
+            set_update_automatically
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
