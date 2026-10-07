@@ -31,5 +31,13 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ]
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDUzQjYwRDFFREQ0RDkwOUYKUldTZmtFM2RIZzIyVSsyY0tVWDFhSTVveFpKM2czeW9jc2g3dCt1SGc0SnBpQTFZcnFtVS95UmcK",
+      "endpoints": [
+        "https://github.com/nino/timelapse-app/releases/latest/download/latest.json"
+      ]
+    }
   }
 }

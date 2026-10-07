@@ -3,6 +3,7 @@ mod timelapse;
 mod database;
 mod ocr;
 mod paths;
+mod updater;
 
 use frame_source::{DaySummary, FrameSource, FrameTime, PendingFrames, Tools};
 use tauri::http::{header, Response, StatusCode};
@@ -475,6 +476,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(photographer_state)
         .register_asynchronous_uri_scheme_protocol("frames", |ctx, request, responder| {
             let source = ctx
@@ -489,6 +491,8 @@ pub fn run() {
             });
         })
         .setup(|app| {
+            updater::spawn(app.handle().clone());
+
             // Create the library up front. The frontend calls readDir on it
             // during its first render, which happens well before the delayed
             // task below builds the Photographer — without this, a first run

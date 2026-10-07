@@ -63,6 +63,14 @@ Two consequences worth remembering: `cargo test --release` compiles with `debug_
 
 
 **Test isolation seams.** `Photographer::new()` resolves the profile's library root and delegates to `Photographer::new_in(root)`; tests always use `new_in` with a `TempDir` so `cargo test` never reads, writes, or captures into a real library, in either profile. `Photographer::start()` calls `tokio::spawn`, so anything touching it needs `#[tokio::test]`, and the test must call `stop()` before its first yield point — that is what makes the capture loop exit on its first poll. An `.await` between start and stop lets it capture the real screen.
+## Releases
+
+`.github/workflows/release.yml` builds, signs (Developer ID, hardened runtime), notarises and staples the app and a DMG on every push to `main`, and republishes them as the rolling `latest` GitHub release; pushing the `beta` tag publishes a prerelease instead. It follows nino/worktree-manager's release workflow and uses the same secret names. The released version is `<major>.<minor>.<commit count>`, with major/minor from `tauri.conf.json`, so it always grows, which is what a future Tauri updater needs; nothing is committed back.
+
+**Auto-update.** `src-tauri/src/updater.rs` (release builds only; a debug build would replace itself with the release one) checks `releases/latest/download/latest.json` at launch and hourly through `tauri-plugin-updater`, installs a newer version, and relaunches once the window is not focused. The workflow writes that `latest.json` and uploads it with a minisign-signed `.app.tar.gz`; `createUpdaterArtifacts` is switched on only by the workflow's `--config` override so a local `tauri build` needs no updater key. The app trusts only `plugins.updater.pubkey` in `tauri.conf.json`, which must match the `TAURI_SIGNING_PRIVATE_KEY` secret: losing that private key means installed copies can never update again, and the workflow refuses to run while the pubkey is the placeholder.
+
+The build is Apple Silicon only (the runner's architecture). The job runs `bun run fetch:ffmpeg` before `cargo test`, because build.rs needs the sidecar and only `tauri build` fetches it on its own.
+
 ## Conventions (enforced by oxlint — see `.oxlintrc.json`)
 
 - `@typescript-eslint/explicit-function-return-type: error` — every function (including arrow callbacks) needs an explicit return type
