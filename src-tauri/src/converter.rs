@@ -2,8 +2,9 @@
 //!
 //! This replaces the `all-timelapses-to-video` / `timelapse-to-video` scripts,
 //! which encoded whole days at once. Here the unit of work is one clock hour of
-//! screenshots, and one batch runs at a time with a cool-down between batches,
-//! so the machine never encodes for long stretches. Nothing is encoded unless
+//! screenshots, and one batch runs at a time, starting at most once every
+//! half hour, so a backlog (say, after a stretch on battery) is worked off at
+//! a steady two hours of screenshots per hour of AC power. Nothing is encoded unless
 //! the machine is on AC power, and an encode in progress is killed if the
 //! power is unplugged.
 //!
@@ -34,7 +35,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 /// Frames per second of the output video, as in `timelapse-to-video`.
 const FRAMERATE: &str = "15";
@@ -49,8 +50,10 @@ const MAX_FRAMES_PER_BATCH: usize = 3600;
 /// is converted a late frame would be deleted without being in the video.
 const LATE_WRITE_GRACE_SECS: i64 = 60;
 
-/// How long to rest after a batch before starting the next one.
-const COOL_DOWN: Duration = Duration::from_secs(10 * 60);
+/// How often a batch may start. When the converter is behind, the next batch
+/// starts this long after the previous one started; an encode that takes
+/// longer than this is followed by the next one straight away.
+const BATCH_INTERVAL: Duration = Duration::from_secs(30 * 60);
 
 /// How long to wait before looking again when there is nothing to convert.
 const IDLE_POLL: Duration = Duration::from_secs(5 * 60);
@@ -647,7 +650,7 @@ impl Converter {
             batch.day,
             batch.hour
         );
-        let started = SystemTime::now();
+        let started = Instant::now();
         let root_owned = root.to_path_buf();
         let running_owned = Arc::clone(running);
         let result = tokio::task::spawn_blocking(move || {
@@ -658,11 +661,11 @@ impl Converter {
         .await
         .unwrap_or_else(|e| Err(ConvertError::Failed(format!("Conversion task panicked: {}", e))));
 
+        let took = started.elapsed();
         match result {
             Ok(video_name) => {
-                let took = started.elapsed().unwrap_or_default().as_secs();
-                println!("Published {} after {}s", video_name, took);
-                COOL_DOWN
+                println!("Published {} after {}s", video_name, took.as_secs());
+                rest_after(took)
             }
             Err(ConvertError::Interrupted) => {
                 println!("Video conversion interrupted; the frames were kept");
@@ -670,10 +673,16 @@ impl Converter {
             }
             Err(e) => {
                 eprintln!("Video conversion failed, frames kept: {}", e);
-                COOL_DOWN
+                rest_after(took)
             }
         }
     }
+}
+
+/// How long to wait after a batch that took `took`, so that the next one
+/// starts `BATCH_INTERVAL` after this one started.
+fn rest_after(took: Duration) -> Duration {
+    BATCH_INTERVAL.saturating_sub(took)
 }
 
 #[cfg(test)]
@@ -681,6 +690,7 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
     use std::fs::{self, File, FileTimes};
+    use std::time::SystemTime;
     use tempfile::TempDir;
 
     fn at(day: &str, hour: u32, minute: u32) -> DateTime<Local> {
@@ -1160,6 +1170,15 @@ mod tests {
 
         assert!(!stale.exists());
         assert!(frames.exists());
+    }
+
+    #[test]
+    fn batches_start_every_half_hour_while_behind() {
+        let minutes = |m: u64| Duration::from_secs(m * 60);
+        assert_eq!(rest_after(minutes(12)), minutes(18));
+        assert_eq!(rest_after(Duration::ZERO), minutes(30));
+        assert_eq!(rest_after(minutes(30)), Duration::ZERO);
+        assert_eq!(rest_after(minutes(45)), Duration::ZERO);
     }
 
     #[test]

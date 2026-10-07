@@ -62,7 +62,7 @@ pub fn filed_at(modified: NaiveDateTime, day: NaiveDate) -> NaiveDateTime {
     modified.clamp(first, last)
 }
 
-fn truncate_to_hour(time: NaiveDateTime) -> NaiveDateTime {
+pub(crate) fn truncate_to_hour(time: NaiveDateTime) -> NaiveDateTime {
     time.date().and_hms_opt(time.hour(), 0, 0).unwrap_or(time)
 }
 

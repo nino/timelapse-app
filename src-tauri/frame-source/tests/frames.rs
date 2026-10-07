@@ -512,3 +512,90 @@ fn stays_under_its_cache_cap() {
         .count();
     assert_eq!(chunk_dirs, 1);
 }
+
+#[test]
+fn finds_frames_by_number_in_screenshots_and_converted_hours() {
+    let lib = Library::new();
+    let root = lib.root.path();
+    let day_dir = root.join("2026-10-04");
+    fs::create_dir(&day_dir).unwrap();
+    // 09:00 held frames 1-3 and was converted in two parts; 10:00 is still
+    // screenshots, with a gap where frame 5 was deleted.
+    make_video(&root.join("2026-10-04--09-00-05--hourly.mov"), 2, 0);
+    make_video(&root.join("2026-10-04--09-40-00--hourly-2.mov"), 1, 100);
+    write_shot(&day_dir, "00004.png", b"four", "2026-10-04 10:00:00");
+    write_shot(&day_dir, "00006.png", b"six", "2026-10-04 10:00:02");
+    let conn = rusqlite::Connection::open(root.join("screenshots.db")).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE screenshots (id INTEGER PRIMARY KEY, day TEXT, frame_number INTEGER, local_time TEXT);
+         INSERT INTO screenshots (day, frame_number, local_time) VALUES
+             ('2026-10-04', 1, '2026-10-04T09:00:05+02:00'),
+             ('2026-10-04', 2, '2026-10-04T09:00:06+02:00'),
+             ('2026-10-04', 3, '2026-10-04T09:40:00+02:00'),
+             ('2026-10-04', 4, '2026-10-04T10:00:00+02:00'),
+             ('2026-10-04', 6, '2026-10-04T10:00:02+02:00'),
+             ('2026-10-05', 1, '2026-10-05T09:00:00+02:00');",
+    )
+    .unwrap();
+    let source = lib.source(u64::MAX);
+
+    assert_eq!(
+        source
+            .indices_of_frames("2026-10-04", &[6, 1, 3, 4, 5, 2, 99])
+            .unwrap(),
+        vec![Some(4), Some(0), Some(2), Some(3), None, Some(1), None]
+    );
+}
+
+#[test]
+fn finds_frames_on_legacy_days_by_their_database_rank() {
+    let lib = Library::new();
+    make_video(&lib.root.path().join("2025-12-01--23-00-00.mov"), 3, 0);
+    make_video(&lib.root.path().join("2025-12-02--23-00-00.mov"), 3, 0);
+    // Frame 3 was a deleted black frame, so the video's third frame is 4.
+    write_db(lib.root.path(), &[]);
+    let conn = rusqlite::Connection::open(lib.root.path().join("screenshots.db")).unwrap();
+    conn.execute_batch(
+        "INSERT INTO screenshots (frame_number, local_time) VALUES
+             (1, '2025-12-01T09:00:00'), (2, '2025-12-01T09:00:01'), (4, '2025-12-01T09:00:03'),
+             (1, '2025-12-02T09:00:00');",
+    )
+    .unwrap();
+    let source = lib.source(u64::MAX);
+
+    assert_eq!(
+        source.indices_of_frames("2025-12-01", &[1, 4, 3]).unwrap(),
+        vec![Some(0), Some(2), None]
+    );
+    // One row for three frames: the rows can't say which frame is which.
+    assert_eq!(source.indices_of_frames("2025-12-02", &[1]).unwrap(), vec![None]);
+}
+
+#[test]
+fn finds_frames_in_recorded_videos_exactly() {
+    let lib = Library::new();
+    let root = lib.root.path();
+    // 09:00 was recorded by the converter (frames 1-3); 10:00 was converted
+    // before it recorded frames, so it falls back to the hour's rows.
+    make_video(&root.join("2026-10-04--09-00-05--hourly.mov"), 3, 0);
+    make_video(&root.join("2026-10-04--10-00-00--hourly.mov"), 2, 0);
+    record_video(
+        root,
+        "2026-10-04--09-00-05--hourly.mov",
+        &["2026-10-04T09:00:05", "2026-10-04T09:00:06", "2026-10-04T09:30:00"],
+    );
+    let conn = rusqlite::Connection::open(root.join("screenshots.db")).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE screenshots (id INTEGER PRIMARY KEY, day TEXT, frame_number INTEGER, local_time TEXT);
+         INSERT INTO screenshots (day, frame_number, local_time) VALUES
+             ('2026-10-04', 10, '2026-10-04T10:00:00'),
+             ('2026-10-04', 11, '2026-10-04T10:00:01');",
+    )
+    .unwrap();
+    let source = lib.source(u64::MAX);
+
+    assert_eq!(
+        source.indices_of_frames("2026-10-04", &[3, 11, 1, 10, 4]).unwrap(),
+        vec![Some(2), Some(4), Some(0), Some(3), None]
+    );
+}

@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
-use chrono::{Duration, NaiveDate};
+use chrono::{DateTime, Duration, NaiveDate, NaiveDateTime};
 use serde::Serialize;
 
 use cache::ChunkCache;
@@ -148,12 +148,13 @@ pub struct FrameSource {
     /// Screenshot listings keyed by day, valid while the folder's mtime
     /// matches. Today's folder changes every second; older ones never do.
     screenshots: Mutex<HashMap<NaiveDate, (SystemTime, Arc<Vec<Shot>>)>>,
-    /// Every capture time the database has for a day, in frame-number order.
-    /// Only asked for days served from legacy videos, which never change.
-    day_times: Mutex<HashMap<NaiveDate, Arc<Vec<String>>>>,
-    /// Per hourly video, the capture times the converter recorded for its
-    /// frames. See `recorded_times`.
-    recorded_times: Mutex<HashMap<PathBuf, Arc<Vec<String>>>>,
+    /// Every frame number and capture time the database has for a day, in
+    /// frame-number order. Only asked for days served from legacy videos,
+    /// which never change.
+    day_times: Mutex<HashMap<NaiveDate, Arc<Vec<(u32, String)>>>>,
+    /// Per hourly video, the frame number and capture time the converter
+    /// recorded for each of its frames. See `recorded_frames`.
+    recorded_frames: Mutex<HashMap<PathBuf, Arc<Vec<(u32, String)>>>>,
     /// The capture times the database has around an hourly video's hour, in
     /// time order. Only asked for videos the converter recorded no
     /// frames for; the hour has ended, so its rows no longer change.
@@ -177,7 +178,7 @@ impl FrameSource {
             probes: Mutex::new(HashMap::new()),
             screenshots: Mutex::new(HashMap::new()),
             day_times: Mutex::new(HashMap::new()),
-            recorded_times: Mutex::new(HashMap::new()),
+            recorded_frames: Mutex::new(HashMap::new()),
             hour_times: Mutex::new(HashMap::new()),
         })
     }
@@ -328,7 +329,7 @@ impl FrameSource {
                 let times = self.day_times(day)?;
                 let total: usize = segments.iter().map(Segment::len).sum();
                 Ok((times.len() == total).then(|| FrameTime {
-                    local_time: times[index].clone(),
+                    local_time: times[index].1.clone(),
                     exact: true,
                 }))
             }
@@ -336,10 +337,10 @@ impl FrameSource {
                 // The converter records which screenshot each frame of an
                 // hourly video was made from, and when it was taken. A record
                 // that doesn't match the video frame for frame is not used.
-                let recorded = self.recorded_times(file);
+                let recorded = self.recorded_frames(file);
                 if recorded.len() == info.frame_count {
                     return Ok(Some(FrameTime {
-                        local_time: recorded[local].clone(),
+                        local_time: recorded[local].1.clone(),
                         exact: true,
                     }));
                 }
@@ -370,6 +371,140 @@ impl FrameSource {
                 }))
             }
         }
+    }
+
+    /// Where frames recorded by number (as OCR records them) sit in the day:
+    /// for each of `numbers`, the day-wide index of screenshot `NNNNN`, or
+    /// `None` if the day no longer has that frame.
+    ///
+    /// A screenshot still on disk is found exactly, and so is one in an
+    /// hourly video whose frames the converter recorded in `video_frames`.
+    /// For a video converted before it did, the video holds the hour's
+    /// screenshots in frame-number order, so the frame's rank among the
+    /// database rows for that hour is its place in the video. That is an
+    /// estimate: a row and its file can fall in different hours by a
+    /// fraction of a second.
+    ///
+    /// A day served only from legacy videos holds every screenshot of the day
+    /// in frame-number order, so there a frame's rank among the day's
+    /// database rows is its index, but only when the counts agree, the same
+    /// rule `frame_time` uses for those days.
+    pub fn indices_of_frames(
+        &self,
+        date: &str,
+        numbers: &[u32],
+    ) -> Result<Vec<Option<usize>>, Error> {
+        let day = parse_date(date)?;
+        let segments = self.plan(day)?;
+        let total: usize = segments.iter().map(Segment::len).sum();
+        let legacy_only = segments.iter().all(
+            |s| matches!(s, Segment::Video { file, .. } if file.kind == VideoKind::Legacy),
+        );
+        if legacy_only {
+            let rows = self.day_times(day)?;
+            if rows.len() != total {
+                return Ok(vec![None; numbers.len()]);
+            }
+            let mut index_of = HashMap::new();
+            for (index, (number, _)) in rows.iter().enumerate() {
+                index_of.entry(*number).or_insert(index);
+            }
+            return Ok(numbers.iter().map(|n| index_of.get(n).copied()).collect());
+        }
+
+        let mut by_number = HashMap::new();
+        // Clock hour -> (first index, length) of each part of its video.
+        let mut video_hours: HashMap<NaiveDateTime, Vec<(usize, usize)>> = HashMap::new();
+        let mut start = 0;
+        for segment in &segments {
+            match segment {
+                Segment::Screenshots { shots, range } => {
+                    for (i, shot) in shots[range.clone()].iter().enumerate() {
+                        by_number.insert(shot.number, start + i);
+                    }
+                }
+                Segment::Video { file, info } => {
+                    // The converter records which screenshot each frame came
+                    // from; only a record that matches the video frame for
+                    // frame is used.
+                    let recorded = self.recorded_frames(file);
+                    if recorded.len() == info.frame_count {
+                        for (i, (number, _)) in recorded.iter().enumerate() {
+                            by_number.entry(*number).or_insert(start + i);
+                        }
+                    } else {
+                        video_hours
+                            .entry(file.hour())
+                            .or_default()
+                            .push((start, segment.len()));
+                    }
+                }
+            }
+            start += segment.len();
+        }
+
+        let needs_db =
+            !video_hours.is_empty() && numbers.iter().any(|n| !by_number.contains_key(n));
+        let hours = if needs_db {
+            self.frame_hours(date)?
+        } else {
+            FrameHours::default()
+        };
+
+        Ok(numbers
+            .iter()
+            .map(|n| {
+                if let Some(&index) = by_number.get(n) {
+                    return Some(index);
+                }
+                let hour = hours.hour_of.get(n)?;
+                let mut rank = hours.numbers[hour].binary_search(n).ok()?;
+                let parts = video_hours.get(hour)?;
+                for &(first, len) in parts {
+                    if rank < len {
+                        return Some(first + rank);
+                    }
+                    rank -= len;
+                }
+                // More rows than the video has frames: the end of the hour is
+                // the closest place there is.
+                parts.last().and_then(|&(first, len)| (first + len).checked_sub(1))
+            })
+            .collect())
+    }
+
+    /// The day's database rows grouped by the local clock hour they were
+    /// captured in.
+    fn frame_hours(&self, date: &str) -> Result<FrameHours, Error> {
+        let mut hours = FrameHours::default();
+        let day = parse_date(date)?;
+        let Some(conn) = self.open_db()? else {
+            return Ok(hours);
+        };
+        // Keyed on the day folder the frame was written to, like the OCR rows
+        // being looked up: a capture just before midnight can be stamped
+        // with the next day's time.
+        let mut statement = conn.prepare(
+            "SELECT frame_number, local_time FROM screenshots
+             WHERE day = ?1
+             ORDER BY frame_number",
+        )?;
+        let rows = statement.query_map([date], |row| {
+            Ok((row.get::<_, u32>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (number, time) = row?;
+            let Some(hour) = local_hour(&time, day) else {
+                continue;
+            };
+            // A number listed twice (an old library's reused black frame)
+            // counts once, in the hour it was first captured.
+            if let std::collections::hash_map::Entry::Vacant(entry) = hours.hour_of.entry(number) {
+                entry.insert(hour);
+                hours.numbers.entry(hour).or_default().push(number);
+            }
+        }
+        Ok(hours)
     }
 
     fn day_dir(&self, day: NaiveDate) -> PathBuf {
@@ -475,7 +610,7 @@ impl FrameSource {
         Ok(probe)
     }
 
-    fn day_times(&self, day: NaiveDate) -> Result<Arc<Vec<String>>, Error> {
+    fn day_times(&self, day: NaiveDate) -> Result<Arc<Vec<(u32, String)>>, Error> {
         if let Some(times) = self.day_times.lock().unwrap().get(&day) {
             return Ok(times.clone());
         }
@@ -483,13 +618,13 @@ impl FrameSource {
             return Ok(Arc::default());
         };
         let mut statement = conn.prepare(
-            "SELECT local_time FROM screenshots
+            "SELECT frame_number, local_time FROM screenshots
              WHERE substr(local_time, 1, 10) = ?1
              ORDER BY frame_number, id",
         )?;
         let times = statement
             .query_map([day.format("%Y-%m-%d").to_string()], |row| {
-                row.get::<_, String>(0)
+                Ok((row.get::<_, u32>(0)?, row.get::<_, String>(1)?))
             })?
             .collect::<Result<Vec<_>, _>>()?;
         let times = Arc::new(times);
@@ -534,17 +669,18 @@ impl FrameSource {
         times
     }
 
-    /// The capture time of each frame of `video`, as the converter recorded
-    /// it. Empty for a video converted before it recorded frames, for a
-    /// database from before it did, and when the database can't be read.
-    fn recorded_times(&self, video: &VideoFile) -> Arc<Vec<String>> {
-        if let Some(times) = self.recorded_times.lock().unwrap().get(&video.path) {
-            return times.clone();
+    /// The frame number and capture time of each frame of `video`, as the
+    /// converter recorded them. Empty for a video converted before it
+    /// recorded frames, for a database from before it did, and when the
+    /// database can't be read.
+    fn recorded_frames(&self, video: &VideoFile) -> Arc<Vec<(u32, String)>> {
+        if let Some(frames) = self.recorded_frames.lock().unwrap().get(&video.path) {
+            return frames.clone();
         }
         let Some(name) = video.path.file_name().and_then(|name| name.to_str()) else {
             return Arc::default();
         };
-        let query = |conn: &rusqlite::Connection| -> rusqlite::Result<Vec<String>> {
+        let query = |conn: &rusqlite::Connection| -> rusqlite::Result<Vec<(u32, String)>> {
             let has_table: bool = conn.query_row(
                 "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'video_frames')",
                 [],
@@ -553,22 +689,24 @@ impl FrameSource {
             if !has_table {
                 return Ok(Vec::new());
             }
-            conn.prepare("SELECT local_time FROM video_frames WHERE video = ?1 ORDER BY frame_index")?
-                .query_map([name], |row| row.get::<_, String>(0))?
-                .collect()
+            conn.prepare(
+                "SELECT frame_number, local_time FROM video_frames WHERE video = ?1 ORDER BY frame_index",
+            )?
+            .query_map([name], |row| Ok((row.get::<_, u32>(0)?, row.get::<_, String>(1)?)))?
+            .collect()
         };
-        let Ok(Some(Ok(times))) = self.open_db().map(|conn| conn.map(|conn| query(&conn))) else {
+        let Ok(Some(Ok(frames))) = self.open_db().map(|conn| conn.map(|conn| query(&conn))) else {
             return Arc::default();
         };
         // The record is written before the video is published, or, for an
         // older video, before its screenshots are deleted, which is the
         // first time the video is served. Either way it is final by now.
-        let times = Arc::new(times);
-        self.recorded_times
+        let frames = Arc::new(frames);
+        self.recorded_frames
             .lock()
             .unwrap()
-            .insert(video.path.clone(), times.clone());
-        times
+            .insert(video.path.clone(), frames.clone());
+        frames
     }
 
     fn open_db(&self) -> Result<Option<rusqlite::Connection>, Error> {
@@ -602,6 +740,25 @@ impl FrameSource {
             Err(e) => Err(e.into()),
         }
     }
+}
+
+/// Frame numbers of one day by capture hour; see `FrameSource::frame_hours`.
+#[derive(Default)]
+struct FrameHours {
+    hour_of: HashMap<u32, NaiveDateTime>,
+    /// Ascending within each hour.
+    numbers: HashMap<NaiveDateTime, Vec<u32>>,
+}
+
+/// The local clock hour of a database timestamp (RFC 3339 with an offset, as
+/// the capture loop writes it, or a naive local time) in day folder `day`,
+/// filed the way the converter files screenshots.
+fn local_hour(time: &str, day: NaiveDate) -> Option<NaiveDateTime> {
+    let local = DateTime::parse_from_rfc3339(time)
+        .map(|t| t.naive_local())
+        .or_else(|_| NaiveDateTime::parse_from_str(time, "%Y-%m-%dT%H:%M:%S%.f"))
+        .ok()?;
+    Some(library::truncate_to_hour(filed_at(local, day)))
 }
 
 fn parse_date(date: &str) -> Result<NaiveDate, Error> {
