@@ -1,6 +1,9 @@
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import React from "react";
 import ReactDOM from "react-dom/client";
 
+import { ACTIVITY_WINDOW } from "./activity";
+import { ActivityView } from "./ActivityView";
 import { App } from "./App";
 import { initTimelapseRoot } from "./timelapseRoot";
 
@@ -18,7 +21,8 @@ initTimelapseRoot().then(
       document.getElementById("root") as HTMLElement,
     ).render(
       <React.StrictMode>
-        <App />
+        {/* Window → Activity opens this same page in a window of its own. */}
+        {getCurrentWindow().label === ACTIVITY_WINDOW ? <ActivityView /> : <App />}
       </React.StrictMode>,
     );
   },

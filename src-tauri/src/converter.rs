@@ -25,6 +25,7 @@
 //! An interrupted batch leaves only a staging folder behind, which the next
 //! run clears.
 
+use crate::activity::{Activity, Encoding, State};
 use crate::database::ScreenshotDatabase;
 use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, TimeZone, Timelike};
 use frame_source::filed_at;
@@ -209,8 +210,21 @@ pub fn find_ready_batches(root: &Path, now: DateTime<Local>) -> std::io::Result<
 /// The oldest batch that is ready to convert and that OCR has read in full.
 /// Hours OCR has not finished wait, so the video is only made once the text
 /// has been read from the full-quality PNGs.
+#[cfg(test)]
 pub fn next_batch(root: &Path, now: DateTime<Local>, ocr_done: &OcrCheck) -> std::io::Result<Option<HourBatch>> {
-    Ok(find_ready_batches(root, now)?.into_iter().find(|batch| ocr_done(batch)))
+    Ok(read_batches(root, now, ocr_done)?.0.into_iter().next())
+}
+
+/// Every batch that is ready to convert, split into those OCR has read in
+/// full, oldest first, and how many still wait for OCR.
+pub fn read_batches(
+    root: &Path,
+    now: DateTime<Local>,
+    ocr_done: &OcrCheck,
+) -> std::io::Result<(Vec<HourBatch>, usize)> {
+    let (read, unread): (Vec<_>, Vec<_>) =
+        find_ready_batches(root, now)?.into_iter().partition(|batch| ocr_done(batch));
+    Ok((read, unread.len()))
 }
 
 /// Find every hour whose PNGs may be deleted, oldest first, as the batches
@@ -556,6 +570,7 @@ pub struct Converter {
     root: PathBuf,
     running: Arc<AtomicBool>,
     ocr_done: OcrCheck,
+    activity: Arc<Activity>,
 }
 
 impl Converter {
@@ -564,7 +579,14 @@ impl Converter {
             root,
             running: Arc::new(AtomicBool::new(false)),
             ocr_done,
+            activity: Arc::default(),
         }
+    }
+
+    /// Report progress to `activity`, for the Activity window.
+    pub fn reporting_to(mut self, activity: Arc<Activity>) -> Self {
+        self.activity = activity;
+        self
     }
 
     /// Spawn the conversion loop. Like `Photographer::start`, this calls
@@ -575,6 +597,7 @@ impl Converter {
         let root = self.root.clone();
         let running = Arc::clone(&self.running);
         let ocr_done = Arc::clone(&self.ocr_done);
+        let activity = Arc::clone(&self.activity);
 
         tokio::spawn(async move {
             println!("Starting video conversion background task...");
@@ -583,7 +606,8 @@ impl Converter {
             }
 
             while running.load(Ordering::SeqCst) {
-                let wait = Self::run_once(&root, &running, &ocr_done).await;
+                let (state, wait) = Self::run_once(&root, &running, &ocr_done, &activity).await;
+                activity.converter_sleeps(state, wait);
                 tokio::time::sleep(wait).await;
             }
 
@@ -600,8 +624,14 @@ impl Converter {
     }
 
     /// Delete the PNGs of every hour that may go, convert at most one batch,
-    /// and return how long to wait before the next attempt.
-    async fn run_once(root: &Path, running: &Arc<AtomicBool>, ocr_done: &OcrCheck) -> Duration {
+    /// and return what the converter waits for and how long before the next
+    /// attempt.
+    async fn run_once(
+        root: &Path,
+        running: &Arc<AtomicBool>,
+        ocr_done: &OcrCheck,
+        activity: &Activity,
+    ) -> (State, Duration) {
         let now = Local::now();
 
         // Deleting is cheap, so it does not wait for AC power.
@@ -626,6 +656,7 @@ impl Converter {
                         }
                     }
                     let deleted = delete_frames(&parts);
+                    activity.frames_deleted(deleted);
                     println!("Deleted {} converted frames from {} {:02}:00", deleted, parts[0].day, parts[0].hour);
                 }
             }
@@ -636,15 +667,20 @@ impl Converter {
         }
 
         if !on_ac_power() {
-            return ON_BATTERY_POLL;
+            return (State::OnBattery, ON_BATTERY_POLL);
         }
 
-        let batch = match next_batch(root, now, ocr_done) {
-            Ok(Some(batch)) => batch,
-            Ok(None) => return IDLE_POLL,
+        let batch = match read_batches(root, now, ocr_done) {
+            Ok((read, waiting_for_ocr)) => {
+                activity.conversion_backlog(read.len().saturating_sub(1), waiting_for_ocr);
+                match read.into_iter().next() {
+                    Some(batch) => batch,
+                    None => return (State::Idle, IDLE_POLL),
+                }
+            }
             Err(e) => {
                 eprintln!("Failed to scan for screenshots to convert: {}", e);
-                return IDLE_POLL;
+                return (State::Idle, IDLE_POLL);
             }
         };
 
@@ -655,6 +691,14 @@ impl Converter {
             batch.hour
         );
         let started = Instant::now();
+        let video_name = batch.video_name();
+        activity.encoding_started(Encoding {
+            video: video_name.clone(),
+            day: batch.day.clone(),
+            hour: batch.hour,
+            frames: batch.frames.len(),
+            started_at: Local::now(),
+        });
         let root_owned = root.to_path_buf();
         let running_owned = Arc::clone(running);
         let result = tokio::task::spawn_blocking(move || {
@@ -669,15 +713,18 @@ impl Converter {
         match result {
             Ok(video_name) => {
                 println!("Published {} after {}s", video_name, took.as_secs());
-                rest_after(took)
+                activity.encoding_finished(video_name, took, None);
+                (State::Resting, rest_after(took))
             }
             Err(ConvertError::Interrupted) => {
                 println!("Video conversion interrupted; the frames were kept");
-                ON_BATTERY_POLL
+                activity.encoding_finished(video_name, took, Some("Stopped because the power was unplugged".to_string()));
+                (State::OnBattery, ON_BATTERY_POLL)
             }
             Err(e) => {
                 eprintln!("Video conversion failed, frames kept: {}", e);
-                rest_after(took)
+                activity.encoding_finished(video_name, took, Some(e.to_string()));
+                (State::Resting, rest_after(took))
             }
         }
     }

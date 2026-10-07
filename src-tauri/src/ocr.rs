@@ -12,6 +12,7 @@
 //! macOS; everything else here is platform-independent and tested with a fake
 //! recognizer.
 
+use crate::activity::{Activity, State};
 use crate::converter::{is_day_folder_name, on_ac_power, OcrCheck, HourBatch};
 use crate::database::ScreenshotDatabase;
 use image::imageops;
@@ -166,6 +167,7 @@ pub struct OcrWorker {
     last_read: std::collections::HashMap<String, Thumbnail>,
     /// Text of the last frame recorded in each day folder.
     last_text: std::collections::HashMap<String, String>,
+    activity: Arc<Activity>,
 }
 
 impl OcrWorker {
@@ -176,7 +178,14 @@ impl OcrWorker {
             recognizer,
             last_read: Default::default(),
             last_text: Default::default(),
+            activity: Arc::default(),
         }
+    }
+
+    /// Report progress to `activity`, for the Activity window.
+    pub fn reporting_to(mut self, activity: Arc<Activity>) -> Self {
+        self.activity = activity;
+        self
     }
 
     /// Handle up to `max_frames` frames, oldest day first, and stop early when
@@ -192,10 +201,18 @@ impl OcrWorker {
     ) -> std::io::Result<PassSummary> {
         let mut summary = PassSummary::default();
 
+        // Listed up front so the Activity window can say how much is left.
+        let mut pending = Vec::new();
         for day in day_folders(&self.root)? {
             let done_through = self.db.ocr_done_through(&day).unwrap_or(None).unwrap_or(0);
+            let frames = frames_after(&self.root.join(&day), done_through)?;
+            pending.push((day, frames));
+        }
+        self.activity
+            .ocr_pass_started(pending.iter().map(|(_, frames)| frames.len()).sum());
 
-            for (frame_number, path) in frames_after(&self.root.join(&day), done_through)? {
+        for (day, frames) in pending {
+            for (frame_number, path) in frames {
                 if summary.handled() >= max_frames {
                     return Ok(summary);
                 }
@@ -209,20 +226,27 @@ impl OcrWorker {
                     break;
                 }
 
-                match self.handle_frame(&day, frame_number, &path) {
-                    Ok(true) => summary.recognized += 1,
-                    Ok(false) => summary.skipped += 1,
+                let recognized = match self.handle_frame(&day, frame_number, &path) {
+                    Ok(recognized) => recognized,
                     Err(error) => {
                         // A frame that cannot be read (deleted meanwhile, or
                         // corrupt) is passed over rather than retried forever,
                         // which would hold back the rest of the day.
                         eprintln!("OCR: skipping {}: {}", path.display(), error);
+                        self.activity
+                            .ocr_failed(format!("Skipped {} frame {}: {}", day, frame_number, error));
                         self.db
                             .record_ocr_frame(&day, frame_number, None)
                             .map_err(std::io::Error::other)?;
-                        summary.skipped += 1;
+                        false
                     }
+                };
+                if recognized {
+                    summary.recognized += 1;
+                } else {
+                    summary.skipped += 1;
                 }
+                self.activity.ocr_frame_handled(&day, frame_number, recognized);
             }
         }
 
@@ -271,8 +295,9 @@ impl OcrWorker {
 
 /// Start reading `root` on a background thread that runs for the life of the
 /// app. Returns `false` on platforms without a text recognizer.
-pub fn start_background_ocr(root: PathBuf) -> bool {
+pub fn start_background_ocr(root: PathBuf, activity: Arc<Activity>) -> bool {
     let Some(recognizer) = system_recognizer() else {
+        activity.ocr_unavailable();
         return false;
     };
 
@@ -290,7 +315,7 @@ pub fn start_background_ocr(root: PathBuf) -> bool {
                     return;
                 }
             };
-            let mut worker = OcrWorker::new(root, db, recognizer);
+            let mut worker = OcrWorker::new(root, db, recognizer).reporting_to(activity);
             run_forever(&mut worker);
         })
         .is_ok()
@@ -308,9 +333,14 @@ fn lower_thread_priority() {
 }
 
 fn run_forever(worker: &mut OcrWorker) {
+    let activity = Arc::clone(&worker.activity);
+    let sleep = |state: State, wait: Duration| {
+        activity.ocr_sleeps(state, wait);
+        std::thread::sleep(wait);
+    };
     loop {
         if !on_ac_power() {
-            std::thread::sleep(BATTERY_SLEEP);
+            sleep(State::OnBattery, BATTERY_SLEEP);
             continue;
         }
 
@@ -319,10 +349,11 @@ fn run_forever(worker: &mut OcrWorker) {
                 "OCR: read {} frames, skipped {} unchanged",
                 summary.recognized, summary.skipped
             ),
-            Ok(_) => std::thread::sleep(IDLE_SLEEP),
+            Ok(_) => sleep(State::Idle, IDLE_SLEEP),
             Err(error) => {
                 eprintln!("OCR pass failed: {}", error);
-                std::thread::sleep(IDLE_SLEEP);
+                activity.ocr_failed(format!("Pass failed: {}", error));
+                sleep(State::Idle, IDLE_SLEEP);
             }
         }
     }
@@ -537,6 +568,26 @@ mod tests {
         fn done_through(&self, day: &str) -> Option<u32> {
             self.worker.db.ocr_done_through(day).unwrap()
         }
+    }
+
+    #[test]
+    fn reports_progress_to_the_activity_window() {
+        let mut library = Library::new();
+        let activity = Arc::new(Activity::default());
+        let db = ScreenshotDatabase::new(library.root.join("screenshots.db")).unwrap();
+        library.worker = OcrWorker::new(library.root.clone(), db, Box::new(SameText))
+            .reporting_to(Arc::clone(&activity));
+        frame(&library.root, DAY_1, 1, 0, false);
+        frame(&library.root, DAY_1, 2, 0, false);
+        frame(&library.root, DAY_1, 3, 0, true);
+
+        library.pass();
+
+        let ocr = activity.snapshot(false, || true).ocr;
+        assert_eq!((ocr.recognized, ocr.skipped), (1, 1));
+        assert_eq!(ocr.current.map(|f| (f.day, f.number)), Some((DAY_1.to_string(), 2)));
+        // The fresh frame waits for the next pass.
+        assert_eq!(ocr.remaining, 1);
     }
 
     #[test]

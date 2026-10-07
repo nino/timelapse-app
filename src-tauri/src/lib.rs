@@ -1,3 +1,4 @@
+mod activity;
 mod converter;
 mod timelapse;
 mod database;
@@ -10,7 +11,9 @@ use tauri::http::{header, Response, StatusCode};
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use tauri::{Manager, State};
+use tauri::menu::{Menu, MenuItem, MenuItemKind, PredefinedMenuItem, WINDOW_SUBMENU_ID};
+use tauri::{AppHandle, Manager, Runtime, State, WebviewUrl, WebviewWindowBuilder};
+use activity::{Activity, Snapshot};
 use database::{OcrHit, ScreenshotDatabase};
 use serde::Serialize;
 use timelapse::Photographer;
@@ -21,6 +24,12 @@ type PhotographerState = Arc<Mutex<Option<Photographer>>>;
 /// Answers "frame N of day D" for the viewer. Managed once `setup` has
 /// resolved the cache directory.
 type FrameSourceState = Arc<FrameSource>;
+
+/// What capture, conversion and OCR are doing, for the Activity window.
+type ActivityState = Arc<Activity>;
+
+/// Label of the Activity window, and id of the menu item that opens it.
+const ACTIVITY_WINDOW: &str = "activity";
 
 /// Decoded video frames are disposable, so the cache lives in the OS cache
 /// directory rather than in the (possibly synced) library.
@@ -117,9 +126,15 @@ fn get_screenshot_metadata_impl(
 }
 
 #[tauri::command]
-async fn start_timelapse(state: State<'_, PhotographerState>) -> Result<String, String> {
+async fn start_timelapse(
+    state: State<'_, PhotographerState>,
+    activity: State<'_, ActivityState>,
+) -> Result<String, String> {
+    let activity = Arc::clone(activity.inner());
     start_timelapse_impl(state.inner(), || {
-        Photographer::new().map_err(|e| e.to_string())
+        Photographer::new()
+            .map(|photographer| photographer.reporting_to(activity))
+            .map_err(|e| e.to_string())
     })
 }
 
@@ -469,15 +484,70 @@ async fn evict_old_cache() -> Result<String, String> {
     evict_old_cache_impl(&timelapse_root)
 }
 
+/// What capture, conversion and OCR are doing right now. It only reads
+/// memory (and, every few seconds, the power source), so the Activity window
+/// can poll it.
+#[tauri::command]
+async fn get_activity(
+    activity: State<'_, ActivityState>,
+    photographer: State<'_, PhotographerState>,
+) -> Result<Snapshot, String> {
+    let capturing = is_timelapse_running_impl(photographer.inner())?;
+    let activity = Arc::clone(activity.inner());
+    run_blocking(move || Ok(activity.snapshot(capturing, converter::on_ac_power))).await
+}
+
+/// The standard menu bar, with "Activity" added to the Window menu.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn app_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
+    let menu = Menu::default(app)?;
+    if let Some(MenuItemKind::Submenu(window)) = menu.get(WINDOW_SUBMENU_ID) {
+        window.append(&PredefinedMenuItem::separator(app)?)?;
+        window.append(&MenuItem::with_id(app, ACTIVITY_WINDOW, "Activity", true, None::<&str>)?)?;
+    }
+    Ok(menu)
+}
+
+/// Bring the Activity window to the front, opening it if it isn't open. It
+/// loads the same page as the main window, which picks the view by the
+/// window's label.
+fn show_activity_window<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
+    if let Some(window) = app.get_webview_window(ACTIVITY_WINDOW) {
+        window.unminimize()?;
+        window.show()?;
+        return window.set_focus();
+    }
+    WebviewWindowBuilder::new(app, ACTIVITY_WINDOW, WebviewUrl::App("index.html".into()))
+        .title("Activity")
+        .inner_size(460.0, 700.0)
+        .min_inner_size(360.0, 360.0)
+        .build()?;
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let photographer_state: PhotographerState = Arc::new(Mutex::new(None));
+    let activity: ActivityState = Arc::default();
 
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    // Elsewhere a menu would add a menu bar to the main window.
+    #[cfg(target_os = "macos")]
+    let builder = builder.menu(app_menu);
+
+    builder
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(photographer_state)
+        .manage(activity)
+        .on_menu_event(|app, event| {
+            if event.id() == ACTIVITY_WINDOW {
+                if let Err(e) = show_activity_window(app) {
+                    eprintln!("Could not open the Activity window: {}", e);
+                }
+            }
+        })
         .register_asynchronous_uri_scheme_protocol("frames", |ctx, request, responder| {
             let source = ctx
                 .app_handle()
@@ -528,6 +598,7 @@ pub fn run() {
             // Start timelapse automatically when app is ready
             let photographer_state = app.state::<PhotographerState>();
             let state_clone = Arc::clone(&photographer_state.inner());
+            let activity = Arc::clone(app.state::<ActivityState>().inner());
 
             tauri::async_runtime::spawn(async move {
                 tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
@@ -540,6 +611,7 @@ pub fn run() {
 
                 match Photographer::new() {
                     Ok(photographer) => {
+                        let photographer = photographer.reporting_to(Arc::clone(&activity));
                         photographer.start();
                         let mut guard = state_clone.lock().unwrap();
                         *guard = Some(photographer);
@@ -561,9 +633,10 @@ pub fn run() {
                             root.clone(),
                             ocr::ocr_check(&root),
                         )
+                        .reporting_to(Arc::clone(&activity))
                         .start();
 
-                        if ocr::start_background_ocr(root) {
+                        if ocr::start_background_ocr(root, activity) {
                             println!("OCR started");
                         } else {
                             println!("OCR is not available on this platform");
@@ -593,7 +666,8 @@ pub fn run() {
             search_ocr_day,
             get_match_lines,
             count_ocr_matches,
-            get_ocr_version
+            get_ocr_version,
+            get_activity
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
