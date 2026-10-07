@@ -61,14 +61,21 @@ impl ScreenshotDatabase {
             [],
         )?;
 
-        // Run migrations
-        Self::run_migrations(&mut conn)?;
+        // Run migrations. A migration that shrank the OCR data leaves the
+        // freed pages inside the file until it is vacuumed.
+        if Self::run_migrations(&mut conn)? {
+            // Not fatal: the space is reused by later writes either way.
+            if let Err(e) = conn.execute_batch("VACUUM") {
+                eprintln!("Failed to vacuum the database: {}", e);
+            }
+        }
 
         Ok(Self { conn })
     }
 
-    /// Run all pending migrations
-    fn run_migrations(conn: &mut Connection) -> Result<()> {
+    /// Run all pending migrations. Returns whether the file should be
+    /// vacuumed, which can't happen inside the migrations' transaction.
+    fn run_migrations(conn: &mut Connection) -> Result<bool> {
         // Migration 1: Split creation_date into created_at and local_time.
         //
         // The applied-check, the table rewrite and the bookkeeping insert all run
@@ -172,9 +179,74 @@ impl ScreenshotDatabase {
             )?;
         }
 
+        // Migration 4: store each OCR row's line boxes as packed integers
+        // instead of JSON that repeated every line's text, and drop rows
+        // whose text is the same as the row before them.
+        let mut vacuum = false;
+        if !Self::migration_applied(&tx, "compact_ocr_frames")? {
+            Self::compact_ocr_frames(&tx)?;
+            tx.execute(
+                "INSERT INTO migrations (migration_name, applied_at) VALUES (?1, ?2)",
+                rusqlite::params!["compact_ocr_frames", Utc::now().to_rfc3339()],
+            )?;
+            vacuum = true;
+        }
+
         tx.commit()?;
 
-        Ok(())
+        Ok(vacuum)
+    }
+
+    fn compact_ocr_frames(tx: &Transaction) -> Result<()> {
+        // The update trigger re-indexed a row on any update; only a change of
+        // text needs that, and filling in `boxes` below is not one.
+        tx.execute_batch(
+            "DROP TRIGGER ocr_frames_au;
+             CREATE TRIGGER ocr_frames_au AFTER UPDATE OF text ON ocr_frames BEGIN
+                 INSERT INTO ocr_fts (ocr_fts, rowid, text) VALUES ('delete', old.id, old.text);
+                 INSERT INTO ocr_fts (rowid, text) VALUES (new.id, new.text);
+             END;
+             -- See `pack_boxes`. Line N of `text` has box N.
+             ALTER TABLE ocr_frames ADD COLUMN boxes BLOB NOT NULL DEFAULT x'';",
+        )?;
+
+        #[derive(serde::Deserialize)]
+        struct JsonLine {
+            x: f64,
+            y: f64,
+            width: f64,
+            height: f64,
+        }
+        {
+            let mut select = tx.prepare("SELECT id, lines_json FROM ocr_frames")?;
+            let mut update = tx.prepare("UPDATE ocr_frames SET boxes = ?1 WHERE id = ?2")?;
+            let mut rows = select.query([])?;
+            while let Some(row) = rows.next()? {
+                let id: i64 = row.get(0)?;
+                let json: String = row.get(1)?;
+                // A row whose JSON can't be read keeps no boxes, so it gets
+                // no highlights, which is all the JSON was for.
+                let boxes: Vec<LineBox> = serde_json::from_str::<Vec<JsonLine>>(&json)
+                    .map(|lines| {
+                        lines.iter().map(|l| [l.x, l.y, l.width, l.height]).collect()
+                    })
+                    .unwrap_or_default();
+                update.execute(rusqlite::params![pack_boxes(&boxes), id])?;
+            }
+        }
+
+        // A row stands for every frame up to the next one, so a row with the
+        // same text as the one before it adds nothing a search can find.
+        tx.execute_batch(
+            "DELETE FROM ocr_frames WHERE id IN (
+                 SELECT id FROM (
+                     SELECT id, text,
+                            LAG(text) OVER (PARTITION BY day ORDER BY frame_number) AS previous
+                     FROM ocr_frames
+                 ) WHERE text = previous
+             );
+             ALTER TABLE ocr_frames DROP COLUMN lines_json;",
+        )
     }
 
     fn add_day_and_ocr(tx: &Transaction) -> Result<()> {
@@ -280,26 +352,26 @@ impl ScreenshotDatabase {
     }
 
     /// Record that OCR has handled frame `frame_number` of `day`. `result` is
-    /// the recognized text and the per-line JSON, or `None` when the frame was
-    /// skipped because the screen had not changed. Either way the day's
-    /// progress mark moves up to this frame.
+    /// the recognized text, one line per box, and the boxes, or `None` when
+    /// the frame was skipped because the screen had not changed. Either way
+    /// the day's progress mark moves up to this frame.
     pub fn record_ocr_frame(
         &self,
         day: &str,
         frame_number: u32,
-        result: Option<(&str, &str)>,
+        result: Option<(&str, &[LineBox])>,
     ) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
 
-        if let Some((text, lines_json)) = result {
+        if let Some((text, boxes)) = result {
             tx.execute(
-                "INSERT INTO ocr_frames (day, frame_number, text, lines_json, processed_at)
+                "INSERT INTO ocr_frames (day, frame_number, text, boxes, processed_at)
                  VALUES (?1, ?2, ?3, ?4, ?5)
                  ON CONFLICT (day, frame_number) DO UPDATE SET
                      text = excluded.text,
-                     lines_json = excluded.lines_json,
+                     boxes = excluded.boxes,
                      processed_at = excluded.processed_at",
-                rusqlite::params![day, frame_number, text, lines_json, Utc::now().to_rfc3339()],
+                rusqlite::params![day, frame_number, text, pack_boxes(boxes), Utc::now().to_rfc3339()],
             )?;
         }
 
@@ -472,14 +544,14 @@ impl ScreenshotDatabase {
         counts
     }
 
-    /// The recognized lines of frame `frame_number` of `day`, as `ocr::OcrLine`s
-    /// in JSON, or `None` if OCR has no row for it.
-    pub fn ocr_lines(&self, day: &str, frame_number: u32) -> Result<Option<String>> {
+    /// The recognized text of frame `frame_number` of `day` and the box of
+    /// each of its lines, or `None` if OCR has no row for it.
+    pub fn ocr_lines(&self, day: &str, frame_number: u32) -> Result<Option<(String, Vec<LineBox>)>> {
         self.conn
             .query_row(
-                "SELECT lines_json FROM ocr_frames WHERE day = ?1 AND frame_number = ?2",
+                "SELECT text, boxes FROM ocr_frames WHERE day = ?1 AND frame_number = ?2",
                 rusqlite::params![day, frame_number],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, unpack_boxes(&row.get::<_, Vec<u8>>(1)?))),
             )
             .optional()
     }
@@ -496,6 +568,34 @@ impl ScreenshotDatabase {
             |row| row.get(0),
         )
     }
+}
+
+/// One OCR line's box as `[x, y, width, height]`, normalized to the frame's
+/// size, with the origin at the bottom-left corner as Vision reports it.
+pub type LineBox = [f64; 4];
+
+/// Each coordinate as a little-endian u16 over 0..=1, 8 bytes a line: a
+/// 65535th of the 1800-pixel frame width is far below a pixel, and a frame of
+/// 100 lines takes under 1 KB where the JSON it replaced took about 15.
+pub fn pack_boxes(boxes: &[LineBox]) -> Vec<u8> {
+    boxes
+        .iter()
+        .flatten()
+        .flat_map(|v| ((v.clamp(0.0, 1.0) * 65535.0).round() as u16).to_le_bytes())
+        .collect()
+}
+
+pub fn unpack_boxes(bytes: &[u8]) -> Vec<LineBox> {
+    bytes
+        .chunks_exact(8)
+        .map(|line| {
+            let mut b = [0.0; 4];
+            for (v, pair) in b.iter_mut().zip(line.chunks_exact(2)) {
+                *v = f64::from(u16::from_le_bytes([pair[0], pair[1]])) / 65535.0;
+            }
+            b
+        })
+        .collect()
 }
 
 /// Which of `lines` hold at least one word of `query`, matched the way the
@@ -902,11 +1002,11 @@ mod tests {
 
         assert_eq!(db.ocr_done_through("2024-01-01").unwrap(), None);
 
-        db.record_ocr_frame("2024-01-01", 1, Some(("hello", "[]"))).unwrap();
+        db.record_ocr_frame("2024-01-01", 1, Some(("hello", &[]))).unwrap();
         db.record_ocr_frame("2024-01-01", 2, None).unwrap();
         assert_eq!(db.ocr_done_through("2024-01-01").unwrap(), Some(2));
 
-        db.record_ocr_frame("2024-01-01", 1, Some(("hello again", "[]"))).unwrap();
+        db.record_ocr_frame("2024-01-01", 1, Some(("hello again", &[]))).unwrap();
         assert_eq!(db.ocr_done_through("2024-01-01").unwrap(), Some(2));
 
         // Skipped frames get no row of their own.
@@ -969,11 +1069,11 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let db = ScreenshotDatabase::new(temp_dir.path().join("test.db")).unwrap();
 
-        db.record_ocr_frame("2024-01-01", 3, Some(("ffmpeg -i input.mov\nChápter 1", "[]")))
+        db.record_ocr_frame("2024-01-01", 3, Some(("ffmpeg -i input.mov\nChápter 1", &[])))
             .unwrap();
-        db.record_ocr_frame("2024-01-02", 9, Some(("Blender: modelling the chair", "[]")))
+        db.record_ocr_frame("2024-01-02", 9, Some(("Blender: modelling the chair", &[])))
             .unwrap();
-        db.record_ocr_frame("2024-01-02", 12, Some(("chapter list for the chair video", "[]")))
+        db.record_ocr_frame("2024-01-02", 12, Some(("chapter list for the chair video", &[])))
             .unwrap();
 
         // Newest first.
@@ -998,8 +1098,8 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let db = ScreenshotDatabase::new(temp_dir.path().join("test.db")).unwrap();
 
-        db.record_ocr_frame("2024-01-01", 1, Some(("old words", "[]"))).unwrap();
-        db.record_ocr_frame("2024-01-01", 1, Some(("new words", "[]"))).unwrap();
+        db.record_ocr_frame("2024-01-01", 1, Some(("old words", &[]))).unwrap();
+        db.record_ocr_frame("2024-01-01", 1, Some(("new words", &[]))).unwrap();
 
         assert_eq!(search(&db, "old"), Vec::<(String, u32)>::new());
         assert_eq!(search(&db, "new"), vec![hit("2024-01-01", 1)]);
@@ -1010,12 +1110,12 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let db = ScreenshotDatabase::new(temp_dir.path().join("test.db")).unwrap();
 
-        db.record_ocr_frame("2024-01-01", 2, Some(("cargo build", "[1]"))).unwrap();
+        db.record_ocr_frame("2024-01-01", 2, Some(("cargo build", &[]))).unwrap();
         db.record_ocr_frame("2024-01-01", 3, None).unwrap();
-        db.record_ocr_frame("2024-01-01", 5, Some(("bun test", "[2]"))).unwrap();
-        db.record_ocr_frame("2024-01-01", 8, Some(("cargo test", "[3]"))).unwrap();
+        db.record_ocr_frame("2024-01-01", 5, Some(("bun test", &[[0.0, 1.0, 1.0, 0.0]]))).unwrap();
+        db.record_ocr_frame("2024-01-01", 8, Some(("cargo test", &[]))).unwrap();
         db.record_ocr_frame("2024-01-01", 9, None).unwrap();
-        db.record_ocr_frame("2024-01-02", 1, Some(("cargo run", "[4]"))).unwrap();
+        db.record_ocr_frame("2024-01-02", 1, Some(("cargo run", &[]))).unwrap();
 
         let found: Vec<_> = db
             .search_ocr_in_day("2024-01-01", "cargo")
@@ -1031,7 +1131,10 @@ mod tests {
                 (8, None, Some(9)),
             ]
         );
-        assert_eq!(db.ocr_lines("2024-01-01", 5).unwrap().as_deref(), Some("[2]"));
+        assert_eq!(
+            db.ocr_lines("2024-01-01", 5).unwrap(),
+            Some(("bun test".to_string(), vec![[0.0, 1.0, 1.0, 0.0]]))
+        );
         assert_eq!(db.ocr_lines("2024-01-01", 3).unwrap(), None);
         assert!(db.search_ocr_in_day("2024-01-01", "  ").unwrap().is_empty());
         assert!(db.search_ocr_in_day("2024-01-03", "cargo").unwrap().is_empty());
@@ -1043,12 +1146,12 @@ mod tests {
         let db = ScreenshotDatabase::new(temp_dir.path().join("test.db")).unwrap();
 
         // Two runs on the 1st: frames 2-5, then 9.
-        db.record_ocr_frame("2024-01-01", 2, Some(("cargo build", "[]"))).unwrap();
-        db.record_ocr_frame("2024-01-01", 5, Some(("cargo test", "[]"))).unwrap();
-        db.record_ocr_frame("2024-01-01", 7, Some(("bun test", "[]"))).unwrap();
-        db.record_ocr_frame("2024-01-01", 9, Some(("cargo run", "[]"))).unwrap();
-        db.record_ocr_frame("2024-01-02", 1, Some(("cargo run", "[]"))).unwrap();
-        db.record_ocr_frame("2024-01-03", 1, Some(("bun run", "[]"))).unwrap();
+        db.record_ocr_frame("2024-01-01", 2, Some(("cargo build", &[]))).unwrap();
+        db.record_ocr_frame("2024-01-01", 5, Some(("cargo test", &[]))).unwrap();
+        db.record_ocr_frame("2024-01-01", 7, Some(("bun test", &[]))).unwrap();
+        db.record_ocr_frame("2024-01-01", 9, Some(("cargo run", &[]))).unwrap();
+        db.record_ocr_frame("2024-01-02", 1, Some(("cargo run", &[]))).unwrap();
+        db.record_ocr_frame("2024-01-03", 1, Some(("bun run", &[]))).unwrap();
 
         assert_eq!(
             db.count_ocr_matches("cargo").unwrap(),
@@ -1081,7 +1184,7 @@ mod tests {
         db.record_ocr_frame("2024-01-01", 1, None).unwrap();
         let skipped = reader.ocr_version().unwrap();
         assert_ne!(before, skipped);
-        db.record_ocr_frame("2024-01-01", 2, Some(("cargo", "[]"))).unwrap();
+        db.record_ocr_frame("2024-01-01", 2, Some(("cargo", &[]))).unwrap();
         assert_ne!(skipped, reader.ocr_version().unwrap());
         assert_eq!(reader.count_ocr_matches("cargo").unwrap().len(), 1);
     }
@@ -1092,6 +1195,124 @@ mod tests {
         assert_eq!(fts_query(" a  b "), Some("\"a\" \"b\"*".to_string()));
         assert_eq!(fts_query("say \"hi\""), Some("\"say\" \"\"\"hi\"\"\"*".to_string()));
         assert_eq!(fts_query(""), None);
+    }
+
+    #[test]
+    fn test_boxes_pack_to_a_65535th() {
+        let boxes = [[0.0, 1.0, 0.125, 0.3333], [-0.5, 2.0, 0.5, 0.999_99]];
+        let packed = pack_boxes(&boxes);
+        assert_eq!(packed.len(), 16);
+        let unpacked = unpack_boxes(&packed);
+        let clamped = [[0.0, 1.0, 0.125, 0.3333], [0.0, 1.0, 0.5, 0.999_99]];
+        for (got, want) in unpacked.iter().flatten().zip(clamped.iter().flatten()) {
+            assert!((got - want).abs() <= 0.5 / 65535.0, "{got} vs {want}");
+        }
+        assert!(unpack_boxes(&[]).is_empty());
+    }
+
+    #[test]
+    fn test_compact_ocr_frames_migration() {
+        // A library from before the boxes were packed: lines_json repeats
+        // every line, and OCR wrote a row each time the pixels changed.
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        {
+            let mut conn = Connection::open(&db_path).unwrap();
+            let tx = conn.transaction().unwrap();
+            tx.execute_batch(
+                "CREATE TABLE migrations (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     migration_name TEXT UNIQUE NOT NULL,
+                     applied_at TEXT NOT NULL
+                 );
+                 INSERT INTO migrations (migration_name, applied_at) VALUES
+                     ('split_timestamps', '2024-01-01T00:00:00Z'),
+                     ('add_day_and_ocr', '2024-01-01T00:00:00Z');
+                 CREATE TABLE screenshots (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     frame_number INTEGER NOT NULL,
+                     created_at TEXT NOT NULL,
+                     local_time TEXT NOT NULL
+                 );",
+            )
+            .unwrap();
+            ScreenshotDatabase::add_day_and_ocr(&tx).unwrap();
+            let line = |text: &str, y: f64| {
+                format!(
+                    r#"{{"text":"{text}","confidence":0.5,"x":0.25,"y":{y},"width":0.5,"height":0.125}}"#
+                )
+            };
+            let rows = [
+                ("2024-01-01", 1, "cargo build\nok", format!("[{},{}]", line("cargo build", 0.5), line("ok", 0.0))),
+                ("2024-01-01", 4, "cargo build\nok", "[]".to_string()),
+                ("2024-01-01", 7, "cargo test", format!("[{}]", line("cargo test", 0.5))),
+                ("2024-01-01", 9, "cargo build\nok", "[]".to_string()),
+                ("2024-01-02", 1, "cargo test", "not json".to_string()),
+            ];
+            for (day, frame, text, json) in rows {
+                tx.execute(
+                    "INSERT INTO ocr_frames (day, frame_number, text, lines_json, processed_at)
+                     VALUES (?1, ?2, ?3, ?4, '2024-01-01T00:00:00Z')",
+                    rusqlite::params![day, frame, text, json],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+
+        let db = ScreenshotDatabase::new(db_path).unwrap();
+
+        // Frame 4 repeated frame 1; frame 9 came back after something else,
+        // and the next day starts afresh.
+        let frames: Vec<(String, u32)> = db
+            .conn
+            .prepare("SELECT day, frame_number FROM ocr_frames ORDER BY day, frame_number")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_>>()
+            .unwrap();
+        let frames: Vec<(&str, u32)> = frames.iter().map(|(d, f)| (d.as_str(), *f)).collect();
+        assert_eq!(
+            frames,
+            vec![("2024-01-01", 1), ("2024-01-01", 7), ("2024-01-01", 9), ("2024-01-02", 1)]
+        );
+
+        assert_eq!(
+            db.ocr_lines("2024-01-01", 1).unwrap(),
+            Some((
+                "cargo build\nok".to_string(),
+                unpack_boxes(&pack_boxes(&[[0.25, 0.5, 0.5, 0.125], [0.25, 0.0, 0.5, 0.125]]))
+            ))
+        );
+        assert_eq!(db.ocr_lines("2024-01-02", 1).unwrap(), Some(("cargo test".to_string(), vec![])));
+
+        let has_json: i32 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('ocr_frames') WHERE name = 'lines_json'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_json, 0);
+
+        // The index lost the deleted row and still finds the others.
+        let found: Vec<u32> = db
+            .search_ocr_in_day("2024-01-01", "build")
+            .unwrap()
+            .into_iter()
+            .map(|m| m.frame_number)
+            .collect();
+        assert_eq!(found, vec![1, 9]);
+        let in_index: i32 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM ocr_fts WHERE ocr_fts MATCH 'cargo'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(in_index, 4);
+        db.conn
+            .execute_batch("INSERT INTO ocr_fts (ocr_fts, rank) VALUES ('integrity-check', 1)")
+            .unwrap();
     }
 
     #[test]
