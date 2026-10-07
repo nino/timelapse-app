@@ -22,7 +22,8 @@ export function stretchPositions(
  * The stretches of the day still to be decoded from video, drawn as soft
  * white bands under the scrubber. Each is its own rounded, glowing element
  * so it reads as a deliberate mark rather than a hard-edged gap in the track.
- * Goes inside a `relative` container, before the range input.
+ * Centred vertically in the bar it sits in. Goes inside a `relative`
+ * container, before the range input.
  */
 export function PendingStretches({
   pending,
@@ -32,12 +33,12 @@ export function PendingStretches({
   const stretches = stretchPositions(pending);
   if (stretches.length === 0) return null;
   return (
-    <div aria-hidden className="pointer-events-none absolute top-0 left-1 right-1 h-2">
+    <div aria-hidden className="pointer-events-none absolute inset-y-0 left-1 right-1">
       {stretches.map(({ left, width }) => (
         <div
           key={left}
           data-pending-stretch
-          className="absolute inset-y-0 min-w-2 rounded-full bg-white/90 shadow-[0_0_6px_2px_rgba(255,255,255,0.8)]"
+          className="absolute top-1/2 h-2 -translate-y-1/2 min-w-2 rounded-full bg-white/90 shadow-[0_0_6px_2px_rgba(255,255,255,0.8)]"
           style={{ left: `${left}%`, width: `${width}%` }}
         />
       ))}
