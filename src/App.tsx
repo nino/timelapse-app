@@ -12,6 +12,7 @@ import {
 import { usePendingFrames } from "./hooks/usePendingFrames";
 import { PendingStretches } from "./PendingStretches";
 import { nextStop, previousStop, rangeAt, toStops, type DayMatch, type Stop } from "./search";
+import { fieldFrame, focusRing, outlineButton } from "./ui";
 
 // How many other days the find bar names before folding the rest away.
 const OTHER_DAYS_SHOWN = 4;
@@ -193,7 +194,7 @@ export function App(): React.ReactNode {
   if (error) {
     return (
       <main className="flex items-center justify-center h-screen">
-        <div className="text-red-500">
+        <div className="text-danger">
           <p>Could not load the timelapse library: {error.message}</p>
         </div>
       </main>
@@ -201,34 +202,37 @@ export function App(): React.ReactNode {
   }
 
   return (
-    <main className="h-screen overflow-hidden grid grid-rows-[min-content_1fr_56px] bg-gray-100 text-black">
-      <header className="bg-gray-100 p-3 border-b border-gray-200">
+    <main className="h-screen overflow-hidden grid grid-rows-[min-content_1fr_auto] bg-page text-fg">
+      <header className="bg-card px-4 py-2.5 border-b border-border">
         <div className="flex items-center gap-4">
-          <h1 className="text-lg font-semibold">Timelapse Viewer</h1>
-
-          <select
-            aria-label="Day"
-            value={selectedDay ?? ""}
-            onChange={(e) => setSelectedDay(e.target.value || null)}
-            className="bg-gray-700 text-white px-3 py-1 rounded border border-gray-600 focus:outline-none focus:ring-2 focus:ring-blue-500"
-          >
-            {selectedDay === null && <option value="">Select a day…</option>}
-            {[...days].reverse().map((date) => (
-              <option key={date} value={date}>
-                {date} {date === today ? "(Today)" : ""}
-              </option>
-            ))}
-          </select>
+          <div className="relative">
+            <select
+              aria-label="Day"
+              value={selectedDay ?? ""}
+              onChange={(e) => setSelectedDay(e.target.value || null)}
+              className={`${fieldFrame} appearance-none h-9 pl-3 pr-8 text-sm font-medium ${focusRing}`}
+            >
+              {selectedDay === null && <option value="">Select a day…</option>}
+              {[...days].reverse().map((date) => (
+                <option key={date} value={date}>
+                  {date} {date === today ? "(Today)" : ""}
+                </option>
+              ))}
+            </select>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true" className="absolute right-2.5 top-1/2 -translate-y-1/2 pointer-events-none text-muted-fg">
+              <path d="m6 9 6 6 6-6" />
+            </svg>
+          </div>
 
           {frameCount > 0 && (
-            <span className="text-gray-600 text-sm tabular-nums">
+            <span className="text-muted-fg text-sm tabular-nums">
               Frame {currentIndex + 1} / {frameCount}
             </span>
           )}
 
           <div className="ml-auto flex items-center gap-1.5">
-            <label className="flex items-center gap-2 w-72 h-8 px-2.5 bg-white border border-gray-300 rounded focus-within:border-blue-500 focus-within:ring-1 focus-within:ring-blue-500">
-              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#6b7280" strokeWidth="2" aria-hidden="true">
+            <label className={`${fieldFrame} flex items-center gap-2 w-72 h-9 px-2.5`}>
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true" className="shrink-0 text-muted-fg">
                 <circle cx="11" cy="11" r="7" />
                 <path d="m20 20-3.5-3.5" />
               </svg>
@@ -251,10 +255,10 @@ export function App(): React.ReactNode {
                     e.currentTarget.blur();
                   }
                 }}
-                className="flex-1 min-w-0 bg-transparent text-sm focus:outline-none"
+                className="flex-1 min-w-0 bg-transparent text-sm outline-none placeholder:text-muted-fg"
               />
               {query !== "" && (
-                <span className="text-xs text-gray-600 whitespace-nowrap tabular-nums" aria-live="polite">
+                <span className="text-xs text-muted-fg whitespace-nowrap tabular-nums" aria-live="polite">
                   {matchLabel(stops, matches, matchesError, currentIndex)}
                 </span>
               )}
@@ -265,7 +269,7 @@ export function App(): React.ReactNode {
               title="Previous match (Shift+Enter)"
               disabled={stops.length === 0}
               onClick={() => stepToMatch(-1)}
-              className="w-8 h-8 flex items-center justify-center bg-white border border-gray-300 rounded text-gray-700 disabled:opacity-40"
+              className={`${outlineButton} size-9`}
             >
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
                 <path d="m15 18-6-6 6-6" />
@@ -277,7 +281,7 @@ export function App(): React.ReactNode {
               title="Next match (Enter)"
               disabled={stops.length === 0}
               onClick={() => stepToMatch(1)}
-              className="w-8 h-8 flex items-center justify-center bg-white border border-gray-300 rounded text-gray-700 disabled:opacity-40"
+              className={`${outlineButton} size-9`}
             >
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
                 <path d="m9 18 6-6-6-6" />
@@ -344,7 +348,7 @@ export function App(): React.ReactNode {
           </svg>
         )}
         {(!src || frameFailed) && (
-          <div className="flex items-center justify-center h-full text-gray-500 text-center">
+          <div className="flex items-center justify-center h-full text-muted-fg text-center">
             <p className="text-xl">
               {frameFailed
                 ? "Could not load this frame"
@@ -358,9 +362,9 @@ export function App(): React.ReactNode {
         )}
       </div>
 
-      <div className="bg-gray-100 p-4">
+      <div className="bg-card px-4 py-3 border-t border-border">
         <div className="flex items-center gap-4">
-          <div className="relative flex-1 bg-gray-200 p-1 pt-0 rounded-full">
+          <div className="relative flex-1 bg-border p-1 pt-0 rounded-full">
             <PendingStretches pending={pendingFrames} />
             <MatchMarks stops={stops} frameCount={frameCount} currentIndex={currentIndex} />
             <input
@@ -371,12 +375,12 @@ export function App(): React.ReactNode {
               value={currentIndex}
               onChange={(e) => goTo(parseInt(e.target.value, 10))}
               disabled={frameCount === 0}
-              className="relative w-full h-2 bg-gray-300 rounded-lg appearance-none cursor-pointer
+              className="relative block w-full h-2 rounded-full appearance-none cursor-pointer
                          disabled:opacity-50 disabled:cursor-not-allowed"
             />
           </div>
           <div
-            className="text-sm text-gray-600 min-w-[60px] text-center tabular-nums"
+            className="text-sm font-medium text-muted-fg min-w-[60px] text-center tabular-nums"
             title={frameTime && !frameTime.exact ? "Estimated" : undefined}
           >
             {formatFrameTime(frameTime)}
@@ -459,20 +463,20 @@ function OtherDays({
   const hidden = counts.length - shown.length;
   return (
     <nav aria-label="Other days with matches" className="flex flex-wrap items-center gap-2 mt-2 text-sm">
-      <span className="text-gray-600">Also on</span>
+      <span className="text-muted-fg">Also on</span>
       {shown.map(({ day, count }) => (
         <button
           key={day}
           type="button"
           onClick={() => onPick(day)}
-          className="flex items-center gap-1.5 px-2.5 py-0.5 bg-white border border-gray-200 rounded-full hover:border-gray-400"
+          className={`flex items-center gap-1.5 px-2.5 py-0.5 bg-card border border-border rounded-full shadow-xs transition-colors hover:bg-muted ${focusRing}`}
         >
           {day === today ? "Today" : day}
-          <span className="text-gray-500 tabular-nums">{count}</span>
+          <span className="text-muted-fg tabular-nums">{count}</span>
         </button>
       ))}
       {hidden > 0 && (
-        <button type="button" onClick={onShowAll} className="text-blue-700 hover:underline">
+        <button type="button" onClick={onShowAll} className={`rounded-sm font-medium text-fg underline-offset-4 hover:underline ${focusRing}`}>
           {hidden === 1 ? "1 more day" : `${hidden} more days`}
         </button>
       )}

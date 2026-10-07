@@ -1,14 +1,80 @@
 @import "tailwindcss";
 
-:root {
-  font-family: system-ui, sans-serif;
+/* The Ninoes design system (github.com/nino/ninoes, app/app.css), copied here:
+   the same tokens, fonts and corner shapes. The fonts are bundled through
+   @fontsource rather than loaded from Bunny Fonts, because this is an offline
+   desktop app. */
+@import "@fontsource/bricolage-grotesque/400.css";
+@import "@fontsource/bricolage-grotesque/500.css";
+@import "@fontsource/bricolage-grotesque/600.css";
+@import "@fontsource/bricolage-grotesque/700.css";
+@import "@fontsource/bevan/400.css";
+
+@theme {
+  --font-sans: "Bricolage Grotesque", ui-sans-serif, system-ui, sans-serif;
+  --font-title: Bevan, Rockwell, Georgia, serif;
+
+  /* Palette (shadcn zinc, tinted toward a cool blue). Swapped for dark mode
+     below. */
+  --color-page: oklch(0.982 0.008 225);
+  --color-card: oklch(0.996 0.003 225);
+  --color-fg: oklch(0.15 0.02 240);
+  --color-muted: oklch(0.956 0.012 225);
+  --color-muted-fg: oklch(0.45 0.03 235);
+  --color-faint-fg: oklch(0.56 0.025 235);
+  --color-border: oklch(0.87 0.018 225);
+  --color-input: oklch(0.87 0.018 225);
+  --color-field: oklch(0.996 0.003 225);
+  --color-ring: oklch(0.64 0.14 240);
+  --color-primary: oklch(0.3 0.05 235);
+  --color-primary-fg: oklch(0.985 0.006 225);
+  --color-danger: oklch(0.577 0.245 27.325);
+  --color-success: oklch(0.527 0.154 150.069);
+  /* Soft halo drawn outside the focus ring. */
+  --shadow-glow: 0 0 12px 2px color-mix(in oklab, var(--color-ring) 35%, transparent);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --color-page: oklch(0.16 0.015 240);
+    --color-card: oklch(0.2 0.018 240);
+    --color-fg: oklch(0.975 0.006 225);
+    --color-muted: oklch(0.28 0.02 235);
+    --color-muted-fg: oklch(0.8 0.03 230);
+    --color-faint-fg: oklch(0.64 0.025 230);
+    --color-border: oklch(1 0 0 / 14%);
+    --color-input: oklch(1 0 0 / 20%);
+    --color-field: oklch(1 0 0 / 4.5%);
+    --color-ring: oklch(0.68 0.13 240);
+    --color-primary: oklch(0.88 0.035 225);
+    --color-primary-fg: oklch(0.22 0.03 240);
+    --color-danger: oklch(0.704 0.191 22.216);
+    --color-success: oklch(0.792 0.209 151.711);
+  }
+}
+
+html,
+body {
   color-scheme: light dark;
-  background-color: light-dark(#f6f6f6, #333);
+  background: var(--color-page);
+  color: var(--color-fg);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
   box-sizing: border-box;
 }
 
-/* Custom range slider styles */
+/* Squircle corners where supported; other engines ignore the property and
+   keep the plain rounded corners. Pills and circles (rounded-full) stay round. */
+.rounded-sm,
+.rounded-md,
+.rounded-lg,
+.rounded-xl {
+  corner-shape: squircle;
+}
+
+/* The scrubber. The track is drawn by its container (see App.tsx), so the
+   input itself is transparent and only the thumb is styled here. */
 input[type="range"] {
   -webkit-appearance: none;
   appearance: none;
@@ -16,25 +82,12 @@ input[type="range"] {
   cursor: pointer;
 }
 
-/* Track */
-input[type="range"]::-webkit-slider-track {
-  background: #4b5563;
-  height: 8px;
-  border-radius: 4px;
-}
-
-input[type="range"]::-moz-range-track {
-  background: #4b5563;
-  height: 8px;
-  border-radius: 4px;
-  border: none;
-}
-
-/* Thumb */
 input[type="range"]::-webkit-slider-thumb {
   -webkit-appearance: none;
   appearance: none;
-  background: #3b82f6;
+  background: var(--color-primary);
+  border: 2px solid var(--color-card);
+  box-shadow: 0 1px 3px oklch(0 0 0 / 25%);
   height: 20px;
   width: 20px;
   border-radius: 50%;
@@ -42,40 +95,37 @@ input[type="range"]::-webkit-slider-thumb {
 }
 
 input[type="range"]::-moz-range-thumb {
-  background: #3b82f6;
+  background: var(--color-primary);
+  border: 2px solid var(--color-card);
+  box-shadow: 0 1px 3px oklch(0 0 0 / 25%);
   height: 20px;
   width: 20px;
   border-radius: 50%;
   cursor: pointer;
-  border: none;
 }
 
-/* Focus states */
-input[type="range"]:focus::-webkit-slider-thumb {
-  outline: 2px solid #3b82f6;
-  outline-offset: 2px;
+input[type="range"]:focus-visible {
+  outline: none;
 }
 
-input[type="range"]:focus::-moz-range-thumb {
-  outline: 2px solid #3b82f6;
-  outline-offset: 2px;
+input[type="range"]:focus-visible::-webkit-slider-thumb {
+  box-shadow:
+    0 0 0 3px color-mix(in oklab, var(--color-ring) 50%, transparent),
+    var(--shadow-glow);
 }
 
-/* Disabled state */
+input[type="range"]:focus-visible::-moz-range-thumb {
+  box-shadow:
+    0 0 0 3px color-mix(in oklab, var(--color-ring) 50%, transparent),
+    var(--shadow-glow);
+}
+
 input[type="range"]:disabled::-webkit-slider-thumb {
-  background: #6b7280;
+  background: var(--color-faint-fg);
   cursor: not-allowed;
 }
 
 input[type="range"]:disabled::-moz-range-thumb {
-  background: #6b7280;
+  background: var(--color-faint-fg);
   cursor: not-allowed;
-}
-
-input[type="range"]:disabled::-webkit-slider-track {
-  background: #374151;
-}
-
-input[type="range"]:disabled::-moz-range-track {
-  background: #374151;
 }
