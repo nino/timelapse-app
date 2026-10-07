@@ -14,42 +14,56 @@
   --font-sans: "Bricolage Grotesque", ui-sans-serif, system-ui, sans-serif;
   --font-title: Bevan, Rockwell, Georgia, serif;
 
-  /* Palette (shadcn zinc, tinted toward a cool blue). Swapped for dark mode
-     below. */
-  --color-page: oklch(0.982 0.008 225);
-  --color-card: oklch(0.996 0.003 225);
-  --color-fg: oklch(0.15 0.02 240);
-  --color-muted: oklch(0.956 0.012 225);
-  --color-muted-fg: oklch(0.45 0.03 235);
-  --color-faint-fg: oklch(0.56 0.025 235);
-  --color-border: oklch(0.87 0.018 225);
-  --color-input: oklch(0.87 0.018 225);
-  --color-field: oklch(0.996 0.003 225);
-  --color-ring: oklch(0.64 0.14 240);
-  --color-primary: oklch(0.3 0.05 235);
-  --color-primary-fg: oklch(0.985 0.006 225);
+  /* Palette: near-neutral greys with a saturated ultramarine accent. The
+     canvas around the frame (page) is a clear step darker than the header and
+     scrubber bars (card), and borders are solid. Swapped for dark mode below. */
+  --color-page: oklch(0.94 0.004 264);
+  --color-card: oklch(1 0 0);
+  --color-fg: oklch(0.17 0.01 264);
+  --color-muted: oklch(0.95 0.004 264);
+  --color-muted-fg: oklch(0.4 0.012 264);
+  --color-faint-fg: oklch(0.55 0.01 264);
+  --color-border: oklch(0.82 0.006 264);
+  --color-input: oklch(0.76 0.008 264);
+  --color-field: oklch(1 0 0);
+  --color-ring: oklch(0.5 0.21 264);
+  --color-primary: oklch(0.45 0.22 264);
+  --color-primary-fg: oklch(0.985 0.004 264);
   --color-danger: oklch(0.577 0.245 27.325);
   --color-success: oklch(0.527 0.154 150.069);
+  /* The scrubber: its track, and the playhead bar that marks the position. */
+  --color-track: oklch(0.86 0.006 264);
+  --color-playhead: oklch(0.6 0.13 225);
+  /* Tailwind writes a shadow's value into its utility, so the dark-mode swap
+     goes through --track-inset (below) instead. */
+  --shadow-track: var(--track-inset);
   /* Soft halo drawn outside the focus ring. */
   --shadow-glow: 0 0 12px 2px color-mix(in oklab, var(--color-ring) 35%, transparent);
 }
 
+:root {
+  --track-inset: inset 0 1px 2.5px oklch(0.2 0.03 264 / 32%), inset 0 0 0 1px oklch(0.2 0.03 264 / 6%);
+}
+
 @media (prefers-color-scheme: dark) {
   :root {
-    --color-page: oklch(0.22 0.015 240);
-    --color-card: oklch(0.26 0.018 240);
-    --color-fg: oklch(0.975 0.006 225);
-    --color-muted: oklch(0.33 0.02 235);
-    --color-muted-fg: oklch(0.8 0.03 230);
-    --color-faint-fg: oklch(0.64 0.025 230);
-    --color-border: oklch(1 0 0 / 14%);
-    --color-input: oklch(1 0 0 / 20%);
-    --color-field: oklch(1 0 0 / 4.5%);
-    --color-ring: oklch(0.68 0.13 240);
-    --color-primary: oklch(0.88 0.035 225);
-    --color-primary-fg: oklch(0.22 0.03 240);
+    --color-page: oklch(0.19 0.008 264);
+    --color-card: oklch(0.255 0.01 264);
+    --color-fg: oklch(0.97 0.004 264);
+    --color-muted: oklch(0.32 0.012 264);
+    --color-muted-fg: oklch(0.78 0.01 264);
+    --color-faint-fg: oklch(0.62 0.01 264);
+    --color-border: oklch(0.37 0.012 264);
+    --color-input: oklch(0.45 0.014 264);
+    --color-field: oklch(0.22 0.01 264);
+    --color-ring: oklch(0.68 0.17 264);
+    --color-primary: oklch(0.72 0.16 264);
+    --color-primary-fg: oklch(0.18 0.02 264);
     --color-danger: oklch(0.704 0.191 22.216);
     --color-success: oklch(0.792 0.209 151.711);
+    --color-track: oklch(0.35 0.012 264);
+    --color-playhead: oklch(0.8 0.12 215);
+    --track-inset: inset 0 1px 3px oklch(0 0 0 / 70%), inset 0 0 0 1px oklch(0 0 0 / 25%);
   }
 }
 
@@ -74,7 +88,9 @@ body {
 }
 
 /* The scrubber. The track is drawn by its container (see App.tsx), so the
-   input itself is transparent and only the thumb is styled here. */
+   input itself is transparent and only the thumb is styled here: a 6px-wide
+   playhead bar, as in a video editor. MatchMarks in App.tsx insets its marks by
+   half that width, so change both together. */
 input[type="range"] {
   -webkit-appearance: none;
   appearance: none;
@@ -85,22 +101,26 @@ input[type="range"] {
 input[type="range"]::-webkit-slider-thumb {
   -webkit-appearance: none;
   appearance: none;
-  background: var(--color-primary);
-  border: 2px solid var(--color-card);
-  box-shadow: 0 1px 3px oklch(0 0 0 / 25%);
-  height: 20px;
-  width: 20px;
-  border-radius: 50%;
+  background: var(--color-playhead);
+  border: 0;
+  box-shadow:
+    0 0 0 2px var(--color-card),
+    0 1px 4px 2px oklch(0 0 0 / 25%);
+  height: 26px;
+  width: 6px;
+  border-radius: 3px;
   cursor: pointer;
 }
 
 input[type="range"]::-moz-range-thumb {
-  background: var(--color-primary);
-  border: 2px solid var(--color-card);
-  box-shadow: 0 1px 3px oklch(0 0 0 / 25%);
-  height: 20px;
-  width: 20px;
-  border-radius: 50%;
+  background: var(--color-playhead);
+  border: 0;
+  box-shadow:
+    0 0 0 2px var(--color-card),
+    0 1px 4px 2px oklch(0 0 0 / 25%);
+  height: 26px;
+  width: 6px;
+  border-radius: 3px;
   cursor: pointer;
 }
 
@@ -110,13 +130,15 @@ input[type="range"]:focus-visible {
 
 input[type="range"]:focus-visible::-webkit-slider-thumb {
   box-shadow:
-    0 0 0 3px color-mix(in oklab, var(--color-ring) 50%, transparent),
+    0 0 0 2px var(--color-card),
+    0 0 0 5px color-mix(in oklab, var(--color-ring) 60%, transparent),
     var(--shadow-glow);
 }
 
 input[type="range"]:focus-visible::-moz-range-thumb {
   box-shadow:
-    0 0 0 3px color-mix(in oklab, var(--color-ring) 50%, transparent),
+    0 0 0 2px var(--color-card),
+    0 0 0 5px color-mix(in oklab, var(--color-ring) 60%, transparent),
     var(--shadow-glow);
 }
 
