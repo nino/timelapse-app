@@ -13,7 +13,7 @@ import {
 import { usePendingFrames } from "./hooks/usePendingFrames";
 import { PendingStretches } from "./PendingStretches";
 import { nextStop, previousStop, rangeAt, toStops, type DayMatch, type Stop } from "./search";
-import { fieldFrame, focusRing, outlineButton } from "./ui";
+import { fieldFrame, focusRing, segmentButton } from "./ui";
 
 // How many other days the find bar names before folding the rest away.
 const OTHER_DAYS_SHOWN = 4;
@@ -247,30 +247,32 @@ export function App(): React.ReactNode {
                 </span>
               )}
             </label>
-            <button
-              type="button"
-              aria-label="Previous match"
-              title="Previous match (Shift+Enter)"
-              disabled={stops.length === 0}
-              onClick={() => stepToMatch(-1)}
-              className={`${outlineButton} size-9`}
-            >
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
-                <path d="m15 18-6-6 6-6" />
-              </svg>
-            </button>
-            <button
-              type="button"
-              aria-label="Next match"
-              title="Next match (Enter)"
-              disabled={stops.length === 0}
-              onClick={() => stepToMatch(1)}
-              className={`${outlineButton} size-9`}
-            >
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
-                <path d="m9 18 6-6-6-6" />
-              </svg>
-            </button>
+            <div className="flex h-9 shrink-0 rounded-xl border border-border bg-card shadow-xs">
+              <button
+                type="button"
+                aria-label="Previous match"
+                title="Previous match (Shift+Enter)"
+                disabled={stops.length === 0}
+                onClick={() => stepToMatch(-1)}
+                className={`${segmentButton} rounded-l-[11px]`}
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+                  <path d="m15 18-6-6 6-6" />
+                </svg>
+              </button>
+              <button
+                type="button"
+                aria-label="Next match"
+                title="Next match (Enter)"
+                disabled={stops.length === 0}
+                onClick={() => stepToMatch(1)}
+                className={`${segmentButton} rounded-r-[11px] border-l border-border`}
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+                  <path d="m9 18 6-6-6-6" />
+                </svg>
+              </button>
+            </div>
           </div>
         </div>
 
