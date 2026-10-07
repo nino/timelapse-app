@@ -44,11 +44,22 @@ pub struct Shot {
 }
 
 impl Shot {
-    /// The clock hour this screenshot belongs to, the same way `converter.rs`
-    /// decides which hourly video it goes into.
-    pub fn hour(&self) -> NaiveDateTime {
-        truncate_to_hour(self.modified)
+    /// The clock hour this screenshot belongs to in day folder `day`, the
+    /// same way `converter.rs` decides which hourly video it goes into.
+    pub fn hour(&self, day: NaiveDate) -> NaiveDateTime {
+        truncate_to_hour(filed_at(self.modified, day))
     }
+}
+
+/// The local time a screenshot in day folder `day` is filed under, by the
+/// converter and here alike: its modification time, kept within the
+/// folder's date. A screenshot taken just before midnight is written into
+/// that day's folder but can land just after midnight, and belongs to the
+/// day's last hour, not its first.
+pub fn filed_at(modified: NaiveDateTime, day: NaiveDate) -> NaiveDateTime {
+    let first = day.and_hms_opt(0, 0, 0).expect("midnight exists");
+    let last = day.and_hms_opt(23, 59, 59).expect("23:59:59 exists");
+    modified.clamp(first, last)
 }
 
 pub(crate) fn truncate_to_hour(time: NaiveDateTime) -> NaiveDateTime {
@@ -200,6 +211,23 @@ pub fn fingerprint(path: &Path) -> std::io::Result<(u64, u64)> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn files_a_screenshot_written_after_midnight_under_its_days_last_hour() {
+        let day = NaiveDate::from_ymd_opt(2026, 10, 1).unwrap();
+        let shot = |modified: NaiveDateTime| Shot {
+            name: "00001.png".into(),
+            number: 1,
+            modified,
+        };
+        let at = |d: u32, h: u32, m: u32| {
+            NaiveDate::from_ymd_opt(2026, 10, d).unwrap().and_hms_opt(h, m, 0).unwrap()
+        };
+        assert_eq!(shot(at(1, 9, 30)).hour(day), at(1, 9, 0));
+        assert_eq!(shot(at(2, 0, 0)).hour(day), at(1, 23, 0));
+        let day_before = NaiveDate::from_ymd_opt(2026, 9, 30).unwrap().and_hms_opt(23, 59, 0).unwrap();
+        assert_eq!(shot(day_before).hour(day), at(1, 0, 0));
+    }
 
     #[test]
     fn parses_names() {

@@ -27,6 +27,7 @@ use serde::Serialize;
 
 use cache::ChunkCache;
 use library::{Shot, VideoFile, VideoKind};
+pub use library::filed_at;
 pub use video::Tools;
 use video::VideoInfo;
 
@@ -155,7 +156,7 @@ pub struct FrameSource {
     /// recorded for each of its frames. See `recorded_frames`.
     recorded_frames: Mutex<HashMap<PathBuf, Arc<Vec<(u32, String)>>>>,
     /// The capture times the database has around an hourly video's hour, in
-    /// frame-number order. Only asked for videos the converter recorded no
+    /// time order. Only asked for videos the converter recorded no
     /// frames for; the hour has ended, so its rows no longer change.
     hour_times: Mutex<HashMap<PathBuf, Arc<Vec<String>>>>,
 }
@@ -344,8 +345,8 @@ impl FrameSource {
                     }));
                 }
                 // Videos converted before it did: the video holds the hour's
-                // screenshots in frame-number order, and so does the
-                // database. The video is named after its first frame's file
+                // screenshots in frame-number order, which within a day is
+                // capture order, and the database rows come in time order. The video is named after its first frame's file
                 // time, and a row is written just after its file, more than
                 // a second after the row before; so the first frame's row is
                 // the first one not before that second. Rows of screenshots
@@ -476,6 +477,7 @@ impl FrameSource {
     /// captured in.
     fn frame_hours(&self, date: &str) -> Result<FrameHours, Error> {
         let mut hours = FrameHours::default();
+        let day = parse_date(date)?;
         let Some(conn) = self.open_db()? else {
             return Ok(hours);
         };
@@ -492,7 +494,7 @@ impl FrameSource {
         })?;
         for row in rows {
             let (number, time) = row?;
-            let Some(hour) = local_hour(&time) else {
+            let Some(hour) = local_hour(&time, day) else {
                 continue;
             };
             // A number listed twice (an old library's reused black frame)
@@ -526,19 +528,21 @@ impl FrameSource {
             videos.push((file, info));
         }
 
-        // (hour, start, segment): sorted by hour, then by when it starts, so
-        // the parts of a split hour stay in order.
+        // (hour, start, part, segment): sorted by hour, then by when it
+        // starts, then by part, so the parts of a split hour stay in order
+        // even when they start at the same filed time.
         let mut timeline = Vec::new();
         let mut start = 0;
         while start < shots.len() {
-            let hour = shots[start].hour();
+            let hour = shots[start].hour(day);
             let mut end = start + 1;
-            while end < shots.len() && shots[end].hour() == hour {
+            while end < shots.len() && shots[end].hour(day) == hour {
                 end += 1;
             }
             timeline.push((
                 hour,
                 shots[start].modified,
+                0,
                 Segment::Screenshots {
                     shots: shots.clone(),
                     range: start..end,
@@ -546,12 +550,12 @@ impl FrameSource {
             ));
             start = end;
         }
-        let hours_with_shots: Vec<_> = timeline.iter().map(|(hour, _, _)| *hour).collect();
+        let hours_with_shots: Vec<_> = timeline.iter().map(|(hour, _, _, _)| *hour).collect();
         let mut legacy = Vec::new();
         for (file, info) in videos {
             match file.kind {
-                VideoKind::Hourly { .. } if !hours_with_shots.contains(&file.hour()) => {
-                    timeline.push((file.hour(), file.start, Segment::Video { file, info }));
+                VideoKind::Hourly { part } if !hours_with_shots.contains(&file.hour()) => {
+                    timeline.push((file.hour(), file.start, part, Segment::Video { file, info }));
                 }
                 VideoKind::Hourly { .. } => {} // its screenshots are still here
                 VideoKind::Legacy => legacy.push(Segment::Video { file, info }),
@@ -561,10 +565,10 @@ impl FrameSource {
             // Only the old script's videos: they are already in start order.
             return Ok(legacy);
         }
-        timeline.sort_by_key(|(hour, start, _)| (*hour, *start));
+        timeline.sort_by_key(|(hour, start, part, _)| (*hour, *start, *part));
         Ok(timeline
             .into_iter()
-            .map(|(_, _, segment)| segment)
+            .map(|(_, _, _, segment)| segment)
             .collect())
     }
 
@@ -628,10 +632,12 @@ impl FrameSource {
         Ok(times)
     }
 
-    /// The capture times of the screenshots in `video`'s clock hour, in
-    /// frame-number order. The row of a screenshot is written after its file,
-    /// so the hour's last rows can fall in the first minute of the next hour
-    /// (or day). Empty when the database can't say.
+    /// The capture times of the screenshots in `video`'s clock hour, in time
+    /// order. The row of a screenshot is written after its file, so the
+    /// hour's last rows can fall in the first minute of the next hour (or
+    /// day). Frame numbers restart every day, so ordering by them would put
+    /// the next day's first rows before this hour's. Empty when the database
+    /// can't say.
     fn hour_times(&self, video: &VideoFile) -> Arc<Vec<String>> {
         if let Some(times) = self.hour_times.lock().unwrap().get(&video.path) {
             return times.clone();
@@ -644,7 +650,7 @@ impl FrameSource {
             conn.prepare(
                 "SELECT local_time FROM screenshots
                  WHERE local_time >= ?1 AND local_time < ?2
-                 ORDER BY frame_number, id",
+                 ORDER BY local_time, id",
             )?
             .query_map(
                 rusqlite::params![format(hour), format(hour + Duration::minutes(61))],
@@ -744,14 +750,15 @@ struct FrameHours {
     numbers: HashMap<NaiveDateTime, Vec<u32>>,
 }
 
-/// The local clock hour of a database timestamp: RFC 3339 with an offset, as
-/// the capture loop writes it, or a naive local time.
-fn local_hour(time: &str) -> Option<NaiveDateTime> {
+/// The local clock hour of a database timestamp (RFC 3339 with an offset, as
+/// the capture loop writes it, or a naive local time) in day folder `day`,
+/// filed the way the converter files screenshots.
+fn local_hour(time: &str, day: NaiveDate) -> Option<NaiveDateTime> {
     let local = DateTime::parse_from_rfc3339(time)
         .map(|t| t.naive_local())
         .or_else(|_| NaiveDateTime::parse_from_str(time, "%Y-%m-%dT%H:%M:%S%.f"))
         .ok()?;
-    Some(library::truncate_to_hour(local))
+    Some(library::truncate_to_hour(filed_at(local, day)))
 }
 
 fn parse_date(date: &str) -> Result<NaiveDate, Error> {
