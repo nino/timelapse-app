@@ -136,10 +136,10 @@ export function App(): React.ReactNode {
     return (): void => window.removeEventListener("keydown", handleKeydown);
   }, []);
 
-  // Keyboard: ←/→ by 1, Shift by 10, Option by 100.
+  // Keyboard: ←/→ by 1, Shift by 10, Option by 100; ⌘←/⌘→ (Ctrl elsewhere)
+  // to the previous/next day.
   React.useEffect(() => {
     const handleKeydown = (e: KeyboardEvent): void => {
-      if (frameCount === 0) return;
       if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
       // Leave the day picker alone, open or closed.
       if (
@@ -150,15 +150,24 @@ export function App(): React.ReactNode {
       }
       // In the find bar they move the caret.
       if (e.target instanceof HTMLInputElement && e.target.type !== "range") return;
+      const direction = e.key === "ArrowLeft" ? -1 : 1;
+      if (e.metaKey || e.ctrlKey) {
+        e.preventDefault();
+        // `days` runs oldest to newest.
+        const at = selectedDay === null ? -1 : days.indexOf(selectedDay);
+        const next = at === -1 ? undefined : days[at + direction];
+        if (next !== undefined) setSelectedDay(next);
+        return;
+      }
+      if (frameCount === 0) return;
       // Also stops a focused slider from taking its own 1-frame step on top.
       e.preventDefault();
       const step = e.altKey ? 100 : e.shiftKey ? 10 : 1;
-      const direction = e.key === "ArrowLeft" ? -1 : 1;
       goTo(Math.min(frameCount - 1, Math.max(0, currentIndex + direction * step)));
     };
     window.addEventListener("keydown", handleKeydown);
     return (): void => window.removeEventListener("keydown", handleKeydown);
-  }, [frameCount, currentIndex, goTo]);
+  }, [days, selectedDay, frameCount, currentIndex, goTo]);
 
   const wantedSrc =
     selectedDay && frameCount > 0 ? frameUrl(selectedDay, currentIndex) : null;
