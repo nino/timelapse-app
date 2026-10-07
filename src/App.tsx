@@ -350,7 +350,7 @@ export function App(): React.ReactNode {
 
       <div className="bg-card px-4 py-3 border-t border-border">
         <div className="flex items-center gap-4">
-          <div className="relative flex-1 bg-track shadow-track p-1 pt-0 rounded-full">
+          <div className="relative flex-1 scrub-track p-1 pt-0 rounded-full">
             <PendingStretches pending={pendingFrames} />
             <MatchMarks stops={stops} frameCount={frameCount} currentIndex={currentIndex} />
             <input
