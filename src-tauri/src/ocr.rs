@@ -163,6 +163,8 @@ pub struct OcrWorker {
     recognizer: Box<dyn TextRecognizer>,
     /// Thumbnail of the last frame read in each day folder.
     last_read: std::collections::HashMap<String, Thumbnail>,
+    /// Text of the last frame recorded in each day folder.
+    last_text: std::collections::HashMap<String, String>,
 }
 
 impl OcrWorker {
@@ -172,6 +174,7 @@ impl OcrWorker {
             db,
             recognizer,
             last_read: Default::default(),
+            last_text: Default::default(),
         }
     }
 
@@ -241,17 +244,26 @@ impl OcrWorker {
         }
 
         let lines = self.recognizer.recognize(path)?;
+        // One line of text per box, so a line's own newlines go.
         let text = lines
             .iter()
-            .map(|line| line.text.as_str())
+            .map(|line| line.text.replace('\n', " "))
             .collect::<Vec<_>>()
             .join("\n");
-        let lines_json = serde_json::to_string(&lines).map_err(|e| e.to_string())?;
 
+        // Pixels change without the text changing (video, images, colours).
+        // A row already stands for every frame up to the next one, so the
+        // same text again needs no row of its own.
+        let result = if self.last_text.get(day) == Some(&text) {
+            None
+        } else {
+            Some(lines.iter().map(|l| [l.x, l.y, l.width, l.height]).collect::<Vec<_>>())
+        };
         self.db
-            .record_ocr_frame(day, frame_number, Some((&text, &lines_json)))
+            .record_ocr_frame(day, frame_number, result.as_deref().map(|boxes| (text.as_str(), boxes)))
             .map_err(|e| e.to_string())?;
         self.last_read.insert(day.to_string(), thumbnail);
+        self.last_text.insert(day.to_string(), text);
         Ok(true)
     }
 }
@@ -496,11 +508,17 @@ mod tests {
 
     impl Library {
         fn new() -> Library {
+            let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            Library::with(seen.clone(), Box::new(FakeRecognizer { seen }))
+        }
+
+        fn with(
+            seen: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+            recognizer: Box<dyn TextRecognizer>,
+        ) -> Library {
             let temp_dir = TempDir::new().unwrap();
             let root = temp_dir.path().to_path_buf();
             let db = ScreenshotDatabase::new(root.join("screenshots.db")).unwrap();
-            let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-            let recognizer = Box::new(FakeRecognizer { seen: seen.clone() });
             let worker = OcrWorker::new(root.clone(), db, recognizer);
             Library { _temp_dir: temp_dir, root, seen, worker }
         }
@@ -558,6 +576,46 @@ mod tests {
 
         // Nothing new, nothing done.
         assert_eq!(library.pass(), PassSummary::default());
+    }
+
+    /// Reads the same text off every frame.
+    struct SameText;
+
+    impl TextRecognizer for SameText {
+        fn recognize(&self, _image: &Path) -> Result<Vec<OcrLine>, String> {
+            Ok(vec![OcrLine {
+                text: "a video\nplaying".into(),
+                confidence: 1.0,
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+            }])
+        }
+    }
+
+    #[test]
+    fn same_text_again_gets_no_row() {
+        let mut library = Library::with(Default::default(), Box::new(SameText));
+        frame(&library.root, DAY_1, 1, 0, false);
+        frame(&library.root, DAY_1, 2, 200, false);
+        frame(&library.root, DAY_1, 3, 0, false);
+        frame(&library.root, DAY_2, 1, 0, false);
+
+        let summary = library.pass();
+
+        // The pixels changed each time, so every frame was read.
+        assert_eq!(summary, PassSummary { recognized: 4, skipped: 0 });
+        assert_eq!(library.done_through(DAY_1), Some(3));
+        let db = &library.worker.db;
+        // Vision's one line with a newline in it stays one line.
+        assert_eq!(
+            db.ocr_lines(DAY_1, 1).unwrap(),
+            Some(("a video playing".to_string(), vec![[0.0, 0.0, 1.0, 1.0]]))
+        );
+        assert_eq!(db.ocr_lines(DAY_1, 2).unwrap(), None);
+        assert_eq!(db.ocr_lines(DAY_1, 3).unwrap(), None);
+        assert!(db.ocr_lines(DAY_2, 1).unwrap().is_some());
     }
 
     #[test]
