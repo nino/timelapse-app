@@ -1,558 +1,550 @@
-import { invoke } from "@tauri-apps/api/core";
-import { BaseDirectory } from "@tauri-apps/api/path";
-import { readFile } from "@tauri-apps/plugin-fs";
 import React from "react";
 
 import "./App.css";
-import { useFiles, useFolders, useVideos } from "./hooks/useFolders";
-import { timelapseRoot } from "./timelapseRoot";
+import { DayPicker } from "./DayPicker";
+import { frameUrl, getFrameTime, type FrameTime } from "./frames";
+import { useDay, useDays } from "./hooks/useLibrary";
+import {
+  useDayMatches,
+  useMatchCounts,
+  useMatchLines,
+  useOcrVersion,
+} from "./hooks/useOcrSearch";
+import { usePendingFrames } from "./hooks/usePendingFrames";
+import { PendingStretches } from "./PendingStretches";
+import { nextStop, previousStop, rangeAt, toStops, type DayMatch, type Stop } from "./search";
+import { fieldFrame, focusRing, outlineButton } from "./ui";
 
-type ViewMode = "images" | "videos";
+// How many other days the find bar names before folding the rest away.
+const OTHER_DAYS_SHOWN = 4;
+// Frames are captured at this size; used until the first one has loaded.
+const DEFAULT_FRAME_SIZE = { width: 1800, height: 1124 };
 
 export function App(): React.ReactNode {
-  const { folders, foldersError, refreshFolders } = useFolders();
-  const { videos, videosError, refreshVideos } = useVideos();
-  const [viewMode, setViewMode] = React.useState<ViewMode>("images");
-  const [selectedFolder, setSelectedFolder] = React.useState<string | null>(
-    null,
+  const { days, daysError } = useDays();
+  const [selectedDay, setSelectedDay] = React.useState<string | null>(null);
+  const { day, dayError } = useDay(selectedDay);
+  const frameCount = day?.frameCount ?? 0;
+  // Where the viewer is in the selected day. `index: null` means "the newest
+  // frame", so the view follows new captures for free and stops following
+  // the moment the user scrubs back. A position recorded for another day
+  // counts as null, which is what makes opening a day land on its last frame
+  // without ever requesting frame 0 first.
+  const [position, setPosition] = React.useState<{
+    day: string | null;
+    index: number | null;
+  }>({ day: null, index: null });
+  const followsLiveEdge = position.day !== selectedDay || position.index === null;
+  const currentIndex = followsLiveEdge
+    ? Math.max(frameCount - 1, 0)
+    : Math.min(position.index ?? 0, Math.max(frameCount - 1, 0));
+  const goTo = React.useCallback(
+    (index: number): void => {
+      setPosition({ day: selectedDay, index: index >= frameCount - 1 ? null : index });
+    },
+    [selectedDay, frameCount],
   );
-  const [selectedVideo, setSelectedVideo] = React.useState<string | null>(null);
-  const { files, filesError } = useFiles(selectedFolder);
-  const [currentImageIndex, setCurrentImageIndex] = React.useState(0);
-  const [currentImageSrc, setCurrentImageSrc] = React.useState<string | null>(
-    null,
-  );
-  const [videoCacheFolder, setVideoCacheFolder] = React.useState<string | null>(
-    null,
-  );
-  const [isExtractingFrames, setIsExtractingFrames] = React.useState(false);
-  const [extractionError, setExtractionError] = React.useState<string | null>(
-    null,
-  );
-  const { files: videoFiles } = useFiles(
-    videoCacheFolder ? `.cache/${videoCacheFolder}` : null,
-  );
-  const [currentTimestamp, setCurrentTimestamp] = React.useState<string | null>(
-    null,
-  );
+  const [frameTime, setFrameTime] = React.useState<FrameTime | null>(null);
 
-  // Get current date folder name (YYYY-MM-DD format)
-  const currentDateFolder = React.useMemo(() => {
-    const today = new Date();
-    return today.toISOString().split("T")[0];
-  }, []);
+  // Find bar: what is typed, and the (debounced) query actually searched.
+  const [typed, setTyped] = React.useState("");
+  const query = useDebounced(typed.trim(), 150);
+  const ocrVersion = useOcrVersion();
+  const { matches, matchesError } = useDayMatches(selectedDay, query, ocrVersion);
+  const stops = React.useMemo(() => toStops(matches ?? []), [matches]);
+  const counts = useMatchCounts(query, ocrVersion);
+  const [showAllDays, setShowAllDays] = React.useState(false);
+  // A day picked from the "Also on" list opens on its first match once that
+  // day's matches have loaded.
+  const [jumpToFirstMatch, setJumpToFirstMatch] = React.useState<string | null>(null);
+  const findInput = React.useRef<HTMLInputElement>(null);
 
-  // Auto-select today's folder if it exists (for images mode)
+  // Today's day name. Recomputed whenever the day list changes so the
+  // "(Today)" label moves over at midnight instead of sticking to launch day.
+  // Local date, to match `create_day_dir_if_needed` in Rust.
+  const today = React.useMemo(
+    () => localDateFolder(new Date()),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [days],
+  );
+  const newestDay = days.length > 0 ? days[days.length - 1] : null;
+
+  // Open the newest day (today, while capturing) when nothing is selected.
   React.useEffect(() => {
-    if (viewMode === "images" && folders.length > 0 && !selectedFolder) {
-      const todayFolder = folders.find(
-        (folder) => folder === currentDateFolder,
-      );
-      if (todayFolder) {
-        setSelectedFolder(todayFolder);
-      } else {
-        // If today's folder doesn't exist, select the most recent one
-        const sortedFolders = [...folders].sort().reverse();
-        setSelectedFolder(sortedFolders[0]);
-      }
+    if (!selectedDay && newestDay) {
+      setSelectedDay(newestDay);
     }
-  }, [folders, selectedFolder, currentDateFolder, viewMode]);
+  }, [selectedDay, newestDay]);
 
-  // Auto-select most recent video (for videos mode)
+  // Roll over to the new day at midnight, but only for someone who was
+  // watching the live edge of the previous newest day.
+  const liveEdge = React.useRef({ selectedDay, followsLiveEdge });
   React.useEffect(() => {
-    if (viewMode === "videos" && videos.length > 0 && !selectedVideo) {
-      setSelectedVideo(videos[videos.length - 1]); // Videos are in chronological order, so last is most recent
-    }
-  }, [videos, selectedVideo, viewMode]);
-
-  // Reset image index when folder changes
+    liveEdge.current = { selectedDay, followsLiveEdge };
+  }, [selectedDay, followsLiveEdge]);
+  const previousNewestDay = React.useRef(newestDay);
   React.useEffect(() => {
-    if (viewMode === "images") {
-      setCurrentImageIndex(Math.max(files.length - 1, 0));
+    const previous = previousNewestDay.current;
+    previousNewestDay.current = newestDay;
+    const viewer = liveEdge.current;
+    if (
+      previous &&
+      newestDay &&
+      newestDay !== previous &&
+      viewer.selectedDay === previous &&
+      viewer.followsLiveEdge
+    ) {
+      setSelectedDay(newestDay);
     }
-  }, [selectedFolder, files.length, viewMode]);
+  }, [newestDay]);
 
-  // Reset image index when video frames are loaded
   React.useEffect(() => {
-    if (viewMode === "videos" && videoFiles.length > 0) {
-      setCurrentImageIndex(0); // Start from first frame for videos
+    // Left for another day before its matches arrived: forget the jump.
+    if (jumpToFirstMatch !== null && jumpToFirstMatch !== selectedDay) {
+      setJumpToFirstMatch(null);
+      return;
     }
-  }, [videoFiles.length, viewMode]);
-
-  // Extract frames from selected video
-  React.useEffect(() => {
-    async function extractFrames(): Promise<void> {
-      if (viewMode !== "videos" || !selectedVideo) {
-        setVideoCacheFolder(null);
-        setIsExtractingFrames(false);
-        setExtractionError(null);
-        return;
-      }
-
-      try {
-        setIsExtractingFrames(true);
-        setExtractionError(null);
-        setVideoCacheFolder(null); // Clear old frames immediately
-        console.log("Extracting frames from video:", selectedVideo);
-
-        // Call Tauri command to extract frames (uses cache if available)
-        const cacheFolder = await invoke<string>("extract_video_frames", {
-          videoFilename: selectedVideo,
-        });
-
-        console.log("Frames extracted to cache folder:", cacheFolder);
-        setVideoCacheFolder(cacheFolder);
-        setIsExtractingFrames(false);
-      } catch (error) {
-        // Without this the UI sits on "Loading video…" forever, which makes a
-        // missing ffmpeg look identical to a slow extraction.
-        console.error("Error extracting frames:", error);
-        setExtractionError(
-          error instanceof Error ? error.message : String(error),
-        );
-        setVideoCacheFolder(null);
-        setIsExtractingFrames(false);
-      }
+    if (
+      jumpToFirstMatch === null ||
+      matches === null ||
+      frameCount === 0
+    ) {
+      return;
     }
+    setJumpToFirstMatch(null);
+    if (stops.length > 0) goTo(stops[0].index);
+  }, [jumpToFirstMatch, selectedDay, matches, stops, frameCount, goTo]);
 
-    extractFrames();
-  }, [selectedVideo, viewMode]);
+  const stepToMatch = React.useCallback(
+    (direction: 1 | -1): void => {
+      const stop =
+        direction === 1 ? nextStop(stops, currentIndex) : previousStop(stops, currentIndex);
+      if (stop) goTo(stop.index);
+    },
+    [stops, currentIndex, goTo],
+  );
 
-  // Keyboard navigation
+  // ⌘F / Ctrl+F jumps to the find bar.
   React.useEffect(() => {
     const handleKeydown = (e: KeyboardEvent): void => {
-      const activeFiles = viewMode === "images" ? files : videoFiles;
-
-      if (viewMode === "images" && (!selectedFolder || files.length === 0))
-        return;
-      if (viewMode === "videos" && videoFiles.length === 0) return;
-
-      let step = 1;
-      if (e.shiftKey) step = 10;
-      if (e.altKey) step = 100; // Option key on Mac is altKey
-
-      let newIndex = currentImageIndex;
-
-      if (e.key === "ArrowLeft") {
-        e.preventDefault();
-        newIndex = Math.max(0, currentImageIndex - step);
-        setCurrentImageIndex(newIndex);
-      } else if (e.key === "ArrowRight") {
-        e.preventDefault();
-        newIndex = Math.min(activeFiles.length - 1, currentImageIndex + step);
-        setCurrentImageIndex(newIndex);
-      }
+      if (e.key.toLowerCase() !== "f" || !(e.metaKey || e.ctrlKey)) return;
+      e.preventDefault();
+      findInput.current?.focus();
+      findInput.current?.select();
     };
-
     window.addEventListener("keydown", handleKeydown);
     return (): void => window.removeEventListener("keydown", handleKeydown);
-  }, [
-    selectedFolder,
-    files.length,
-    videoFiles.length,
-    currentImageIndex,
-    viewMode,
-  ]);
+  }, []);
 
-  // Load current image when folder or index changes (works for both images and videos)
+  // Keyboard: ←/→ by 1, Shift by 10, Option by 100.
   React.useEffect(() => {
-    async function loadImage(): Promise<void> {
-      if (viewMode === "images") {
-        if (!selectedFolder || files.length === 0 || !files[currentImageIndex]) {
-          setCurrentImageSrc(null);
-          return;
-        }
-
-        try {
-          const imagePath = `${timelapseRoot()}/${selectedFolder}/${files[currentImageIndex]}`;
-          console.log("Loading image from path:", imagePath);
-
-          const imageData = await readFile(imagePath, {
-            baseDir: BaseDirectory.Home,
-          });
-
-          console.log("Image data loaded, size:", imageData.length);
-
-          // Create a blob URL from the binary data
-          const blob = new Blob([imageData], { type: "image/jpeg" });
-          const blobUrl = URL.createObjectURL(blob);
-
-          console.log("Created blob URL:", blobUrl);
-          setCurrentImageSrc(blobUrl);
-        } catch (error) {
-          console.error("Error loading image:", error);
-          setCurrentImageSrc(null);
-        }
-      } else if (viewMode === "videos") {
-        if (!videoCacheFolder || videoFiles.length === 0 || !videoFiles[currentImageIndex]) {
-          setCurrentImageSrc(null);
-          return;
-        }
-
-        try {
-          const framePath = `${timelapseRoot()}/.cache/${videoCacheFolder}/${videoFiles[currentImageIndex]}`;
-          console.log("Loading video frame from path:", framePath);
-
-          const frameData = await readFile(framePath, {
-            baseDir: BaseDirectory.Home,
-          });
-
-          console.log("Frame data loaded, size:", frameData.length);
-
-          // Create a blob URL from the binary data
-          const blob = new Blob([frameData], { type: "image/jpeg" });
-          const blobUrl = URL.createObjectURL(blob);
-
-          console.log("Created blob URL:", blobUrl);
-          setCurrentImageSrc(blobUrl);
-        } catch (error) {
-          console.error("Error loading frame:", error);
-          setCurrentImageSrc(null);
-        }
-      }
-    }
-
-    loadImage();
-  }, [selectedFolder, files, videoCacheFolder, videoFiles, currentImageIndex, viewMode]);
-
-  // Clean up blob URLs when component unmounts or image changes
-  React.useEffect(() => {
-    return (): void => {
-      if (currentImageSrc && currentImageSrc.startsWith("blob:")) {
-        URL.revokeObjectURL(currentImageSrc);
-      }
-    };
-  }, [currentImageSrc]);
-
-  const handleScrubberChange = React.useCallback(
-    (e: React.ChangeEvent<HTMLInputElement>) => {
-      const newIndex = parseInt(e.target.value, 10);
-      setCurrentImageIndex(newIndex);
-    },
-    [],
-  );
-
-  const refreshContent = React.useCallback(() => {
-    if (viewMode === "images") {
-      refreshFolders();
-      // Force refresh by changing the selected folder
-      const currentFolder = selectedFolder;
-      setSelectedFolder(null);
-      setTimeout(() => setSelectedFolder(currentFolder), 10);
-    } else {
-      refreshVideos();
-      // Force refresh by changing the selected video
-      const currentVideo = selectedVideo;
-      setSelectedVideo(null);
-      setTimeout(() => setSelectedVideo(currentVideo), 10);
-    }
-  }, [refreshFolders, refreshVideos, selectedFolder, selectedVideo, viewMode]);
-
-  // Fetch timestamp for current frame from database
-  React.useEffect(() => {
-    async function fetchTimestamp(): Promise<void> {
-      if (viewMode !== "images" || files.length === 0) {
-        setCurrentTimestamp(null);
+    const handleKeydown = (e: KeyboardEvent): void => {
+      if (frameCount === 0) return;
+      if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+      // Leave the day picker alone, open or closed.
+      if (
+        e.target instanceof Element &&
+        e.target.closest('[role="listbox"], [aria-haspopup="listbox"]')
+      ) {
         return;
       }
+      // In the find bar they move the caret.
+      if (e.target instanceof HTMLInputElement && e.target.type !== "range") return;
+      // Also stops a focused slider from taking its own 1-frame step on top.
+      e.preventDefault();
+      const step = e.altKey ? 100 : e.shiftKey ? 10 : 1;
+      const direction = e.key === "ArrowLeft" ? -1 : 1;
+      goTo(Math.min(frameCount - 1, Math.max(0, currentIndex + direction * step)));
+    };
+    window.addEventListener("keydown", handleKeydown);
+    return (): void => window.removeEventListener("keydown", handleKeydown);
+  }, [frameCount, currentIndex, goTo]);
 
-      try {
-        // Extract frame number from filename (e.g., "00001.png" -> 1)
-        const filename = files[currentImageIndex];
-        const frameNumber = parseInt(filename.replace(".png", ""), 10);
+  const wantedSrc =
+    selectedDay && frameCount > 0 ? frameUrl(selectedDay, currentIndex) : null;
+  const { src, frameFailed, loaded, onLoad, onError } = useGatedImage(wantedSrc);
+  // Stretches still to be decoded from video are drawn paler on the scrubber.
+  const pendingFrames = usePendingFrames(day, loaded);
+  const [frameSize, setFrameSize] = React.useState(DEFAULT_FRAME_SIZE);
+  const currentMatch: DayMatch | null = matches?.[rangeAt(matches, currentIndex)] ?? null;
+  const matchLines = useMatchLines(selectedDay, currentMatch?.frame ?? null, query);
+  // Outline the matching lines only once the frame on screen is the one the
+  // match was read from, or stands for: until a new frame has loaded, the
+  // browser keeps showing the old one.
+  const highlights =
+    currentMatch && loaded === wantedSrc && !frameFailed ? (matchLines ?? []) : [];
 
-        const metadata = await invoke<[string, string] | null>(
-          "get_screenshot_metadata",
-          {
-            frameNumber,
-          },
-        );
-
-        if (metadata && metadata[1]) {
-          setCurrentTimestamp(metadata[1]); // Use local_time
-        } else {
-          setCurrentTimestamp(null);
-        }
-      } catch (error) {
-        console.error("Error fetching timestamp:", error);
-        setCurrentTimestamp(null);
-      }
+  // Capture time of the frame on screen.
+  React.useEffect(() => {
+    if (!selectedDay || frameCount === 0) {
+      setFrameTime(null);
+      return;
     }
-
-    fetchTimestamp();
-  }, [currentImageIndex, files, viewMode]);
-
-  const formatTime = React.useCallback(
-    (index: number) => {
-      // If we have a real timestamp from the database, use it
-      if (currentTimestamp) {
-        try {
-          const date = new Date(currentTimestamp);
-          const hours = date.getHours();
-          const minutes = date.getMinutes();
-          return `${hours.toString().padStart(2, "0")}:${minutes
-            .toString()
-            .padStart(2, "0")}`;
-        } catch (e) {
-          console.error("Error parsing timestamp:", e);
-        }
-      }
-
-      // Fall back to estimate if no timestamp available
-      const totalMinutes = Math.floor((index * 1) / 60); // Assuming 1 second between screenshots
-      const hours = Math.floor(totalMinutes / 60);
-      const minutes = totalMinutes % 60;
-      return `${hours.toString().padStart(2, "0")}:${minutes
-        .toString()
-        .padStart(2, "0")}`;
-    },
-    [currentTimestamp],
-  );
-
-  if (foldersError) {
-    return (
-      <main className="flex items-center justify-center h-screen">
-        <div className="text-red-500">
-          <p>Error loading folders: {foldersError.message}</p>
-        </div>
-      </main>
+    let cancelled = false;
+    getFrameTime(selectedDay, currentIndex).then(
+      (time) => {
+        if (!cancelled) setFrameTime(time);
+      },
+      (error: unknown) => {
+        if (cancelled) return;
+        console.error("Error fetching frame time:", error);
+        setFrameTime(null);
+      },
     );
-  }
+    return (): void => {
+      cancelled = true;
+    };
+  }, [selectedDay, currentIndex, frameCount]);
 
-  if (filesError) {
+  const error = daysError ?? dayError;
+  if (error) {
     return (
       <main className="flex items-center justify-center h-screen">
-        <div className="text-red-500">
-          <p>Error loading files: {filesError.message}</p>
-        </div>
-      </main>
-    );
-  }
-
-  if (videosError) {
-    return (
-      <main className="flex items-center justify-center h-screen">
-        <div className="text-red-500">
-          <p>Error loading videos: {videosError.message}</p>
+        <div className="text-danger">
+          <p>Could not load the timelapse library: {error.message}</p>
         </div>
       </main>
     );
   }
 
   return (
-    <main className="h-screen overflow-hidden grid grid-rows-[min-content_1fr_56px] bg-gray-100 text-black">
-      {/* Header with mode toggle and content selection */}
-      <header className="bg-gray-100 p-3 border-b border-gray-200">
+    <main className="h-screen overflow-hidden grid grid-rows-[min-content_1fr_auto] bg-page text-fg">
+      <header className="bg-card px-4 py-2.5 border-b border-border">
         <div className="flex items-center gap-4">
-          <h1 className="text-lg font-semibold">Timelapse Viewer</h1>
+          <DayPicker days={days} today={today} value={selectedDay} onChange={setSelectedDay} />
 
-          {/* Mode toggle */}
-          <div className="flex bg-gray-200 rounded-lg p-1">
-            <button
-              onClick={() => setViewMode("images")}
-              className={`px-3 py-1 rounded text-sm font-medium transition-colors ${
-                viewMode === "images"
-                  ? "bg-white text-gray-900 shadow-sm"
-                  : "text-gray-600 hover:text-gray-900"
-              }`}
-            >
-              Images
-            </button>
-            <button
-              onClick={() => setViewMode("videos")}
-              className={`px-3 py-1 rounded text-sm font-medium transition-colors ${
-                viewMode === "videos"
-                  ? "bg-white text-gray-900 shadow-sm"
-                  : "text-gray-600 hover:text-gray-900"
-              }`}
-            >
-              Videos
-            </button>
-          </div>
 
-          {/* Images mode selectors */}
-          {viewMode === "images" && (
-            <>
-              <select
-                value={selectedFolder || ""}
-                onChange={(e) => setSelectedFolder(e.target.value || null)}
-                className="bg-gray-700 text-white px-3 py-1 rounded border border-gray-600 focus:outline-none focus:ring-2 focus:ring-blue-500"
-              >
-                <option value="">Select a date…</option>
-                {[...folders]
-                  .sort()
-                  .reverse()
-                  .map((folder) => (
-                    <option key={folder} value={folder}>
-                      {folder} {folder === currentDateFolder ? "(Today)" : ""}
-                    </option>
-                  ))}
-              </select>
-              {selectedFolder && files.length > 0 && (
-                <>
-                  <span className="text-gray-600 text-sm">
-                    {files.length} screenshots
-                  </span>
-                  <span className="text-gray-600 text-sm tabular-nums">
-                    Frame {currentImageIndex + 1} / {files.length}
-                  </span>
-                  <span className="text-gray-600 text-sm tabular-nums">
-                    {currentTimestamp ? "" : "~"}
-                    {formatTime(currentImageIndex)}
-                  </span>
-                </>
-              )}
-            </>
-          )}
-
-          {/* Videos mode selectors */}
-          {viewMode === "videos" && (
-            <>
-              <select
-                value={selectedVideo || ""}
-                onChange={(e) => setSelectedVideo(e.target.value || null)}
-                className="bg-gray-700 text-white px-3 py-1 rounded border border-gray-600 focus:outline-none focus:ring-2 focus:ring-blue-500"
-              >
-                <option value="">Select a video…</option>
-                {[...videos]
-                  .sort()
-                  .reverse()
-                  .map((video) => (
-                    <option key={video} value={video}>
-                      {video}
-                    </option>
-                  ))}
-              </select>
-              {videos.length > 0 && (
-                <span className="text-gray-600 text-sm">
-                  {videos.length} videos
+          <div className="ml-auto flex items-center gap-1.5">
+            <label className={`${fieldFrame} flex items-center gap-2 w-72 h-9 px-2.5`}>
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true" className="shrink-0 text-muted-fg">
+                <circle cx="11" cy="11" r="7" />
+                <path d="m20 20-3.5-3.5" />
+              </svg>
+              <input
+                ref={findInput}
+                type="search"
+                aria-label="Find text on screen"
+                placeholder="Find text on screen"
+                value={typed}
+                onChange={(e) => {
+                  setTyped(e.target.value);
+                  setShowAllDays(false);
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    stepToMatch(e.shiftKey ? -1 : 1);
+                  } else if (e.key === "Escape") {
+                    setTyped("");
+                    e.currentTarget.blur();
+                  }
+                }}
+                className="flex-1 min-w-0 bg-transparent text-sm outline-none placeholder:text-muted-fg"
+              />
+              {query !== "" && (
+                <span className="text-xs text-muted-fg whitespace-nowrap tabular-nums" aria-live="polite">
+                  {matchLabel(stops, matches, matchesError, currentIndex)}
                 </span>
               )}
-              {selectedVideo && videoFiles.length > 0 && (
-                <>
-                  <span className="text-gray-600 text-sm">
-                    {videoFiles.length} frames
-                  </span>
-                  <span className="text-gray-600 text-sm tabular-nums">
-                    Frame {currentImageIndex + 1} / {videoFiles.length}
-                  </span>
-                </>
-              )}
-            </>
-          )}
+            </label>
+            <button
+              type="button"
+              aria-label="Previous match"
+              title="Previous match (Shift+Enter)"
+              disabled={stops.length === 0}
+              onClick={() => stepToMatch(-1)}
+              className={`${outlineButton} size-9`}
+            >
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+                <path d="m15 18-6-6 6-6" />
+              </svg>
+            </button>
+            <button
+              type="button"
+              aria-label="Next match"
+              title="Next match (Enter)"
+              disabled={stops.length === 0}
+              onClick={() => stepToMatch(1)}
+              className={`${outlineButton} size-9`}
+            >
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+                <path d="m9 18 6-6-6-6" />
+              </svg>
+            </button>
+          </div>
         </div>
+
+        <OtherDays
+          counts={counts.filter((c) => c.day !== selectedDay)}
+          today={today}
+          showAll={showAllDays}
+          onShowAll={() => setShowAllDays(true)}
+          onPick={(date) => {
+            setSelectedDay(date);
+            setJumpToFirstMatch(date);
+          }}
+        />
       </header>
 
-      {/* Main content area */}
-      <div className="relative overflow-hidden object-contain">
-        {currentImageSrc ? (
+      <div className="relative overflow-hidden">
+        {src && (
           <img
-            src={currentImageSrc}
-            alt={
-              viewMode === "images"
-                ? `Screenshot ${currentImageIndex + 1}`
-                : `Frame ${currentImageIndex + 1}`
-            }
-            className="w-full h-full object-contain absolute top-0 left-0 bottom-0 right-0"
-            onError={() => {
-              console.error("Failed to load image:", currentImageSrc);
-              setCurrentImageSrc(null);
+            src={src}
+            alt={`Frame ${currentIndex + 1}`}
+            onLoad={(e) => {
+              const { naturalWidth: width, naturalHeight: height } = e.currentTarget;
+              if (width > 0 && height > 0) {
+                setFrameSize((size) =>
+                  size.width === width && size.height === height ? size : { width, height },
+                );
+              }
+              onLoad();
             }}
+            onError={onError}
+            className={`w-full h-full object-contain absolute inset-0 ${
+              frameFailed ? "invisible" : ""
+            }`}
           />
-        ) : (
-          <div className="flex items-center justify-center h-full text-gray-500 text-center">
-            <div>
-              {viewMode === "images" ? (
-                <>
-                  <p className="text-xl mb-2">
-                    {files.length > 0
-                      ? "Loading image…"
-                      : "No screenshots available"}
-                  </p>
-                  {files.length === 0 && (
-                    <p>Select a date folder with screenshots to begin</p>
-                  )}
-                  {files.length > 0 && (
-                    <p className="text-sm mt-2">
-                      Trying to load: {files[currentImageIndex]}
-                    </p>
-                  )}
-                </>
-              ) : (
-                <>
-                  <p className="text-xl mb-2">
-                    {extractionError
-                      ? "Could not extract frames from this video"
-                      : isExtractingFrames
-                        ? "Extracting frames from video…"
-                        : videoFiles.length > 0
-                          ? "Loading frame…"
-                          : videoCacheFolder
-                            ? "Loading frames…"
-                            : selectedVideo
-                              ? "Loading video…"
-                              : "No video selected"}
-                  </p>
-                  {extractionError && (
-                    <p className="text-sm mt-2 text-red-400">
-                      {extractionError}
-                    </p>
-                  )}
-                  {!selectedVideo && videos.length > 0 && (
-                    <p>Select a video to begin</p>
-                  )}
-                  {!selectedVideo && videos.length === 0 && (
-                    <p>No videos found in the Timelapse directory</p>
-                  )}
-                  {selectedVideo && videoFiles.length > 0 && (
-                    <p className="text-sm mt-2">
-                      Trying to load: {videoFiles[currentImageIndex]}
-                    </p>
-                  )}
-                </>
-              )}
-            </div>
+        )}
+        {highlights.length > 0 && (
+          // Same box and aspect fitting as the <img>'s object-contain, so
+          // normalized line boxes land on the text.
+          <svg
+            data-testid="match-highlights"
+            viewBox={`0 0 ${frameSize.width} ${frameSize.height}`}
+            preserveAspectRatio="xMidYMid meet"
+            className="absolute inset-0 w-full h-full pointer-events-none"
+            aria-hidden="true"
+          >
+            {highlights.map((line, i) => (
+              <rect
+                key={i}
+                x={line.x * frameSize.width - 4}
+                y={line.y * frameSize.height - 4}
+                width={line.width * frameSize.width + 8}
+                height={line.height * frameSize.height + 8}
+                rx={4}
+                fill="rgba(250, 204, 21, 0.2)"
+                stroke="#facc15"
+                strokeWidth={4}
+              />
+            ))}
+          </svg>
+        )}
+        {(!src || frameFailed) && (
+          <div className="flex items-center justify-center h-full text-muted-fg text-center">
+            <p className="text-xl">
+              {frameFailed
+                ? "Could not load this frame"
+                : days.length === 0
+                  ? "No screenshots yet"
+                  : selectedDay && day && frameCount === 0
+                    ? "Nothing was captured on this day"
+                    : "Loading…"}
+            </p>
           </div>
         )}
       </div>
 
-      {/* Bottom controls */}
-      <div className="bg-gray-100 p-4">
+      <div className="bg-card px-4 py-3 border-t border-border">
         <div className="flex items-center gap-4">
-          {/* Scrubber (works for both images and videos) */}
-          <div className="flex-1 bg-gray-200 p-1 pt-0 rounded-full">
+          <div className="relative flex-1 bg-border p-1 pt-0 rounded-full">
+            <PendingStretches pending={pendingFrames} />
+            <MatchMarks stops={stops} frameCount={frameCount} currentIndex={currentIndex} />
             <input
               type="range"
+              aria-label="Position in day"
               min={0}
-              max={Math.max(0, (viewMode === "images" ? files.length : videoFiles.length) - 1)}
-              value={currentImageIndex}
-              onChange={handleScrubberChange}
-              disabled={viewMode === "images" ? files.length === 0 : videoFiles.length === 0}
-              className="w-full h-2 bg-gray-300 rounded-lg appearance-none cursor-pointer
+              max={Math.max(0, frameCount - 1)}
+              value={currentIndex}
+              onChange={(e) => goTo(parseInt(e.target.value, 10))}
+              disabled={frameCount === 0}
+              className="relative block w-full h-2 rounded-full appearance-none cursor-pointer
                          disabled:opacity-50 disabled:cursor-not-allowed"
             />
           </div>
-
-          {/* Current time/frame display */}
-          {viewMode === "images" && (
-            <div className="text-sm text-gray-600 min-w-[60px] text-center">
-              {files.length > 0 ? formatTime(currentImageIndex) : "--:--"}
-            </div>
-          )}
-
-          {/* Refresh button */}
-          <button
-            onClick={refreshContent}
-            disabled={viewMode === "images" ? !selectedFolder : !selectedVideo}
-            className="bg-gradient-to-b from-fuchsia-50 to-amber-50 hover:bg-blue-700 disabled:bg-gray-600 px-3 py-1 rounded-xl text-sm font-medium text-amber-800 transition-colors border-2 border-yellow-500 shadow-md shadow-amber-400/20"
-            title={
-              viewMode === "images" ? "Refresh screenshots" : "Refresh videos"
-            }
+          <div
+            className="text-sm font-medium text-muted-fg min-w-[60px] text-center tabular-nums"
+            title={frameTime && !frameTime.exact ? "Estimated" : undefined}
           >
-            ↻ Refresh
-          </button>
+            {formatFrameTime(frameTime)}
+          </div>
         </div>
       </div>
     </main>
   );
+}
+
+/** "3 of 31" when on a match, otherwise how many there are. */
+function matchLabel(
+  stops: Array<Stop>,
+  matches: Array<DayMatch> | null,
+  error: Error | null,
+  currentIndex: number,
+): string {
+  if (error) return "Search failed";
+  if (matches === null) return "…";
+  if (stops.length === 0) return "No matches";
+  const current = rangeAt(stops, currentIndex);
+  if (current !== -1) return `${current + 1} of ${stops.length}`;
+  return stops.length === 1 ? "1 match" : `${stops.length} matches`;
+}
+
+/** Where the searched text was on screen, drawn just above the scrubber. */
+function MatchMarks({
+  stops,
+  frameCount,
+  currentIndex,
+}: {
+  stops: Array<Stop>;
+  frameCount: number;
+  currentIndex: number;
+}): React.ReactNode {
+  if (stops.length === 0 || frameCount === 0) return null;
+  const current = rangeAt(stops, currentIndex);
+  // Where the slider puts its thumb's centre for frame `index`.
+  const at = (index: number): number => (Math.min(index, frameCount - 1) / Math.max(frameCount - 1, 1)) * 100;
+  return (
+    <div
+      data-testid="match-marks"
+      // Inset by the track's padding (4px) plus half the 20px thumb, the
+      // range the thumb's centre moves over.
+      className="absolute left-[14px] right-[14px] -top-3 h-3 pointer-events-none"
+      aria-hidden="true"
+    >
+      {stops.map((stop, i) => (
+        <span
+          key={stop.index}
+          className={`absolute bottom-0 h-3 min-w-[3px] -ml-px rounded-sm ${
+            i === current ? "bg-yellow-600" : "bg-yellow-400"
+          }`}
+          style={{
+            left: `${at(stop.index)}%`,
+            width: `${at(stop.endIndex - 1) - at(stop.index)}%`,
+          }}
+        />
+      ))}
+    </div>
+  );
+}
+
+/** The other days the searched text appears on, as links to them. */
+function OtherDays({
+  counts,
+  today,
+  showAll,
+  onShowAll,
+  onPick,
+}: {
+  counts: Array<{ day: string; count: number }>;
+  today: string;
+  showAll: boolean;
+  onShowAll: () => void;
+  onPick: (date: string) => void;
+}): React.ReactNode {
+  if (counts.length === 0) return null;
+  const shown = showAll ? counts : counts.slice(0, OTHER_DAYS_SHOWN);
+  const hidden = counts.length - shown.length;
+  return (
+    <nav aria-label="Other days with matches" className="flex flex-wrap items-center gap-2 mt-2 text-sm">
+      <span className="text-muted-fg">Also on</span>
+      {shown.map(({ day, count }) => (
+        <button
+          key={day}
+          type="button"
+          onClick={() => onPick(day)}
+          className={`flex items-center gap-1.5 px-2.5 py-0.5 bg-card border border-border rounded-full shadow-xs transition-colors hover:bg-muted ${focusRing}`}
+        >
+          {day === today ? "Today" : day}
+          <span className="text-muted-fg tabular-nums">{count}</span>
+        </button>
+      ))}
+      {hidden > 0 && (
+        <button type="button" onClick={onShowAll} className={`rounded-sm font-medium text-fg underline-offset-4 hover:underline ${focusRing}`}>
+          {hidden === 1 ? "1 more day" : `${hidden} more days`}
+        </button>
+      )}
+    </nav>
+  );
+}
+
+/** `value`, once it has stopped changing for `delayMs`. */
+function useDebounced<T>(value: T, delayMs: number): T {
+  const [settled, setSettled] = React.useState(value);
+  React.useEffect(() => {
+    const timer = setTimeout(() => setSettled(value), delayMs);
+    return (): void => clearTimeout(timer);
+  }, [value, delayMs]);
+  return settled;
+}
+
+/**
+ * Show `wanted` in an `<img>`, but never start loading a frame while another
+ * is still loading. Dragging the scrubber across a video day would otherwise
+ * queue a decode for every chunk it passes; this way each load that finishes
+ * jumps straight to wherever the scrubber is now.
+ */
+function useGatedImage(wanted: string | null): {
+  src: string | null;
+  frameFailed: boolean;
+  /** The last frame that finished loading successfully. */
+  loaded: string | null;
+  onLoad: () => void;
+  onError: () => void;
+} {
+  const [src, setSrc] = React.useState<string | null>(null);
+  const [frameFailed, setFrameFailed] = React.useState(false);
+  const [loaded, setLoaded] = React.useState<string | null>(null);
+  const srcRef = React.useRef<string | null>(null);
+  const wantedRef = React.useRef<string | null>(wanted);
+  const inFlight = React.useRef(false);
+
+  const show = React.useCallback((next: string | null): void => {
+    srcRef.current = next;
+    inFlight.current = next !== null;
+    setSrc(next);
+  }, []);
+
+  React.useEffect(() => {
+    wantedRef.current = wanted;
+    if (!inFlight.current && wanted !== srcRef.current) {
+      show(wanted);
+    }
+  }, [wanted, show]);
+
+  const settle = React.useCallback(
+    (failed: boolean): void => {
+      inFlight.current = false;
+      setFrameFailed(failed);
+      if (!failed) setLoaded(srcRef.current);
+      if (wantedRef.current !== srcRef.current) {
+        show(wantedRef.current);
+      }
+    },
+    [show],
+  );
+
+  return {
+    src,
+    frameFailed,
+    loaded,
+    onLoad: React.useCallback((): void => settle(false), [settle]),
+    onError: React.useCallback((): void => settle(true), [settle]),
+  };
+}
+
+function formatFrameTime(time: FrameTime | null): string {
+  if (!time) return "--:--";
+  const date = new Date(time.localTime);
+  if (Number.isNaN(date.getTime())) return "--:--";
+  const hhmm = `${String(date.getHours()).padStart(2, "0")}:${String(
+    date.getMinutes(),
+  ).padStart(2, "0")}`;
+  return time.exact ? hhmm : `~${hhmm}`;
+}
+
+function localDateFolder(date: Date): string {
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${date.getFullYear()}-${month}-${day}`;
 }
