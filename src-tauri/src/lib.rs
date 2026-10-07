@@ -553,9 +553,9 @@ pub fn run() {
                 // own yet.
                 match paths::timelapse_root() {
                     Some(root) => {
-                        converter::Converter::with_delete_check(
+                        converter::Converter::with_ocr_check(
                             root.clone(),
-                            ocr::delete_check(&root),
+                            ocr::ocr_check(&root),
                         )
                         .start();
 

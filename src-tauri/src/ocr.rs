@@ -5,14 +5,14 @@
 //! read, stores the text in `screenshots.db` for full-text search, and moves
 //! that day's progress mark forward (see `ScreenshotDatabase::record_ocr_frame`).
 //! It only works while the machine is on AC power, like the video converter,
-//! and the converter in turn only deletes PNGs that the progress mark covers
-//! (`delete_check`).
+//! and the converter in turn only converts and deletes PNGs that the progress
+//! mark covers (`ocr_check`).
 //!
 //! Recognition itself is Apple's Vision framework, so the worker only runs on
 //! macOS; everything else here is platform-independent and tested with a fake
 //! recognizer.
 
-use crate::converter::{is_day_folder_name, on_ac_power, DeleteCheck, HourBatch};
+use crate::converter::{is_day_folder_name, on_ac_power, OcrCheck, HourBatch};
 use crate::database::ScreenshotDatabase;
 use image::imageops;
 use serde::Serialize;
@@ -91,10 +91,11 @@ pub fn ocr_covers(
     }
 }
 
-/// The video converter's `DeleteCheck`: an hour's PNGs may go once OCR has
-/// handled every one of them. It keeps its own connection to the library's
-/// database; if that cannot be opened, nothing is deleted.
-pub fn delete_check(root: &Path) -> DeleteCheck {
+/// The video converter's `OcrCheck`: an hour is converted, and its PNGs may
+/// go, once OCR has handled every one of them. It keeps its own connection to
+/// the library's database; if that cannot be opened, nothing is converted or
+/// deleted.
+pub fn ocr_check(root: &Path) -> OcrCheck {
     let db = match ScreenshotDatabase::new(root.join("screenshots.db")) {
         Ok(db) => Mutex::new(db),
         Err(error) => {
@@ -717,10 +718,10 @@ mod tests {
     }
 
     #[test]
-    fn delete_check_waits_for_ocr() {
+    fn ocr_check_waits_for_ocr() {
         let temp_dir = TempDir::new().unwrap();
         let root = temp_dir.path();
-        let check = delete_check(root);
+        let check = ocr_check(root);
         let batch = |numbers: &[u32]| HourBatch {
             day: DAY_1.to_string(),
             hour: 9,
