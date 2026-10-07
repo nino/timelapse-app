@@ -666,7 +666,7 @@ mod tests {
         let batch = |numbers: &[u32]| HourBatch {
             day: DAY_1.to_string(),
             hour: 9,
-            start: chrono::Local::now(),
+            start: chrono::Local::now().naive_local(),
             part: 0,
             frames: numbers
                 .iter()

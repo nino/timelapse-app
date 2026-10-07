@@ -397,9 +397,9 @@ impl FrameSource {
         let mut timeline = Vec::new();
         let mut start = 0;
         while start < shots.len() {
-            let hour = shots[start].hour();
+            let hour = shots[start].hour(day);
             let mut end = start + 1;
-            while end < shots.len() && shots[end].hour() == hour {
+            while end < shots.len() && shots[end].hour(day) == hour {
                 end += 1;
             }
             timeline.push((

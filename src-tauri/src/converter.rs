@@ -27,7 +27,7 @@
 //! run clears.
 
 use crate::database::ScreenshotDatabase;
-use chrono::{DateTime, Local, NaiveDate, Timelike};
+use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, Timelike};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -42,6 +42,11 @@ const FRAMERATE: &str = "15";
 /// most 3600 frames; this only matters when mtimes are unreliable (a library
 /// copied from elsewhere can have a whole day stamped with one time).
 const MAX_FRAMES_PER_BATCH: usize = 3600;
+
+/// How long after an hour ends before it counts as ended. A screenshot taken
+/// in the hour's last second can be written a moment later, and once the hour
+/// is converted a late frame would be deleted without being in the video.
+const LATE_WRITE_GRACE_SECS: i64 = 60;
 
 /// How long to rest after a batch before starting the next one.
 const COOL_DOWN: Duration = Duration::from_secs(10 * 60);
@@ -67,10 +72,10 @@ pub type DeleteCheck = Arc<dyn Fn(&HourBatch) -> bool + Send + Sync>;
 pub struct HourBatch {
     /// Day folder name, `YYYY-MM-DD`.
     pub day: String,
-    /// Local hour of the frames' modification times, 0–23.
+    /// The hour the frames are filed under, 0–23: see `filed_at`.
     pub hour: u32,
-    /// Modification time of the first frame.
-    pub start: DateTime<Local>,
+    /// When the first frame is filed: see `filed_at`.
+    pub start: NaiveDateTime,
     /// Which slice of the hour this is, from 0. Only non-zero when the hour
     /// has more than `MAX_FRAMES_PER_BATCH` frames.
     pub part: usize,
@@ -89,7 +94,8 @@ pub struct Frame {
 
 impl HourBatch {
     /// File name of the video: `YYYY-MM-DD--HH-MM-SS--hourly.mov`, where the
-    /// time is the first frame's, with `-2`, `-3`, … after `hourly` for later
+    /// date is the day folder's and the time is the first frame's (as filed,
+    /// so always within that date), with `-2`, `-3`, … after `hourly` for later
     /// parts of an oversized hour.
     ///
     /// The viewer reads the leading date and time as the video's start, and
@@ -155,6 +161,19 @@ fn parse_pmset_power_source(output: &str) -> Option<bool> {
 /// Is `name` a day folder name (`YYYY-MM-DD`)?
 pub(crate) fn is_day_folder_name(name: &str) -> bool {
     name.len() == 10 && NaiveDate::parse_from_str(name, "%Y-%m-%d").is_ok()
+}
+
+/// The local time a screenshot is filed under: its modification time, kept
+/// within its day folder's date. A screenshot taken just before midnight is
+/// written into that day's folder but can land just after midnight; filed by
+/// its mtime alone it would join the folder's 00:00 hour, and could be taken
+/// for part of that hour's video and deleted without ever being encoded.
+///
+/// `frame_source::library` files screenshots the same way.
+pub(crate) fn filed_at(modified: DateTime<Local>, day: NaiveDate) -> NaiveDateTime {
+    let first = day.and_hms_opt(0, 0, 0).expect("midnight exists");
+    let last = day.and_hms_opt(23, 59, 59).expect("23:59:59 exists");
+    modified.naive_local().clamp(first, last)
 }
 
 /// Frame number of a screenshot file name such as `00042.png`.
@@ -251,9 +270,12 @@ fn find_ended_hours(root: &Path, now: DateTime<Local>) -> std::io::Result<Vec<En
 
     for day in day_names {
         let day_dir = root.join(&day);
+        let Ok(date) = NaiveDate::parse_from_str(&day, "%Y-%m-%d") else {
+            continue;
+        };
 
-        // (frame number, path, mtime, hour start) for every screenshot.
-        let mut frames: Vec<(u32, PathBuf, DateTime<Local>, DateTime<Local>)> = Vec::new();
+        // (frame number, path, mtime, filed at) for every screenshot.
+        let mut frames: Vec<(u32, PathBuf, DateTime<Local>, NaiveDateTime)> = Vec::new();
         for entry in std::fs::read_dir(&day_dir)?.filter_map(|entry| entry.ok()) {
             let Some(number) = entry.file_name().to_str().and_then(frame_number) else {
                 continue;
@@ -262,14 +284,7 @@ fn find_ended_hours(root: &Path, now: DateTime<Local>) -> std::io::Result<Vec<En
                 continue;
             };
             let modified: DateTime<Local> = modified.into();
-            let Some(hour_start) = modified
-                .with_minute(0)
-                .and_then(|t| t.with_second(0))
-                .and_then(|t| t.with_nanosecond(0))
-            else {
-                continue;
-            };
-            frames.push((number, entry.path(), modified, hour_start));
+            frames.push((number, entry.path(), modified, filed_at(modified, date)));
         }
         frames.sort_by_key(|(number, _, _, _)| *number);
 
@@ -279,26 +294,34 @@ fn find_ended_hours(root: &Path, now: DateTime<Local>) -> std::io::Result<Vec<En
             None
         };
 
-        let mut by_hour: BTreeMap<DateTime<Local>, Vec<Frame>> = BTreeMap::new();
-        for (number, path, modified, hour_start) in frames {
-            by_hour.entry(hour_start).or_default().push(Frame { number, path, modified });
+        // Keyed by the hour plus the filed time of each frame, in frame order.
+        let mut by_hour: BTreeMap<u32, Vec<(Frame, NaiveDateTime)>> = BTreeMap::new();
+        for (number, path, modified, filed) in frames {
+            by_hour
+                .entry(filed.hour())
+                .or_default()
+                .push((Frame { number, path, modified }, filed));
         }
 
-        for (hour_start, hour_frames) in by_hour {
-            if hour_start + chrono::Duration::hours(1) > now {
+        for (hour, hour_frames) in by_hour {
+            let hour_start = date.and_hms_opt(hour, 0, 0).expect("every hour exists as a naive time");
+            let ended = hour_start
+                + chrono::Duration::hours(1)
+                + chrono::Duration::seconds(LATE_WRITE_GRACE_SECS);
+            if ended > now.naive_local() {
                 continue;
             }
             let holds_todays_newest_frame =
-                todays_newest.is_some_and(|newest| hour_frames.iter().any(|frame| frame.number == newest));
+                todays_newest.is_some_and(|newest| hour_frames.iter().any(|(frame, _)| frame.number == newest));
             let parts = hour_frames
                 .chunks(MAX_FRAMES_PER_BATCH)
                 .enumerate()
                 .map(|(part, chunk)| HourBatch {
                     day: day.clone(),
-                    hour: hour_start.hour(),
-                    start: chunk[0].modified,
+                    hour,
+                    start: chunk[0].1,
                     part,
-                    frames: chunk.to_vec(),
+                    frames: chunk.iter().map(|(frame, _)| frame.clone()).collect(),
                 })
                 .collect();
             hours.push(EndedHour {
@@ -687,6 +710,55 @@ mod tests {
         let summary: Vec<(u32, usize)> = batches.iter().map(|b| (b.hour, b.frames.len())).collect();
         assert_eq!(summary, vec![(9, 2), (10, 1)]);
         assert_eq!(batches[0].video_name(), "2026-10-01--09-10-00--hourly.mov");
+    }
+
+    #[test]
+    fn files_a_frame_written_after_midnight_under_its_folders_last_hour() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        frame(root, "2026-10-01", 1, at("2026-10-01", 0, 10));
+        frame(root, "2026-10-01", 2, at("2026-10-01", 23, 30));
+        // Taken at 23:59:59 and written just after midnight, into the folder
+        // of the day it was taken.
+        frame(root, "2026-10-01", 3, at("2026-10-02", 0, 0));
+
+        let batches = find_ready_batches(root, at("2026-10-02", 0, 5)).unwrap();
+
+        let summary: Vec<(u32, String, usize)> = batches
+            .iter()
+            .map(|b| (b.hour, b.video_name(), b.frames.len()))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                (0, "2026-10-01--00-10-00--hourly.mov".to_string(), 1),
+                (23, "2026-10-01--23-30-00--hourly.mov".to_string(), 2),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_frame_written_after_midnight_alone_is_named_within_its_day() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        frame(root, "2026-10-01", 1, at("2026-10-02", 0, 0));
+
+        let batches = find_ready_batches(root, at("2026-10-02", 0, 5)).unwrap();
+
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].hour, 23);
+        assert_eq!(batches[0].video_name(), "2026-10-01--23-59-59--hourly.mov");
+    }
+
+    #[test]
+    fn waits_a_minute_after_the_hour_for_late_writes() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        frame(root, "2026-10-01", 1, at("2026-10-01", 9, 30));
+        let just_after = at("2026-10-01", 10, 0) + chrono::Duration::seconds(30);
+
+        assert!(find_ready_batches(root, just_after).unwrap().is_empty());
+        assert_eq!(find_ready_batches(root, at("2026-10-01", 10, 1)).unwrap().len(), 1);
     }
 
     #[test]
