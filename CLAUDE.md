@@ -67,6 +67,8 @@ Two consequences worth remembering: `cargo test --release` compiles with `debug_
 
 `.github/workflows/release.yml` builds, signs (Developer ID, hardened runtime), notarises and staples the app and a DMG on every push to `main`, and republishes them as the rolling `latest` GitHub release; pushing the `beta` tag publishes a prerelease instead. It follows nino/worktree-manager's release workflow and uses the same secret names. The released version is `<major>.<minor>.<commit count>`, with major/minor from `tauri.conf.json`, so it always grows, which is what a future Tauri updater needs; nothing is committed back.
 
+**Auto-update.** `src-tauri/src/updater.rs` (release builds only; a debug build would replace itself with the release one) checks `releases/latest/download/latest.json` at launch and hourly through `tauri-plugin-updater`, installs a newer version, and relaunches once the window is not focused. The workflow writes that `latest.json` and uploads it with a minisign-signed `.app.tar.gz`; `createUpdaterArtifacts` is switched on only by the workflow's `--config` override so a local `tauri build` needs no updater key. The app trusts only `plugins.updater.pubkey` in `tauri.conf.json`, which must match the `TAURI_SIGNING_PRIVATE_KEY` secret: losing that private key means installed copies can never update again, and the workflow refuses to run while the pubkey is the placeholder.
+
 The build is Apple Silicon only (the runner's architecture). The job runs `bun run fetch:ffmpeg` before `cargo test`, because build.rs needs the sidecar and only `tauri build` fetches it on its own.
 
 ## Conventions (enforced by oxlint — see `.oxlintrc.json`)
