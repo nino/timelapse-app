@@ -104,14 +104,7 @@ pub fn delete_check(root: &Path) -> DeleteCheck {
     };
 
     Arc::new(move |batch: &HourBatch| {
-        let Some(frame_numbers) = batch
-            .frames
-            .iter()
-            .map(|path| frame_number(path))
-            .collect::<Option<Vec<u32>>>()
-        else {
-            return false;
-        };
+        let frame_numbers = batch.frames.iter().map(|frame| frame.number);
         db.lock()
             .map(|db| ocr_covers(&db, &batch.day, frame_numbers))
             .unwrap_or(false)
@@ -421,6 +414,7 @@ mod vision {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::converter::Frame;
     use image::{GrayImage, Luma};
     use std::cell::RefCell;
     use std::fs::{File, FileTimes};
@@ -669,24 +663,29 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let root = temp_dir.path();
         let check = delete_check(root);
-        let batch = |frames: &[&str]| HourBatch {
+        let batch = |numbers: &[u32]| HourBatch {
             day: DAY_1.to_string(),
             hour: 9,
             start: chrono::Local::now(),
             part: 0,
-            frames: frames.iter().map(|name| root.join(DAY_1).join(name)).collect(),
-            captured: Vec::new(),
+            frames: numbers
+                .iter()
+                .map(|&number| Frame {
+                    number,
+                    path: root.join(DAY_1).join(format!("{:05}.png", number)),
+                    modified: chrono::Local::now(),
+                })
+                .collect(),
         };
 
-        assert!(!check(&batch(&["00001.png", "00002.png"])));
+        assert!(!check(&batch(&[1, 2])));
 
         // OCR's own connection records progress; the check sees it.
         let db = ScreenshotDatabase::new(root.join("screenshots.db")).unwrap();
         db.record_ocr_frame(DAY_1, 2, None).unwrap();
 
-        assert!(check(&batch(&["00001.png", "00002.png"])));
-        assert!(!check(&batch(&["00002.png", "00003.png"])));
-        assert!(!check(&batch(&["00001.png", "notes.png"])));
+        assert!(check(&batch(&[1, 2])));
+        assert!(!check(&batch(&[2, 3])));
     }
 
     /// Runs the real Vision recognizer on a capture named by `OCR_TEST_IMAGE`:

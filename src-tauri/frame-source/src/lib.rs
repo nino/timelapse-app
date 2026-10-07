@@ -82,10 +82,11 @@ pub struct Frame {
 #[serde(rename_all = "camelCase")]
 pub struct FrameTime {
     /// ISO 8601. Has an offset when it came from the database or a file
-    /// timestamp; a naive local time when estimated.
+    /// timestamp; a naive local time when estimated from a video's name.
     pub local_time: String,
-    /// False when estimated from a video's start time, assuming one capture
-    /// per second with no gaps.
+    /// False when estimated: an older hourly video's frame lined up with the
+    /// database's rows for that hour, or failing that, the video's start
+    /// time plus one second per frame.
     pub exact: bool,
 }
 
@@ -132,6 +133,9 @@ pub struct FrameSource {
     /// Every capture time the database has for a day, in frame-number order.
     /// Only asked for days served from legacy videos, which never change.
     day_times: Mutex<HashMap<NaiveDate, Arc<Vec<String>>>>,
+    /// Per hourly video, the capture times the converter recorded for its
+    /// frames. See `recorded_times`.
+    recorded_times: Mutex<HashMap<PathBuf, Arc<Vec<String>>>>,
     /// The capture times the database has around an hourly video's hour, in
     /// frame-number order. Only asked for videos the converter recorded no
     /// frames for; the hour has ended, so its rows no longer change.
@@ -155,6 +159,7 @@ impl FrameSource {
             probes: Mutex::new(HashMap::new()),
             screenshots: Mutex::new(HashMap::new()),
             day_times: Mutex::new(HashMap::new()),
+            recorded_times: Mutex::new(HashMap::new()),
             hour_times: Mutex::new(HashMap::new()),
         })
     }
@@ -279,12 +284,14 @@ impl FrameSource {
                     exact: true,
                 }))
             }
-            Segment::Video { file, .. } => {
+            Segment::Video { file, info } => {
                 // The converter records which screenshot each frame of an
-                // hourly video was made from, and when it was taken.
-                if let Some(local_time) = self.recorded_time(file, local)? {
+                // hourly video was made from, and when it was taken. A record
+                // that doesn't match the video frame for frame is not used.
+                let recorded = self.recorded_times(file);
+                if recorded.len() == info.frame_count {
                     return Ok(Some(FrameTime {
-                        local_time,
+                        local_time: recorded[local].clone(),
                         exact: true,
                     }));
                 }
@@ -296,7 +303,7 @@ impl FrameSource {
                 // the first one not before that second. Rows of screenshots
                 // deleted before the conversion would shift the frames after
                 // them, so this is still an estimate.
-                let rows = self.hour_times(day, file)?;
+                let rows = self.hour_times(file);
                 let start = file.start.format("%Y-%m-%dT%H:%M:%S").to_string();
                 let first = rows.partition_point(|time| time.get(..19).is_some_and(|t| t < start.as_str()));
                 if let Some(time) = rows.get(first + local) {
@@ -442,60 +449,74 @@ impl FrameSource {
 
     /// The capture times of the screenshots in `video`'s clock hour, in
     /// frame-number order. The row of a screenshot is written after its file,
-    /// so the hour's last rows can fall in the first minute of the next hour.
-    fn hour_times(&self, day: NaiveDate, video: &VideoFile) -> Result<Arc<Vec<String>>, Error> {
+    /// so the hour's last rows can fall in the first minute of the next hour
+    /// (or day). Empty when the database can't say.
+    fn hour_times(&self, video: &VideoFile) -> Arc<Vec<String>> {
         if let Some(times) = self.hour_times.lock().unwrap().get(&video.path) {
-            return Ok(times.clone());
+            return times.clone();
         }
-        let Some(conn) = self.open_db()? else {
-            return Ok(Arc::default());
-        };
         let format = |time: chrono::NaiveDateTime| time.format("%Y-%m-%dT%H:%M:%S").to_string();
         let hour = video.hour();
-        let mut statement = conn.prepare(
-            "SELECT local_time FROM screenshots
-             WHERE substr(local_time, 1, 10) = ?1 AND local_time >= ?2 AND local_time < ?3
-             ORDER BY frame_number, id",
-        )?;
-        let times = statement
+        let query = |conn: &rusqlite::Connection| -> rusqlite::Result<Vec<String>> {
+            // `local_time` is ISO 8601, so comparing it as text against the
+            // hour's bounds compares times.
+            conn.prepare(
+                "SELECT local_time FROM screenshots
+                 WHERE local_time >= ?1 AND local_time < ?2
+                 ORDER BY frame_number, id",
+            )?
             .query_map(
-                rusqlite::params![
-                    day.format("%Y-%m-%d").to_string(),
-                    format(hour),
-                    format(hour + Duration::minutes(61)),
-                ],
+                rusqlite::params![format(hour), format(hour + Duration::minutes(61))],
                 |row| row.get::<_, String>(0),
             )?
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect()
+        };
+        let Ok(Some(Ok(times))) = self.open_db().map(|conn| conn.map(|conn| query(&conn))) else {
+            return Arc::default();
+        };
         let times = Arc::new(times);
         self.hour_times
             .lock()
             .unwrap()
             .insert(video.path.clone(), times.clone());
-        Ok(times)
+        times
     }
 
-    /// The capture time the converter recorded for frame `index` of `video`.
-    /// `None` for a video converted before it recorded frames, and for a
-    /// database from before it did (no `video_frames` table).
-    fn recorded_time(&self, video: &VideoFile, index: usize) -> Result<Option<String>, Error> {
-        let Some(conn) = self.open_db()? else {
-            return Ok(None);
-        };
-        let Some(name) = video.path.file_name().and_then(|name| name.to_str()) else {
-            return Ok(None);
-        };
-        let result = conn.query_row(
-            "SELECT local_time FROM video_frames WHERE video = ?1 AND frame_index = ?2",
-            rusqlite::params![name, index as i64],
-            |row| row.get::<_, String>(0),
-        );
-        match result {
-            Ok(time) => Ok(Some(time)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) if e.to_string().contains("no such table") => Ok(None),
-            Err(e) => Err(e.into()),
+    /// The capture time of each frame of `video`, as the converter recorded
+    /// it. Empty for a video converted before it recorded frames, for a
+    /// database from before it did, and when the database can't be read.
+    fn recorded_times(&self, video: &VideoFile) -> Arc<Vec<String>> {
+        if let Some(times) = self.recorded_times.lock().unwrap().get(&video.path) {
+            return times.clone();
         }
+        let Some(name) = video.path.file_name().and_then(|name| name.to_str()) else {
+            return Arc::default();
+        };
+        let query = |conn: &rusqlite::Connection| -> rusqlite::Result<Vec<String>> {
+            let has_table: bool = conn.query_row(
+                "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'video_frames')",
+                [],
+                |row| row.get(0),
+            )?;
+            if !has_table {
+                return Ok(Vec::new());
+            }
+            conn.prepare("SELECT local_time FROM video_frames WHERE video = ?1 ORDER BY frame_index")?
+                .query_map([name], |row| row.get::<_, String>(0))?
+                .collect()
+        };
+        let Ok(Some(Ok(times))) = self.open_db().map(|conn| conn.map(|conn| query(&conn))) else {
+            return Arc::default();
+        };
+        // The record is written before the video is published, or, for an
+        // older video, before its screenshots are deleted, which is the
+        // first time the video is served. Either way it is final by now.
+        let times = Arc::new(times);
+        self.recorded_times
+            .lock()
+            .unwrap()
+            .insert(video.path.clone(), times.clone());
+        times
     }
 
     fn open_db(&self) -> Result<Option<rusqlite::Connection>, Error> {

@@ -771,9 +771,10 @@ mod tests {
         let db = ScreenshotDatabase::new(temp_dir.path().join("test.db")).unwrap();
         let shot: DateTime<Local> = "2024-01-02T09:00:00.5+00:00".parse().unwrap();
         let file: DateTime<Local> = "2024-01-02T09:00:01+00:00".parse().unwrap();
+        let other_day: DateTime<Local> = "2024-01-01T17:00:00+00:00".parse().unwrap();
         db.insert_screenshot("2024-01-02", 1, shot.into(), shot).unwrap();
-        // Frame 1 of another day must not lend its time.
-        db.insert_screenshot("2024-01-01", 2, file.into(), file).unwrap();
+        // Frame 2 of another day must not lend its time.
+        db.insert_screenshot("2024-01-01", 2, other_day.into(), other_day).unwrap();
         let video = "2024-01-02--09-00-00--hourly.mov";
 
         assert!(!db.has_video_frames(video).unwrap());
