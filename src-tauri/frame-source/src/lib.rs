@@ -73,6 +73,23 @@ pub struct DaySummary {
     pub source: Source,
 }
 
+/// Day-wide frame indices `start..end`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct FrameRange {
+    pub start: usize,
+    pub end: usize,
+}
+
+/// What `FrameSource::pending` found, with the frame count it found it
+/// against, so callers can scale the ranges even if the day has changed since
+/// they last asked for its summary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingFrames {
+    pub frame_count: usize,
+    pub ranges: Vec<FrameRange>,
+}
+
 pub struct Frame {
     pub bytes: Vec<u8>,
     pub mime: &'static str,
@@ -236,6 +253,36 @@ impl FrameSource {
                 })
             }
         }
+    }
+
+    /// The stretches of `date` whose frames would have to be decoded from
+    /// video before they can be shown, in order and merged where they touch.
+    /// Screenshots are always ready.
+    pub fn pending(&self, date: &str) -> Result<PendingFrames, Error> {
+        let segments = self.plan(parse_date(date)?)?;
+        let mut pending: Vec<FrameRange> = Vec::new();
+        let mut offset = 0;
+        for segment in &segments {
+            if let Segment::Video { file, info } = segment {
+                let key = cache_key(file)?;
+                for chunk in 0..info.frame_count.div_ceil(CHUNK_FRAMES) {
+                    if self.cache.contains(&key, chunk) {
+                        continue;
+                    }
+                    let start = offset + chunk * CHUNK_FRAMES;
+                    let end = offset + ((chunk + 1) * CHUNK_FRAMES).min(info.frame_count);
+                    match pending.last_mut() {
+                        Some(last) if last.end == start => last.end = end,
+                        _ => pending.push(FrameRange { start, end }),
+                    }
+                }
+            }
+            offset += segment.len();
+        }
+        Ok(PendingFrames {
+            frame_count: offset,
+            ranges: pending,
+        })
     }
 
     pub fn frame_time(&self, date: &str, index: usize) -> Result<Option<FrameTime>, Error> {

@@ -12,11 +12,13 @@ import * as library from './hooks/useLibrary';
 const useDays = spyOn(library, 'useDays');
 const useDay = spyOn(library, 'useDay');
 const getFrameTime = spyOn(frames, 'getFrameTime');
+const getPendingFrames = spyOn(frames, 'getPendingFrames');
 
 afterAll(() => {
   useDays.mockRestore();
   useDay.mockRestore();
   getFrameTime.mockRestore();
+  getPendingFrames.mockRestore();
 });
 
 /** Pretend the library holds `counts[date]` frames for each day. */
@@ -61,6 +63,7 @@ describe('App', () => {
   beforeEach(() => {
     mock.clearAllMocks();
     getFrameTime.mockResolvedValue(null);
+    getPendingFrames.mockResolvedValue({ frameCount: 0, ranges: [] });
   });
 
   describe('Library states', () => {
@@ -272,6 +275,23 @@ describe('App', () => {
       await act(async () => rerender(<App />));
       expect(screen.getByRole('option', { name: /2026-10-05/ })).toBeInTheDocument();
       expect(screen.getByLabelText('Day')).toHaveValue('2026-10-03');
+    });
+  });
+
+  describe('Decoding progress', () => {
+    it('pales the stretches of the scrubber that are not decoded yet', async () => {
+      getPendingFrames.mockResolvedValue({ frameCount: 300, ranges: [{ start: 150, end: 300 }] });
+      mockLibrary({ '2026-10-01': 300 }, 'video');
+      render(<App />);
+      const slider = screen.getByRole('slider');
+      await waitFor(() => expect(slider.style.background).toContain('linear-gradient'));
+      expect(getPendingFrames).toHaveBeenCalledWith('2026-10-01');
+
+      // Showing a frame decodes its chunk, so the scrubber asks again.
+      getPendingFrames.mockResolvedValue({ frameCount: 300, ranges: [] });
+      finishLoading();
+      await waitFor(() => expect(slider.style.background).toBe(''));
+      await settleFrameTime();
     });
   });
 });
