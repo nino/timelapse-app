@@ -5,8 +5,10 @@
 use std::fs;
 use std::path::Path;
 use std::process::Command;
+use std::sync::mpsc;
+use std::time::Duration;
 
-use frame_source::{FrameRange, FrameSource, Source, Tools, CHUNK_FRAMES};
+use frame_source::{FrameRange, FrameSource, Source, Tools, CHUNK_FRAMES, READ_AHEAD_FRAMES};
 use tempfile::TempDir;
 
 const LEVEL_STEP: usize = 4;
@@ -437,6 +439,68 @@ fn reports_video_frames_that_are_not_decoded_yet() {
             range(long + 1, long + 6)
         ]
     );
+}
+
+#[test]
+fn reads_ahead_into_the_next_chunk_before_the_viewer_gets_there() {
+    let lib = Library::new();
+    make_video(
+        &lib.root.path().join("2024-12-20--09-00-00.mov"),
+        3 * CHUNK_FRAMES,
+        0,
+    );
+    let (decoded, read_ahead) = mpsc::channel();
+    let source = lib.source(u64::MAX).read_ahead(move |date| {
+        decoded.send(date.to_owned()).unwrap();
+    });
+    let range = |start, end| FrameRange { start, end };
+    let wait = || {
+        read_ahead
+            .recv_timeout(Duration::from_secs(60))
+            .expect("read-ahead should decode a chunk")
+    };
+
+    // Mid-chunk, moving forward: nothing to read ahead yet.
+    source.frame("2024-12-20", 0).unwrap();
+    source.frame("2024-12-20", 10).unwrap();
+    // Within READ_AHEAD_FRAMES of the next chunk: it gets decoded without
+    // being asked for.
+    source.frame("2024-12-20", CHUNK_FRAMES - READ_AHEAD_FRAMES).unwrap();
+    assert_eq!(wait(), "2024-12-20");
+    assert_eq!(
+        source.pending("2024-12-20").unwrap().ranges,
+        vec![range(2 * CHUNK_FRAMES, 3 * CHUNK_FRAMES)]
+    );
+    // And its frames are the right ones.
+    assert_frame(
+        &source,
+        "2024-12-20",
+        CHUNK_FRAMES + 7,
+        (CHUNK_FRAMES + 7) * LEVEL_STEP % 256,
+        lib.scratch.path(),
+    );
+}
+
+#[test]
+fn reads_back_from_the_end_of_a_day_it_opens_on() {
+    let lib = Library::new();
+    // Two sessions: 200 frames, then 40.
+    make_video(&lib.root.path().join("2024-12-20--09-00-00.mov"), 200, 0);
+    make_video(&lib.root.path().join("2024-12-20--17-05-22.mov"), 40, 100);
+    let (decoded, read_ahead) = mpsc::channel();
+    let source = lib.source(u64::MAX).read_ahead(move |date| {
+        decoded.send(date.to_owned()).unwrap();
+    });
+
+    // The viewer opens a day on its last frame; the first video's two
+    // chunks are both within reach behind it.
+    source.frame("2024-12-20", 239).unwrap();
+    for _ in 0..2 {
+        read_ahead
+            .recv_timeout(Duration::from_secs(60))
+            .expect("read-ahead should decode a chunk");
+    }
+    assert_eq!(source.pending("2024-12-20").unwrap().ranges, vec![]);
 }
 
 #[test]

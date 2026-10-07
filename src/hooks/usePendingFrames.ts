@@ -1,6 +1,6 @@
 import React from "react";
 
-import { frameUrl, getPendingFrames, type Day, type PendingFrames } from "../frames";
+import { frameUrl, getPendingFrames, onFramesDecoded, type Day, type PendingFrames } from "../frames";
 
 /**
  * The stretches of `day` that would have to be decoded from video before
@@ -10,7 +10,8 @@ import { frameUrl, getPendingFrames, type Day, type PendingFrames } from "../fra
  * Re-asked when the day's frame count changes and when `loaded` (the last
  * frame the viewer finished loading) was in a pending stretch, since that
  * load decoded its chunk. Loading a frame that was already decoded changes
- * nothing, so it doesn't ask.
+ * nothing, so it doesn't ask. Also re-asked when the frame source reports
+ * that it read ahead into the day.
  */
 export function usePendingFrames(day: Day | null, loaded: string | null): PendingFrames | null {
   const [state, setState] = React.useState<{ date: string; pending: PendingFrames } | null>(null);
@@ -33,6 +34,28 @@ export function usePendingFrames(day: Day | null, loaded: string | null): Pendin
       setDecodes((n) => n + 1);
     }
   }, [date, loaded]);
+
+  // Read-ahead decodes chunks no frame load asked for.
+  React.useEffect(() => {
+    if (!date || !hasVideo) return;
+    let stop: (() => void) | null = null;
+    let unmounted = false;
+    onFramesDecoded((decoded) => {
+      if (decoded === date) setDecodes((n) => n + 1);
+    }).then(
+      (unlisten) => {
+        if (unmounted) unlisten();
+        else stop = unlisten;
+      },
+      (error: unknown) => {
+        console.error("Error listening for decoded frames:", error);
+      },
+    );
+    return (): void => {
+      unmounted = true;
+      stop?.();
+    };
+  }, [date, hasVideo]);
 
   // Answers may land out of order. Each one is published unless a newer
   // request has already published, so a burst of requests still shows the

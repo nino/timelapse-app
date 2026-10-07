@@ -14,6 +14,7 @@
 
 mod cache;
 mod library;
+mod read_ahead;
 mod video;
 
 use std::collections::HashMap;
@@ -28,13 +29,20 @@ use serde::Serialize;
 use cache::ChunkCache;
 use library::{Shot, VideoFile, VideoKind};
 pub use library::filed_at;
+use read_ahead::ReadAhead;
 pub use video::Tools;
-use video::VideoInfo;
+use video::{Priority, VideoInfo};
 
 /// Frames decoded per ffmpeg run: 10 seconds of a 15 fps timelapse. Large
 /// enough that arrow-key scrubbing rarely waits on ffmpeg, small enough that a
 /// jump to a new spot comes back quickly.
 pub const CHUNK_FRAMES: usize = 150;
+
+/// How close to a chunk it hasn't decoded the viewer has to be, in frames,
+/// for read-ahead to start decoding that chunk. The largest keyboard step
+/// (Alt+arrow) is 100 frames, so one step never lands on a chunk read-ahead
+/// hasn't asked for.
+pub const READ_AHEAD_FRAMES: usize = 100;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -142,7 +150,11 @@ impl Segment {
 pub struct FrameSource {
     root: PathBuf,
     tools: Tools,
-    cache: ChunkCache,
+    cache: Arc<ChunkCache>,
+    /// None unless `read_ahead` switched it on.
+    read_ahead: Option<ReadAhead>,
+    /// The last frame asked for, to tell which way the viewer is moving.
+    last_frame: Mutex<Option<(String, usize)>>,
     /// Per-video facts keyed by path, valid while size and mtime match.
     probes: Mutex<HashMap<PathBuf, Probe>>,
     /// Screenshot listings keyed by day, valid while the folder's mtime
@@ -174,13 +186,30 @@ impl FrameSource {
         Ok(Self {
             root,
             tools,
-            cache: ChunkCache::open(cache_dir, cache_cap_bytes)?,
+            cache: Arc::new(ChunkCache::open(cache_dir, cache_cap_bytes)?),
+            read_ahead: None,
+            last_frame: Mutex::new(None),
             probes: Mutex::new(HashMap::new()),
             screenshots: Mutex::new(HashMap::new()),
             day_times: Mutex::new(HashMap::new()),
             recorded_frames: Mutex::new(HashMap::new()),
             hour_times: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Decode video chunks in the background before the viewer reaches them:
+    /// once a frame is asked for within `READ_AHEAD_FRAMES` of a chunk that
+    /// isn't decoded, in the direction the viewer is moving (both ways for
+    /// the first frame asked for), that chunk is decoded at low priority,
+    /// nearest first, one at a time. `on_decoded` is called with the day
+    /// after each one, from the read-ahead thread.
+    pub fn read_ahead(mut self, on_decoded: impl Fn(&str) + Send + Sync + 'static) -> Self {
+        self.read_ahead = Some(ReadAhead::start(
+            Arc::clone(&self.cache),
+            self.tools.clone(),
+            Box::new(on_decoded),
+        ));
+        self
     }
 
     /// Every day with screenshots or videos, oldest first, as `YYYY-MM-DD`.
@@ -219,7 +248,22 @@ impl FrameSource {
     pub fn frame(&self, date: &str, index: usize) -> Result<Frame, Error> {
         let day = parse_date(date)?;
         let segments = self.plan(day)?;
-        let (segment, local) = locate(&segments, date, index)?;
+        let frame = self.frame_in(day, date, &segments, index);
+        // After this frame's own decode, so the two don't compete.
+        if frame.is_ok() {
+            self.queue_read_ahead(date, &segments, index);
+        }
+        frame
+    }
+
+    fn frame_in(
+        &self,
+        day: NaiveDate,
+        date: &str,
+        segments: &[Segment],
+        index: usize,
+    ) -> Result<Frame, Error> {
+        let (segment, local) = locate(segments, date, index)?;
         match segment {
             Segment::Screenshots { shots, range } => Ok(Frame {
                 bytes: fs::read(self.day_dir(day).join(&shots[range.start + local].name))?,
@@ -238,6 +282,7 @@ impl FrameSource {
                             chunk * CHUNK_FRAMES,
                             CHUNK_FRAMES,
                             out,
+                            Priority::Now,
                         )
                         .map(|_| ())
                     })
@@ -265,6 +310,48 @@ impl FrameSource {
                 })
             }
         }
+    }
+
+    /// Hand the read-ahead thread the undecoded chunks near `index`, in place
+    /// of whatever it still had queued.
+    fn queue_read_ahead(&self, date: &str, segments: &[Segment], index: usize) {
+        let Some(read_ahead) = &self.read_ahead else {
+            return;
+        };
+        let previous = self
+            .last_frame
+            .lock()
+            .unwrap()
+            .replace((date.to_owned(), index))
+            .and_then(|(last_date, last)| (last_date == date).then_some(last));
+        let (back, ahead) = match previous {
+            Some(last) if index > last => (0, READ_AHEAD_FRAMES),
+            Some(last) if index < last => (READ_AHEAD_FRAMES, 0),
+            Some(_) => return, // the same frame again
+            None => (READ_AHEAD_FRAMES, READ_AHEAD_FRAMES),
+        };
+        let lens: Vec<_> = segments
+            .iter()
+            .map(|s| (s.len(), matches!(s, Segment::Video { .. })))
+            .collect();
+        let mut jobs = Vec::new();
+        for (segment, chunk) in chunks_near(&lens, index, back, ahead) {
+            let Segment::Video { file, info } = &segments[segment] else {
+                continue;
+            };
+            let Ok(key) = cache_key(file) else { continue };
+            if self.cache.contains(&key, chunk) {
+                continue;
+            }
+            jobs.push(read_ahead::Job {
+                date: date.to_owned(),
+                key,
+                chunk,
+                video: file.path.clone(),
+                info: *info,
+            });
+        }
+        read_ahead.replace(jobs);
     }
 
     /// The stretches of `date` whose frames would have to be decoded from
@@ -765,6 +852,46 @@ fn parse_date(date: &str) -> Result<NaiveDate, Error> {
     library::parse_day(date).ok_or_else(|| Error::NotADay(date.to_owned()))
 }
 
+/// The video chunks, as (segment, chunk within it), with frames from `back`
+/// frames before `index` to `ahead` frames after it, nearest first, leaving
+/// out the chunk holding `index`. `segments` are (frame count, is video).
+fn chunks_near(
+    segments: &[(usize, bool)],
+    index: usize,
+    back: usize,
+    ahead: usize,
+) -> Vec<(usize, usize)> {
+    let lo = index.saturating_sub(back);
+    let hi = index.saturating_add(ahead);
+    let mut found = Vec::new();
+    let mut offset = 0;
+    for (segment, &(len, is_video)) in segments.iter().enumerate() {
+        let end = offset + len;
+        if is_video && len > 0 && lo < end && offset <= hi {
+            let first = (lo.max(offset) - offset) / CHUNK_FRAMES;
+            let last = (hi.min(end - 1) - offset) / CHUNK_FRAMES;
+            for chunk in first..=last {
+                let start = offset + chunk * CHUNK_FRAMES;
+                let stop = (start + CHUNK_FRAMES).min(end);
+                let distance = if index < start {
+                    start - index
+                } else if index >= stop {
+                    index - (stop - 1)
+                } else {
+                    continue; // the chunk being shown
+                };
+                found.push((distance, segment, chunk));
+            }
+        }
+        offset = end;
+    }
+    found.sort();
+    found
+        .into_iter()
+        .map(|(_, segment, chunk)| (segment, chunk))
+        .collect()
+}
+
 /// The segment holding day-wide frame `index`, and the index within it.
 fn locate<'a>(
     segments: &'a [Segment],
@@ -790,4 +917,39 @@ fn locate<'a>(
 fn cache_key(video: &VideoFile) -> Result<String, Error> {
     let stem = video.path.file_stem().unwrap_or_default().to_string_lossy();
     Ok(format!("{stem}-{}", fs::metadata(&video.path)?.len()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const C: usize = CHUNK_FRAMES;
+
+    #[test]
+    fn reads_ahead_only_near_the_edge_of_a_chunk() {
+        let video = [(3 * C, true)];
+        // Mid-chunk, the next chunk is further than the window.
+        assert_eq!(chunks_near(&video, 10, 0, 100), vec![]);
+        assert_eq!(chunks_near(&video, C - 100, 0, 100), vec![(0, 1)]);
+        assert_eq!(chunks_near(&video, C - 101, 0, 100), vec![]);
+        // Going backwards, the previous one.
+        assert_eq!(chunks_near(&video, C + 99, 100, 0), vec![(0, 0)]);
+        assert_eq!(chunks_near(&video, C + 100, 100, 0), vec![]);
+        // Nothing past the ends of the day.
+        assert_eq!(chunks_near(&video, 3 * C - 1, 0, 100), vec![]);
+        assert_eq!(chunks_near(&video, 0, 100, 0), vec![]);
+    }
+
+    #[test]
+    fn reads_ahead_across_segments_nearest_first() {
+        // 200 frames of video, 5 screenshots, 40 frames of video.
+        let day = [(200, true), (5, false), (40, true)];
+        // From the last frame of the day, both ways: the first video's
+        // second chunk is 40 frames back, its first chunk 90.
+        assert_eq!(chunks_near(&day, 244, 100, 100), vec![(0, 1), (0, 0)]);
+        // From a screenshot, the videos on either side.
+        assert_eq!(chunks_near(&day, 203, 100, 100), vec![(2, 0), (0, 1), (0, 0)]);
+        // Screenshots are never read ahead.
+        assert_eq!(chunks_near(&[(500, false)], 10, 100, 100), vec![]);
+    }
 }

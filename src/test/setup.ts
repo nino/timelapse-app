@@ -19,6 +19,10 @@ mock.module('@tauri-apps/api/core', () => ({
   invoke: mock(),
 }));
 
+mock.module('@tauri-apps/api/event', () => ({
+  listen: mock(() => Promise.resolve((): void => {})),
+}));
+
 // Production resolves this from Rust at startup; tests pin it to a value that
 // is deliberately NOT the production name, so any path built from a hardcoded
 // "Timelapse" literal shows up as a failure.
