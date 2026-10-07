@@ -9,4 +9,4 @@ export const fieldFrame =
   "rounded-xl border border-input bg-field transition-[color,box-shadow] focus-within:border-ring focus-within:ring-[3px] focus-within:ring-ring/50";
 
 /** One button in a joined group: the group draws the border, and each button rounds its outer corners. */
-export const segmentButton = `inline-flex w-9 items-center justify-center transition-colors hover:bg-muted disabled:pointer-events-none disabled:opacity-50 [&_svg]:shrink-0 ${focusRing}`;
+export const segmentButton = `inline-flex w-8 items-center justify-center transition-colors hover:bg-muted disabled:pointer-events-none disabled:opacity-50 [&_svg]:shrink-0 ${focusRing}`;
