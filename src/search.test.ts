@@ -3,7 +3,7 @@ import { describe, expect, it } from 'bun:test';
 import { nextStop, previousStop, rangeAt, toStops, type DayMatch } from './search';
 
 function match(index: number, endIndex: number): DayMatch {
-  return { index, endIndex, lines: [] };
+  return { index, endIndex, frame: index + 1 };
 }
 
 describe('toStops', () => {

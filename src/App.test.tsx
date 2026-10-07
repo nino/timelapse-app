@@ -6,7 +6,7 @@ import * as frames from './frames';
 import { frameUrl, type Day } from './frames';
 import * as library from './hooks/useLibrary';
 import * as ocrSearch from './hooks/useOcrSearch';
-import type { DayCount, DayMatch } from './search';
+import type { DayCount, DayMatch, LineBox } from './search';
 
 // Spied on rather than replaced with `mock.module`: Bun runs every test file in
 // one process, and a module mock would also replace the real hooks and
@@ -16,6 +16,8 @@ const useDay = spyOn(library, 'useDay');
 const getFrameTime = spyOn(frames, 'getFrameTime');
 const useDayMatches = spyOn(ocrSearch, 'useDayMatches');
 const useMatchCounts = spyOn(ocrSearch, 'useMatchCounts');
+const useMatchLines = spyOn(ocrSearch, 'useMatchLines');
+const useOcrVersion = spyOn(ocrSearch, 'useOcrVersion');
 
 afterAll(() => {
   useDays.mockRestore();
@@ -23,6 +25,8 @@ afterAll(() => {
   getFrameTime.mockRestore();
   useDayMatches.mockRestore();
   useMatchCounts.mockRestore();
+  useMatchLines.mockRestore();
+  useOcrVersion.mockRestore();
 });
 
 /**
@@ -33,7 +37,12 @@ function mockSearch(
   query: string,
   matches: Record<string, Array<DayMatch>>,
   counts: Array<DayCount> = [],
+  lines: Record<number, Array<LineBox>> = {},
 ): void {
+  useOcrVersion.mockReturnValue('1');
+  useMatchLines.mockImplementation((_date: string | null, frame: number | null, q: string) =>
+    q === query && frame !== null ? (lines[frame] ?? []) : null,
+  );
   useDayMatches.mockImplementation((date: string | null, q: string) => ({
     matches: q === '' ? [] : q === query && date ? (matches[date] ?? []) : [],
     matchesError: null,
@@ -41,8 +50,9 @@ function mockSearch(
   useMatchCounts.mockImplementation((q: string) => (q === query ? counts : []));
 }
 
-function match(index: number, endIndex = index + 1, lines: DayMatch['lines'] = []): DayMatch {
-  return { index, endIndex, lines };
+/** A match whose OCR'd frame number is its index plus one. */
+function match(index: number, endIndex = index + 1): DayMatch {
+  return { index, endIndex, frame: index + 1 };
 }
 
 function findBar(): HTMLInputElement {
@@ -52,7 +62,9 @@ function findBar(): HTMLInputElement {
 /** Type `query` and wait out the find bar's debounce. */
 async function search(query: string): Promise<void> {
   fireEvent.change(findBar(), { target: { value: query } });
-  await waitFor(() => expect(useDayMatches).toHaveBeenLastCalledWith(expect.anything(), query));
+  await waitFor(() =>
+    expect(useDayMatches).toHaveBeenLastCalledWith(expect.anything(), query, expect.anything()),
+  );
 }
 
 /** Pretend the library holds `counts[date]` frames for each day. */
@@ -340,15 +352,17 @@ describe('App', () => {
     });
 
     it('marks the matches on the scrubber', async () => {
-      mockLibrary({ '2026-10-04': 100 });
-      mockSearch('cargo', { '2026-10-04': [match(10, 20), match(50)] });
+      // 101 frames, so frame N sits at N% along the track.
+      mockLibrary({ '2026-10-04': 101 });
+      mockSearch('cargo', { '2026-10-04': [match(10, 20), match(50), match(100)] });
       render(<App />);
       await search('cargo');
 
       const marks = Array.from(screen.getByTestId('match-marks').children) as Array<HTMLElement>;
       expect(marks.map((m) => [m.style.left, m.style.width])).toEqual([
-        ['10%', '10%'],
-        ['50%', '1%'],
+        ['10%', '9%'],
+        ['50%', '0%'],
+        ['100%', '0%'],
       ]);
       await settleFrameTime();
     });
@@ -385,7 +399,7 @@ describe('App', () => {
     it('outlines the matching lines on the frame the match stands for', async () => {
       mockLibrary({ '2026-10-04': 100 });
       const line = { x: 0.5, y: 0.25, width: 0.25, height: 0.125 };
-      mockSearch('cargo', { '2026-10-04': [match(10, 20, [line])] });
+      mockSearch('cargo', { '2026-10-04': [match(10, 20)] }, [], { 11: [line] });
       render(<App />);
       await waitFor(() => expect(shownFrame()).toBe(frameUrl('2026-10-04', 99)));
       finishLoading();
@@ -394,6 +408,10 @@ describe('App', () => {
 
       fireEvent.change(screen.getByRole('slider'), { target: { value: '15' } });
       await waitFor(() => expect(shownFrame()).toBe(frameUrl('2026-10-04', 15)));
+      // Not until the frame has loaded: the old one is still on screen.
+      expect(screen.queryByTestId('match-highlights')).not.toBeInTheDocument();
+      finishLoading();
+      expect(useMatchLines).toHaveBeenLastCalledWith('2026-10-04', 11, 'cargo');
       const rect = screen.getByTestId('match-highlights').querySelector('rect');
       // 1800×1124 until a frame reports its own size; 4px of padding around.
       expect(rect?.getAttribute('x')).toBe(String(900 - 4));
@@ -422,6 +440,30 @@ describe('App', () => {
       await waitFor(() => expect(screen.getByText('Frame 8 / 50')).toBeInTheDocument());
       expect(screen.getByLabelText('Day')).toHaveValue('2026-10-02');
       await settleFrameTime();
+    });
+
+    it('forgets the jump to a first match when another day is picked first', async () => {
+      mockLibrary({ '2026-10-02': 50, '2026-10-03': 50, '2026-10-04': 100 });
+      // 10-02's matches never arrive while it is selected.
+      useOcrVersion.mockReturnValue('1');
+      useMatchLines.mockReturnValue(null);
+      useMatchCounts.mockReturnValue([{ day: '2026-10-02', count: 1 }]);
+      useDayMatches.mockImplementation(() => ({ matches: null, matchesError: null }));
+      render(<App />);
+      await search('cargo');
+      fireEvent.click(screen.getByRole('button', { name: /2026-10-02/ }));
+      fireEvent.change(screen.getByLabelText('Day'), { target: { value: '2026-10-03' } });
+      await waitFor(() => expect(screen.getByText('Frame 50 / 50')).toBeInTheDocument());
+
+      // Now the matches are there, and 10-02 is opened from the picker.
+      useDayMatches.mockImplementation((date: string | null) => ({
+        matches: date === '2026-10-02' ? [match(7)] : [],
+        matchesError: null,
+      }));
+      fireEvent.change(screen.getByLabelText('Day'), { target: { value: '2026-10-02' } });
+      await waitFor(() => expect(screen.getByLabelText('Day')).toHaveValue('2026-10-02'));
+      await settleFrameTime();
+      expect(screen.getByText('Frame 50 / 50')).toBeInTheDocument();
     });
 
     it('folds away all but the first few other days', async () => {

@@ -13,8 +13,8 @@ export type DayMatch = {
   index: number;
   /** One past the last frame this OCR'd frame's text stands for. */
   endIndex: number;
-  /** The lines of the frame holding a search word. */
-  lines: Array<LineBox>;
+  /** The OCR'd frame's number, for `getMatchLines`. */
+  frame: number;
 };
 
 /** Mirrors `DayCount` in Rust. */
@@ -39,6 +39,20 @@ export function searchDay(date: string, query: string): Promise<Array<DayMatch>>
 
 export function countMatches(query: string): Promise<Array<DayCount>> {
   return invoke<Array<DayCount>>("count_ocr_matches", { query });
+}
+
+/** The lines of OCR'd frame `frame` of `date` holding a word of `query`. */
+export function getMatchLines(
+  date: string,
+  frame: number,
+  query: string,
+): Promise<Array<LineBox>> {
+  return invoke<Array<LineBox>>("get_match_lines", { date, frame, query });
+}
+
+/** Changes whenever OCR has recorded something a search could find. */
+export function getOcrVersion(): Promise<string> {
+  return invoke<string>("get_ocr_version");
 }
 
 /** `matches` (in index order) merged into the stretches they cover. */

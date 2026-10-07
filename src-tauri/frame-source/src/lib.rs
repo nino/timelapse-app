@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
-use chrono::{DateTime, Duration, NaiveDate, NaiveDateTime, Timelike};
+use chrono::{DateTime, Duration, NaiveDate, NaiveDateTime};
 use serde::Serialize;
 
 use cache::ChunkCache;
@@ -129,9 +129,10 @@ pub struct FrameSource {
     /// Screenshot listings keyed by day, valid while the folder's mtime
     /// matches. Today's folder changes every second; older ones never do.
     screenshots: Mutex<HashMap<NaiveDate, (SystemTime, Arc<Vec<Shot>>)>>,
-    /// Every capture time the database has for a day, in frame-number order.
-    /// Only asked for days served from legacy videos, which never change.
-    day_times: Mutex<HashMap<NaiveDate, Arc<Vec<String>>>>,
+    /// Every frame number and capture time the database has for a day, in
+    /// frame-number order. Only asked for days served from legacy videos,
+    /// which never change.
+    day_times: Mutex<HashMap<NaiveDate, Arc<Vec<(u32, String)>>>>,
 }
 
 impl FrameSource {
@@ -270,7 +271,7 @@ impl FrameSource {
                 let times = self.day_times(day)?;
                 let total: usize = segments.iter().map(Segment::len).sum();
                 Ok((times.len() == total).then(|| FrameTime {
-                    local_time: times[index].clone(),
+                    local_time: times[index].1.clone(),
                     exact: true,
                 }))
             }
@@ -297,9 +298,10 @@ impl FrameSource {
     /// place in the video. That is an estimate: a row and its file can fall in
     /// different hours by a fraction of a second.
     ///
-    /// A day served only from legacy videos has no frame numbers, so there a
-    /// number is taken to be a 1-based position in the day, which is how OCR
-    /// counts the frames it reads from those videos.
+    /// A day served only from legacy videos holds every screenshot of the day
+    /// in frame-number order, so there a frame's rank among the day's
+    /// database rows is its index, but only when the counts agree, the same
+    /// rule `frame_time` uses for those days.
     pub fn indices_of_frames(
         &self,
         date: &str,
@@ -312,10 +314,15 @@ impl FrameSource {
             |s| matches!(s, Segment::Video { file, .. } if file.kind == VideoKind::Legacy),
         );
         if legacy_only {
-            return Ok(numbers
-                .iter()
-                .map(|&n| (n as usize).checked_sub(1).filter(|&i| i < total))
-                .collect());
+            let rows = self.day_times(day)?;
+            if rows.len() != total {
+                return Ok(vec![None; numbers.len()]);
+            }
+            let mut index_of = HashMap::new();
+            for (index, (number, _)) in rows.iter().enumerate() {
+                index_of.entry(*number).or_insert(index);
+            }
+            return Ok(numbers.iter().map(|n| index_of.get(n).copied()).collect());
         }
 
         let mut by_number = HashMap::new();
@@ -376,9 +383,12 @@ impl FrameSource {
         let Some(conn) = self.open_db()? else {
             return Ok(hours);
         };
+        // Keyed on the day folder the frame was written to, like the OCR rows
+        // being looked up: a capture just before midnight can be stamped
+        // with the next day's time.
         let mut statement = conn.prepare(
             "SELECT frame_number, local_time FROM screenshots
-             WHERE substr(local_time, 1, 10) = ?1
+             WHERE day = ?1
              ORDER BY frame_number",
         )?;
         let rows = statement.query_map([date], |row| {
@@ -500,7 +510,7 @@ impl FrameSource {
         Ok(probe)
     }
 
-    fn day_times(&self, day: NaiveDate) -> Result<Arc<Vec<String>>, Error> {
+    fn day_times(&self, day: NaiveDate) -> Result<Arc<Vec<(u32, String)>>, Error> {
         if let Some(times) = self.day_times.lock().unwrap().get(&day) {
             return Ok(times.clone());
         }
@@ -508,13 +518,13 @@ impl FrameSource {
             return Ok(Arc::default());
         };
         let mut statement = conn.prepare(
-            "SELECT local_time FROM screenshots
+            "SELECT frame_number, local_time FROM screenshots
              WHERE substr(local_time, 1, 10) = ?1
              ORDER BY frame_number, id",
         )?;
         let times = statement
             .query_map([day.format("%Y-%m-%d").to_string()], |row| {
-                row.get::<_, String>(0)
+                Ok((row.get::<_, u32>(0)?, row.get::<_, String>(1)?))
             })?
             .collect::<Result<Vec<_>, _>>()?;
         let times = Arc::new(times);
@@ -570,7 +580,7 @@ fn local_hour(time: &str) -> Option<NaiveDateTime> {
         .map(|t| t.naive_local())
         .or_else(|_| NaiveDateTime::parse_from_str(time, "%Y-%m-%dT%H:%M:%S%.f"))
         .ok()?;
-    local.date().and_hms_opt(local.hour(), 0, 0)
+    Some(library::truncate_to_hour(local))
 }
 
 fn parse_date(date: &str) -> Result<NaiveDate, Error> {

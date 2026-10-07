@@ -356,14 +356,14 @@ fn finds_frames_by_number_in_screenshots_and_converted_hours() {
     write_shot(&day_dir, "00006.png", b"six", "2026-10-04 10:00:02");
     let conn = rusqlite::Connection::open(root.join("screenshots.db")).unwrap();
     conn.execute_batch(
-        "CREATE TABLE screenshots (id INTEGER PRIMARY KEY, frame_number INTEGER, local_time TEXT);
-         INSERT INTO screenshots (frame_number, local_time) VALUES
-             (1, '2026-10-04T09:00:05+02:00'),
-             (2, '2026-10-04T09:00:06+02:00'),
-             (3, '2026-10-04T09:40:00+02:00'),
-             (4, '2026-10-04T10:00:00+02:00'),
-             (6, '2026-10-04T10:00:02+02:00'),
-             (1, '2026-10-05T09:00:00+02:00');",
+        "CREATE TABLE screenshots (id INTEGER PRIMARY KEY, day TEXT, frame_number INTEGER, local_time TEXT);
+         INSERT INTO screenshots (day, frame_number, local_time) VALUES
+             ('2026-10-04', 1, '2026-10-04T09:00:05+02:00'),
+             ('2026-10-04', 2, '2026-10-04T09:00:06+02:00'),
+             ('2026-10-04', 3, '2026-10-04T09:40:00+02:00'),
+             ('2026-10-04', 4, '2026-10-04T10:00:00+02:00'),
+             ('2026-10-04', 6, '2026-10-04T10:00:02+02:00'),
+             ('2026-10-05', 1, '2026-10-05T09:00:00+02:00');",
     )
     .unwrap();
     let source = lib.source(u64::MAX);
@@ -377,13 +377,25 @@ fn finds_frames_by_number_in_screenshots_and_converted_hours() {
 }
 
 #[test]
-fn counts_legacy_days_by_position() {
+fn finds_frames_on_legacy_days_by_their_database_rank() {
     let lib = Library::new();
     make_video(&lib.root.path().join("2025-12-01--23-00-00.mov"), 3, 0);
+    make_video(&lib.root.path().join("2025-12-02--23-00-00.mov"), 3, 0);
+    // Frame 3 was a deleted black frame, so the video's third frame is 4.
+    write_db(lib.root.path(), &[]);
+    let conn = rusqlite::Connection::open(lib.root.path().join("screenshots.db")).unwrap();
+    conn.execute_batch(
+        "INSERT INTO screenshots (frame_number, local_time) VALUES
+             (1, '2025-12-01T09:00:00'), (2, '2025-12-01T09:00:01'), (4, '2025-12-01T09:00:03'),
+             (1, '2025-12-02T09:00:00');",
+    )
+    .unwrap();
     let source = lib.source(u64::MAX);
 
     assert_eq!(
-        source.indices_of_frames("2025-12-01", &[1, 3, 4, 0]).unwrap(),
-        vec![Some(0), Some(2), None, None]
+        source.indices_of_frames("2025-12-01", &[1, 4, 3]).unwrap(),
+        vec![Some(0), Some(2), None]
     );
+    // One row for three frames: the rows can't say which frame is which.
+    assert_eq!(source.indices_of_frames("2025-12-02", &[1]).unwrap(), vec![None]);
 }

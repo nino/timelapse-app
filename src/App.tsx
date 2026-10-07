@@ -3,7 +3,12 @@ import React from "react";
 import "./App.css";
 import { frameUrl, getFrameTime, type FrameTime } from "./frames";
 import { useDay, useDays } from "./hooks/useLibrary";
-import { useDayMatches, useMatchCounts } from "./hooks/useOcrSearch";
+import {
+  useDayMatches,
+  useMatchCounts,
+  useMatchLines,
+  useOcrVersion,
+} from "./hooks/useOcrSearch";
 import { nextStop, previousStop, rangeAt, toStops, type DayMatch, type Stop } from "./search";
 
 // How many other days the find bar names before folding the rest away.
@@ -40,9 +45,10 @@ export function App(): React.ReactNode {
   // Find bar: what is typed, and the (debounced) query actually searched.
   const [typed, setTyped] = React.useState("");
   const query = useDebounced(typed.trim(), 150);
-  const { matches, matchesError } = useDayMatches(selectedDay, query);
+  const ocrVersion = useOcrVersion();
+  const { matches, matchesError } = useDayMatches(selectedDay, query, ocrVersion);
   const stops = React.useMemo(() => toStops(matches ?? []), [matches]);
-  const counts = useMatchCounts(query);
+  const counts = useMatchCounts(query, ocrVersion);
   const [showAllDays, setShowAllDays] = React.useState(false);
   // A day picked from the "Also on" list opens on its first match once that
   // day's matches have loaded.
@@ -89,9 +95,13 @@ export function App(): React.ReactNode {
   }, [newestDay]);
 
   React.useEffect(() => {
+    // Left for another day before its matches arrived: forget the jump.
+    if (jumpToFirstMatch !== null && jumpToFirstMatch !== selectedDay) {
+      setJumpToFirstMatch(null);
+      return;
+    }
     if (
       jumpToFirstMatch === null ||
-      jumpToFirstMatch !== selectedDay ||
       matches === null ||
       frameCount === 0
     ) {
@@ -143,14 +153,15 @@ export function App(): React.ReactNode {
 
   const wantedSrc =
     selectedDay && frameCount > 0 ? frameUrl(selectedDay, currentIndex) : null;
-  const { src, frameFailed, onLoad, onError } = useGatedImage(wantedSrc);
+  const { src, loadedSrc, frameFailed, onLoad, onError } = useGatedImage(wantedSrc);
   const [frameSize, setFrameSize] = React.useState(DEFAULT_FRAME_SIZE);
-  // Outline the matching lines only while the frame on screen is the one the
-  // match was read from, or stands for.
-  const highlighted: DayMatch | null =
-    matches && src === wantedSrc && !frameFailed
-      ? (matches[rangeAt(matches, currentIndex)] ?? null)
-      : null;
+  const currentMatch: DayMatch | null = matches?.[rangeAt(matches, currentIndex)] ?? null;
+  const matchLines = useMatchLines(selectedDay, currentMatch?.frame ?? null, query);
+  // Outline the matching lines only once the frame on screen is the one the
+  // match was read from, or stands for: until a new frame has loaded, the
+  // browser keeps showing the old one.
+  const highlights =
+    currentMatch && loadedSrc === wantedSrc && !frameFailed ? (matchLines ?? []) : [];
 
   // Capture time of the frame on screen.
   React.useEffect(() => {
@@ -303,7 +314,7 @@ export function App(): React.ReactNode {
             }`}
           />
         )}
-        {highlighted && highlighted.lines.length > 0 && (
+        {highlights.length > 0 && (
           // Same box and aspect fitting as the <img>'s object-contain, so
           // normalized line boxes land on the text.
           <svg
@@ -313,7 +324,7 @@ export function App(): React.ReactNode {
             className="absolute inset-0 w-full h-full pointer-events-none"
             aria-hidden="true"
           >
-            {highlighted.lines.map((line, i) => (
+            {highlights.map((line, i) => (
               <rect
                 key={i}
                 x={line.x * frameSize.width - 4}
@@ -398,17 +409,25 @@ function MatchMarks({
 }): React.ReactNode {
   if (stops.length === 0 || frameCount === 0) return null;
   const current = rangeAt(stops, currentIndex);
+  // Where the slider puts its thumb's centre for frame `index`.
+  const at = (index: number): number => (Math.min(index, frameCount - 1) / Math.max(frameCount - 1, 1)) * 100;
   return (
-    <div data-testid="match-marks" className="absolute left-3 right-3 -top-3 h-3 pointer-events-none" aria-hidden="true">
+    <div
+      data-testid="match-marks"
+      // Inset by the track's padding (4px) plus half the 20px thumb, the
+      // range the thumb's centre moves over.
+      className="absolute left-[14px] right-[14px] -top-3 h-3 pointer-events-none"
+      aria-hidden="true"
+    >
       {stops.map((stop, i) => (
         <span
           key={stop.index}
-          className={`absolute bottom-0 h-3 min-w-[3px] rounded-sm ${
+          className={`absolute bottom-0 h-3 min-w-[3px] -ml-px rounded-sm ${
             i === current ? "bg-yellow-600" : "bg-yellow-400"
           }`}
           style={{
-            left: `${(stop.index / frameCount) * 100}%`,
-            width: `${((stop.endIndex - stop.index) / frameCount) * 100}%`,
+            left: `${at(stop.index)}%`,
+            width: `${at(stop.endIndex - 1) - at(stop.index)}%`,
           }}
         />
       ))}
@@ -474,12 +493,15 @@ function useDebounced<T>(value: T, delayMs: number): T {
  */
 function useGatedImage(wanted: string | null): {
   src: string | null;
+  /** The last src that finished loading, i.e. what is on screen. */
+  loadedSrc: string | null;
   frameFailed: boolean;
   onLoad: () => void;
   onError: () => void;
 } {
   const [src, setSrc] = React.useState<string | null>(null);
   const [frameFailed, setFrameFailed] = React.useState(false);
+  const [loadedSrc, setLoadedSrc] = React.useState<string | null>(null);
   const srcRef = React.useRef<string | null>(null);
   const wantedRef = React.useRef<string | null>(wanted);
   const inFlight = React.useRef(false);
@@ -501,6 +523,7 @@ function useGatedImage(wanted: string | null): {
     (failed: boolean): void => {
       inFlight.current = false;
       setFrameFailed(failed);
+      setLoadedSrc(failed ? null : srcRef.current);
       if (wantedRef.current !== srcRef.current) {
         show(wantedRef.current);
       }
@@ -510,6 +533,7 @@ function useGatedImage(wanted: string | null): {
 
   return {
     src,
+    loadedSrc,
     frameFailed,
     onLoad: React.useCallback((): void => settle(false), [settle]),
     onError: React.useCallback((): void => settle(true), [settle]),
