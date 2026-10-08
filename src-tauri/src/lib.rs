@@ -1,5 +1,6 @@
 mod activity;
 mod app_state;
+mod boost;
 mod converter;
 mod timelapse;
 mod database;
@@ -32,6 +33,9 @@ type FrameSourceState = Arc<FrameSource>;
 
 /// What capture, conversion and OCR are doing, for the Activity window.
 type ActivityState = Arc<Activity>;
+
+/// Whether conversion and OCR are boosted (`boost.rs`).
+type BoostState = Arc<boost::Boost>;
 
 /// Label of the main window, set in `tauri.conf.json`.
 const MAIN_WINDOW: &str = "main";
@@ -517,10 +521,45 @@ async fn evict_old_cache() -> Result<String, String> {
 async fn get_activity(
     activity: State<'_, ActivityState>,
     photographer: State<'_, PhotographerState>,
+    boost: State<'_, BoostState>,
 ) -> Result<Snapshot, String> {
     let capturing = is_timelapse_running_impl(photographer.inner())?;
     let activity = Arc::clone(activity.inner());
-    run_blocking(move || Ok(activity.snapshot(capturing, converter::on_ac_power))).await
+    let boost = boost.status();
+    run_blocking(move || {
+        let mut snapshot = activity.snapshot(capturing, converter::on_ac_power);
+        snapshot.boost = boost;
+        Ok(snapshot)
+    })
+    .await
+}
+
+/// Run conversion and OCR at full speed for `minutes`, on battery too if
+/// `allow_battery`, replacing any boost in progress. Returns the new boost.
+#[tauri::command]
+fn start_boost(
+    boost: State<'_, BoostState>,
+    minutes: u64,
+    allow_battery: bool,
+) -> Result<Option<boost::BoostStatus>, String> {
+    if minutes == 0 {
+        return Err("A boost needs a length".to_string());
+    }
+    boost.start(std::time::Duration::from_secs(minutes.saturating_mul(60)), allow_battery);
+    Ok(boost.status())
+}
+
+/// End the boost in progress, if any.
+#[tauri::command]
+fn stop_boost(boost: State<'_, BoostState>) {
+    boost.stop();
+}
+
+/// Let the boost in progress run on battery, or not. Returns the boost.
+#[tauri::command]
+fn set_boost_allow_battery(boost: State<'_, BoostState>, allow_battery: bool) -> Option<boost::BoostStatus> {
+    boost.set_allow_battery(allow_battery);
+    boost.status()
 }
 
 /// The app's settings. Changes apply at once and are saved straight away.
@@ -839,6 +878,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(photographer_state)
         .manage(activity)
+        .manage(BoostState::default())
         .manage(UpdaterState::default())
         .on_menu_event(|app, event| {
             let opened = match event.id().as_ref() {
@@ -935,6 +975,7 @@ pub fn run() {
             let photographer_state = app.state::<PhotographerState>();
             let state_clone = Arc::clone(&photographer_state.inner());
             let activity = Arc::clone(app.state::<ActivityState>().inner());
+            let boost = Arc::clone(app.state::<BoostState>().inner());
 
             tauri::async_runtime::spawn(async move {
                 tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
@@ -970,9 +1011,10 @@ pub fn run() {
                             ocr::ocr_check(&root),
                         )
                         .reporting_to(Arc::clone(&activity))
+                        .boosted_by(Arc::clone(&boost))
                         .start();
 
-                        if ocr::start_background_ocr(root, ocr_dir, activity) {
+                        if ocr::start_background_ocr(root, ocr_dir, activity, boost) {
                             println!("OCR started");
                         } else {
                             println!("OCR is not available on this platform");
@@ -1004,6 +1046,9 @@ pub fn run() {
             count_ocr_matches,
             get_ocr_version,
             get_activity,
+            start_boost,
+            stop_boost,
+            set_boost_allow_battery,
             get_settings,
             set_update_automatically,
             get_viewer_position,

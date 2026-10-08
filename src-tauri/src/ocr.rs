@@ -4,8 +4,8 @@
 //! recognition on each PNG whose screen has changed since the last frame it
 //! read, stores the text in `screenshots.db` for full-text search, and moves
 //! that day's progress mark forward (see `ScreenshotDatabase::record_ocr_frame`).
-//! It only works while the machine is on AC power, like the video converter,
-//! and the converter in turn only converts and deletes PNGs that the progress
+//! It only works while the machine is on AC power (or during a boost that
+//! allows battery, see `boost.rs`), like the video converter, and the converter in turn only converts and deletes PNGs that the progress
 //! mark covers (`ocr_check`).
 //!
 //! Days that only exist as video (the old script's whole-day videos, whose
@@ -19,6 +19,7 @@
 //! recognizer.
 
 use crate::activity::{Activity, State};
+use crate::boost::Boost;
 use crate::converter::{is_day_folder_name, on_ac_power, OcrCheck, HourBatch};
 use crate::database::{LineBox, OcrProgress, ScreenshotDatabase};
 use frame_source::{FrameSource, RawFrame};
@@ -545,6 +546,7 @@ pub fn start_background_ocr(
     root: PathBuf,
     work_dir: Option<PathBuf>,
     activity: Arc<Activity>,
+    boost: Arc<Boost>,
 ) -> bool {
     let Some(recognizer) = system_recognizer() else {
         activity.ocr_unavailable();
@@ -554,7 +556,7 @@ pub fn start_background_ocr(
     std::thread::Builder::new()
         .name("ocr".into())
         .spawn(move || {
-            lower_thread_priority();
+            set_thread_priority(false);
 
             // A connection of its own, so OCR never waits on the capture
             // loop's lock.
@@ -584,39 +586,59 @@ pub fn start_background_ocr(
             if let Some(videos) = videos {
                 worker = worker.with_videos(videos);
             }
-            run_forever(&mut worker);
+            run_forever(&mut worker, &boost);
         })
         .is_ok()
 }
 
 /// Run this thread at background priority, as the converter runs ffmpeg: on
 /// Apple silicon that keeps it on the efficiency cores and lets the system
-/// throttle it, so a long backlog does not heat the machine.
-fn lower_thread_priority() {
+/// throttle it, so a long backlog does not heat the machine. During a boost
+/// (`boosted`) it runs at the user-initiated class instead, so it gets the
+/// performance cores.
+fn set_thread_priority(boosted: bool) {
     #[cfg(target_os = "macos")]
     // SAFETY: only changes the calling thread's own scheduling class.
     unsafe {
-        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_BACKGROUND, 0);
+        let class = if boosted {
+            libc::qos_class_t::QOS_CLASS_USER_INITIATED
+        } else {
+            libc::qos_class_t::QOS_CLASS_BACKGROUND
+        };
+        libc::pthread_set_qos_class_self_np(class, 0);
     }
+    #[cfg(not(target_os = "macos"))]
+    let _ = boosted;
 }
 
-fn run_forever(worker: &mut OcrWorker) {
+fn run_forever(worker: &mut OcrWorker, boost: &Boost) {
     let activity = Arc::clone(&worker.activity);
+    // A boost starting or stopping ends the sleep early.
     let sleep = |state: State, wait: Duration| {
         activity.ocr_sleeps(state, wait);
-        std::thread::sleep(wait);
+        boost.sleep(wait);
+    };
+    let mut boosted = false;
+    // Asked before each pass and every `FRAMES_PER_POWER_CHECK` frames, so a
+    // boost's start and end reach a pass in progress within seconds.
+    let mut keep_going = || {
+        if boost.is_on() != boosted {
+            boosted = !boosted;
+            set_thread_priority(boosted);
+        }
+        boost.may_work(on_ac_power)
     };
     loop {
-        if !on_ac_power() {
+        if !keep_going() {
             sleep(State::OnBattery, BATTERY_SLEEP);
             continue;
         }
 
         // New screenshots first: the converter is waiting on them.
-        let screenshots = worker.run_pass(SystemTime::now(), usize::MAX, &mut on_ac_power);
+        let screenshots = worker.run_pass(SystemTime::now(), usize::MAX, &mut keep_going);
         let result = match screenshots {
             Ok(summary) if summary.handled() == 0 => worker
-                .run_video_pass(VIDEO_FRAMES_PER_PASS, &mut on_ac_power)
+                .run_video_pass(VIDEO_FRAMES_PER_PASS, &mut keep_going)
                 .map(|summary| ("video frames", summary)),
             Ok(summary) => Ok(("screenshots", summary)),
             Err(error) => Err(error.to_string()),

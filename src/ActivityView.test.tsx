@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, mock } from 'bun:test';
 import { invoke } from '@tauri-apps/api/core';
-import { render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 
 import type { Activity } from './activity';
 import { ActivityView } from './ActivityView';
@@ -15,6 +15,7 @@ const secondsAhead = (s: number): string => new Date(NOW + s * 1000).toISOString
 function activity(overrides: Partial<Activity> = {}): Activity {
   return {
     onAcPower: true,
+    boost: null,
     capture: {
       running: true,
       lastFrame: { day: '2026-10-07', number: 1234, at: secondsAgo(2) },
@@ -185,5 +186,87 @@ describe('ActivityView', () => {
 
     await waitFor(() => expect(screen.getByTestId('Capture-headline')).toHaveTextContent(/Capture failed/));
     expect(screen.getByText("Can't get active window")).toBeInTheDocument();
+  });
+
+  describe('boost', () => {
+    /** Answers `get_activity` with `current()` and records the other commands. */
+    function respond(current: () => Activity, answer?: (command: string) => Promise<unknown>): void {
+      const reply = answer ?? (async (command: string): Promise<unknown> => {
+        if (command === 'get_activity') return current();
+        if (command === 'stop_boost') return undefined;
+        return current().boost;
+      });
+      mocked(invoke).mockImplementation(<T,>(command: string): Promise<T> => reply(command) as Promise<T>);
+    }
+
+    it('starts a boost of the chosen length', async () => {
+      let boost: Activity['boost'] = null;
+      respond(() => activity({ boost }));
+      render(<ActivityView />);
+
+      await waitFor(() => expect(screen.getByTestId('Boost-headline')).toHaveTextContent(/^Off/));
+      fireEvent.click(screen.getByRole('button', { name: '1h' }));
+      expect(screen.getByRole('button', { name: '1h' })).toHaveAttribute('aria-pressed', 'true');
+      fireEvent.click(screen.getByRole('checkbox', { name: 'Also on battery' }));
+      boost = { until: secondsAhead(3600), allowBattery: true };
+      fireEvent.click(screen.getByRole('button', { name: 'Boost!' }));
+
+      expect(invoke).toHaveBeenCalledWith('start_boost', { minutes: 60, allowBattery: true });
+      // Asks again straight away rather than at the next poll.
+      await waitFor(() =>
+        expect(screen.getByTestId('Boost-headline')).toHaveTextContent('Running at full speed for another 1h 00m'),
+      );
+      expect(screen.getByRole('button', { name: 'Stop boost' })).toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: '1h' })).not.toBeInTheDocument();
+    });
+
+    it('defaults to 20 minutes, not on battery', async () => {
+      respond(() => activity());
+      render(<ActivityView />);
+
+      fireEvent.click(await screen.findByRole('button', { name: 'Boost!' }));
+      expect(invoke).toHaveBeenCalledWith('start_boost', { minutes: 20, allowBattery: false });
+      await waitFor(() => expect(screen.getByRole('button', { name: 'Boost!' })).toBeEnabled());
+    });
+
+    it('stops a boost', async () => {
+      let boost: Activity['boost'] = { until: secondsAhead(125), allowBattery: false };
+      respond(() => activity({ boost }));
+      render(<ActivityView />);
+
+      await waitFor(() =>
+        expect(screen.getByTestId('Boost-headline')).toHaveTextContent('Running at full speed for another 2m 05s'),
+      );
+      boost = null;
+      fireEvent.click(screen.getByRole('button', { name: 'Stop boost' }));
+
+      expect(invoke).toHaveBeenCalledWith('stop_boost');
+      await screen.findByRole('button', { name: 'Boost!' });
+    });
+
+    it('changes whether the boost in progress runs on battery', async () => {
+      let boost: Activity['boost'] = { until: secondsAhead(600), allowBattery: false };
+      respond(() => activity({ boost, onAcPower: false }));
+      render(<ActivityView />);
+
+      await waitFor(() => expect(screen.getByTestId('Power-headline')).toHaveTextContent(/wait until the Mac is plugged in/));
+      boost = { until: secondsAhead(600), allowBattery: true };
+      fireEvent.click(screen.getByRole('checkbox', { name: 'Also on battery' }));
+
+      expect(invoke).toHaveBeenCalledWith('set_boost_allow_battery', { allowBattery: true });
+      await waitFor(() => expect(screen.getByTestId('Power-headline')).toHaveTextContent('On battery: boosting anyway'));
+      expect(screen.getByRole('checkbox', { name: 'Also on battery' })).toBeChecked();
+    });
+
+    it('shows why a boost could not start', async () => {
+      respond(activity, async (command: string): Promise<unknown> => {
+        if (command === 'get_activity') return activity();
+        throw 'nope';
+      });
+      render(<ActivityView />);
+
+      fireEvent.click(await screen.findByRole('button', { name: 'Boost!' }));
+      expect(await screen.findByRole('alert')).toHaveTextContent('nope');
+    });
   });
 });

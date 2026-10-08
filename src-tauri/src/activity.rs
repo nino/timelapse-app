@@ -5,6 +5,7 @@
 //! only touches memory, so the window can ask as often as it likes without the
 //! workers scanning the library or the database on its behalf.
 
+use crate::boost::BoostStatus;
 use chrono::{DateTime, Local};
 use serde::Serialize;
 use std::sync::Mutex;
@@ -19,6 +20,8 @@ pub struct Snapshot {
     /// Whether the machine is on AC power. Conversion and OCR run only then.
     /// `None` until first asked.
     pub on_ac_power: Option<bool>,
+    /// The boost in progress, if any. Filled in by `get_activity`.
+    pub boost: Option<BoostStatus>,
     pub capture: CaptureStatus,
     pub conversion: ConversionStatus,
     pub ocr: OcrStatus,

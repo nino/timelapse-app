@@ -25,9 +25,17 @@ export type Encoding = {
   pausedSecs: number;
 };
 
+/** A boost in progress. Mirrors `BoostStatus` in `boost.rs`. */
+export type Boost = {
+  until: string;
+  /** Whether conversion and OCR also run on battery. */
+  allowBattery: boolean;
+};
+
 /** Mirrors `Snapshot` in `activity.rs`. */
 export type Activity = {
   onAcPower: boolean | null;
+  boost: Boost | null;
   capture: {
     running: boolean;
     lastFrame: FrameRef | null;
@@ -62,6 +70,20 @@ export type Activity = {
 
 export function getActivity(): Promise<Activity> {
   return invoke<Activity>("get_activity");
+}
+
+/** Run conversion and OCR at full speed for `minutes`, replacing any boost in progress. */
+export function startBoost(minutes: number, allowBattery: boolean): Promise<Boost | null> {
+  return invoke<Boost | null>("start_boost", { minutes, allowBattery });
+}
+
+export function stopBoost(): Promise<void> {
+  return invoke<void>("stop_boost");
+}
+
+/** Let the boost in progress run on battery, or not. */
+export function setBoostAllowBattery(allowBattery: boolean): Promise<Boost | null> {
+  return invoke<Boost | null>("set_boost_allow_battery", { allowBattery });
 }
 
 /** A length of time, to the second under an hour: "45s", "3m 05s", "2h 14m". */

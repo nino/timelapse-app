@@ -8,18 +8,21 @@ export const ACTIVITY_POLL_MS = 1000;
 /**
  * The latest activity report and when it arrived, asked for every
  * `ACTIVITY_POLL_MS` while the page is visible. Each answer re-renders, so
- * countdowns computed against `now` tick along with it.
+ * countdowns computed against `now` tick along with it. `refresh` asks again
+ * straight away, after a change the window made itself.
  */
 export function useActivity(): {
   activity: Activity | null;
   now: number;
   error: string | null;
+  refresh: () => void;
 } {
   const [state, setState] = React.useState<{
     activity: Activity | null;
     now: number;
     error: string | null;
   }>(() => ({ activity: null, now: Date.now(), error: null }));
+  const askNow = React.useRef<() => void>(() => {});
 
   React.useEffect(() => {
     let cancelled = false;
@@ -49,6 +52,13 @@ export function useActivity(): {
     const onVisibilityChange = (): void => {
       if (document.visibilityState === "visible" && !asking && timer === undefined) ask();
     };
+    // An ask already under way may have started before the change; the next
+    // scheduled one picks it up a second later.
+    askNow.current = (): void => {
+      if (cancelled || asking) return;
+      if (timer !== undefined) clearTimeout(timer);
+      ask();
+    };
 
     ask();
     document.addEventListener("visibilitychange", onVisibilityChange);
@@ -59,5 +69,6 @@ export function useActivity(): {
     };
   }, []);
 
-  return state;
+  const refresh = React.useCallback((): void => askNow.current(), []);
+  return { ...state, refresh };
 }
