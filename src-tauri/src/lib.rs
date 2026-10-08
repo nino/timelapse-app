@@ -562,14 +562,35 @@ fn show_settings_window<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
         window.show()?;
         return window.set_focus();
     }
-    WebviewWindowBuilder::new(app, SETTINGS_WINDOW, WebviewUrl::App("index.html".into()))
-        .title("Settings")
-        .inner_size(440.0, 170.0)
-        .resizable(false)
-        .minimizable(false)
-        .maximizable(false)
-        .build()?;
+    // It opens hidden, and `fit_settings_window` shows it once it is sized to
+    // its content, so it never visibly jumps. Shown anyway after a second in
+    // case the page never gets that far.
+    let window =
+        WebviewWindowBuilder::new(app, SETTINGS_WINDOW, WebviewUrl::App("index.html".into()))
+            .title("Settings")
+            .inner_size(SETTINGS_WIDTH, 140.0)
+            .resizable(false)
+            .minimizable(false)
+            .maximizable(false)
+            .visible(false)
+            .build()?;
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let _ = window.show();
+    });
     Ok(())
+}
+
+/// Width of the Settings window, in logical pixels.
+const SETTINGS_WIDTH: f64 = 440.0;
+
+/// Sizes the Settings window to the height of its content and shows it.
+#[tauri::command]
+fn fit_settings_window(height: f64, window: tauri::WebviewWindow) -> Result<(), String> {
+    window
+        .set_size(tauri::LogicalSize::new(SETTINGS_WIDTH, height.ceil()))
+        .and_then(|_| window.show())
+        .map_err(|e| e.to_string())
 }
 
 /// Bring the Activity window to the front, opening it if it isn't open. It
@@ -753,7 +774,8 @@ pub fn run() {
             get_ocr_version,
             get_activity,
             get_settings,
-            set_update_automatically
+            set_update_automatically,
+            fit_settings_window
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
