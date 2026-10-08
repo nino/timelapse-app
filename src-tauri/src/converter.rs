@@ -33,7 +33,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Frames per second of the output video, as in `timelapse-to-video`.
@@ -62,6 +62,11 @@ const ON_BATTERY_POLL: Duration = Duration::from_secs(60);
 
 /// How often a running encode re-checks the power source and the stop flag.
 const ENCODE_POWER_CHECK: Duration = Duration::from_secs(30);
+
+/// The ffmpeg process of the encode in progress, if any. ffmpeg is a separate
+/// process, so quitting the app would leave it running, encoding into a
+/// staging folder the next launch deletes; `kill_running_encode` stops it.
+static RUNNING_ENCODE: Mutex<Option<Child>> = Mutex::new(None);
 
 /// Prefix of the staging folders under `.cache`.
 const STAGING_PREFIX: &str = ".convert-";
@@ -508,15 +513,48 @@ fn ffmpeg_command(frames_dir: &Path, output: &Path) -> Command {
     command
 }
 
+/// Kill the encode in progress, if there is one. The app calls this when it
+/// quits or restarts; the hour is converted again from the start on the next
+/// launch.
+pub fn kill_running_encode() {
+    kill_encode_in(&RUNNING_ENCODE);
+}
+
+fn kill_encode_in(slot: &Mutex<Option<Child>>) {
+    let mut slot = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(child) = slot.as_mut() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
 /// Wait for `child`, killing it if `should_stop` turns true. `should_stop` is
 /// checked every `check_every`; the child's exit is checked every second.
+/// While it runs the child sits in `slot`, where `kill_encode_in` can reach
+/// it.
 fn wait_or_kill(
-    mut child: Child,
+    slot: &Mutex<Option<Child>>,
+    child: Child,
     check_every: Duration,
     mut should_stop: impl FnMut() -> bool,
 ) -> Result<(), ConvertError> {
+    *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(child);
+    let result = wait_in(slot, check_every, &mut should_stop);
+    slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take();
+    result
+}
+
+fn wait_in(
+    slot: &Mutex<Option<Child>>,
+    check_every: Duration,
+    should_stop: &mut impl FnMut() -> bool,
+) -> Result<(), ConvertError> {
     let mut last_check = Instant::now();
     loop {
+        let mut guard = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(child) = guard.as_mut() else {
+            return Err(ConvertError::Interrupted);
+        };
         match child.try_wait() {
             Ok(Some(status)) if status.success() => return Ok(()),
             Ok(Some(status)) => {
@@ -539,6 +577,7 @@ fn wait_or_kill(
                 return Err(ConvertError::Interrupted);
             }
         }
+        drop(guard);
 
         std::thread::sleep(Duration::from_secs(1).min(check_every));
     }
@@ -560,7 +599,7 @@ fn encode_with_ffmpeg(frames_dir: &Path, output: &Path, running: &AtomicBool) ->
             ))
         })?;
 
-    wait_or_kill(child, ENCODE_POWER_CHECK, || {
+    wait_or_kill(&RUNNING_ENCODE, child, ENCODE_POWER_CHECK, || {
         !running.load(Ordering::SeqCst) || !on_ac_power()
     })
 }
@@ -1264,16 +1303,41 @@ mod tests {
         let child = Command::new("sleep").arg("30").spawn().unwrap();
         let started = Instant::now();
 
-        let result = wait_or_kill(child, Duration::from_millis(50), || true);
+        let slot = Mutex::new(None);
+        let result = wait_or_kill(&slot, child, Duration::from_millis(50), || true);
 
         assert_eq!(result, Err(ConvertError::Interrupted));
         assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(slot.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn quitting_kills_the_running_encode() {
+        let child = Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id();
+        let slot = Mutex::new(None);
+        let started = Instant::now();
+
+        let result = std::thread::scope(|scope| {
+            let waiter = scope.spawn(|| wait_or_kill(&slot, child, Duration::from_secs(60), || false));
+            while slot.lock().unwrap().is_none() {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            kill_encode_in(&slot);
+            waiter.join().unwrap()
+        });
+
+        assert!(result.is_err(), "a killed encode is not published");
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(slot.lock().unwrap().is_none());
+        let alive = Command::new("kill").args(["-0", &pid.to_string()]).status().unwrap().success();
+        assert!(!alive, "the process is gone, not orphaned");
     }
 
     #[test]
     fn wait_or_kill_reports_failure() {
         let child = Command::new("false").stderr(Stdio::piped()).spawn().unwrap();
-        let result = wait_or_kill(child, Duration::from_secs(60), || false);
+        let result = wait_or_kill(&Mutex::new(None), child, Duration::from_secs(60), || false);
         assert!(matches!(result, Err(ConvertError::Failed(_))));
     }
 
