@@ -514,32 +514,34 @@ fn window_overlaps_screen(window: (i32, i32, i32, i32), screen: (i32, i32, u32, 
 const FRAME_WIDTH: u32 = 1800;
 const FRAME_HEIGHT: u32 = 1124;
 
-/// A screen that would get fewer stored pixels per point than this (a big
-/// monitor: 2560×1440 points gets 0.7) gets a bigger frame. On such a screen
-/// OCR read about a quarter of the words, against three quarters on a laptop,
-/// which gets 1.14.
+/// A screen that would get fewer stored pixels per point than this in an
+/// ordinary frame (a big monitor: 2560×1440 points gets 0.7) is stored bigger.
+/// On test pages of such a screen OCR found about a quarter of the words; on a
+/// laptop, which gets 1.14, three quarters.
 const MIN_PIXELS_PER_POINT: f64 = 1.0;
 
 /// How many pixels per point a big screen's frame gets, or as many as the
-/// capture has if fewer. At 1.4, with OCR reading in strips, a 2560×1440-point
-/// screen read about 68% of words; twice as many pixels read no more.
+/// capture has if fewer. At 1.4, with OCR reading such frames in tiles (see
+/// `ocr_tiles`), a 2560×1440-point screen's pages read about four fifths of
+/// their words.
 const BIG_SCREEN_PIXELS_PER_POINT: f64 = 1.4;
 
 /// The size of the frame `capture` is stored in: `FRAME_WIDTH`×`FRAME_HEIGHT`,
-/// or for a big screen that shape scaled up to `BIG_SCREEN_PIXELS_PER_POINT`.
-/// Keeping the shape means the converter, which scales every frame down to
-/// 1800×1124, letterboxes them all alike.
+/// or for a big screen the screen's own shape at `BIG_SCREEN_PIXELS_PER_POINT`,
+/// without black bars (the converter letterboxes every frame into its 1800×1124
+/// video, whatever its shape).
 fn frame_size(capture: &Capture) -> (u32, u32) {
-    let fit = (FRAME_WIDTH as f64 / capture.width as f64).min(FRAME_HEIGHT as f64 / capture.height as f64);
-    let stored = fit * capture.pixels_per_point;
-    if !(stored < MIN_PIXELS_PER_POINT) {
-        // Also an unknown pixels-per-point (NaN): an ordinary frame.
+    let (width, height) = (capture.width as f64, capture.height as f64);
+    let fit = (FRAME_WIDTH as f64 / width).min(FRAME_HEIGHT as f64 / height);
+    let pixels_per_point = capture.pixels_per_point;
+    // An unknown density (zero, negative, NaN) gets the ordinary frame.
+    if !(pixels_per_point > 0.0 && pixels_per_point.is_finite()) || fit * pixels_per_point >= MIN_PIXELS_PER_POINT {
         return (FRAME_WIDTH, FRAME_HEIGHT);
     }
-    let factor = BIG_SCREEN_PIXELS_PER_POINT.min(capture.pixels_per_point) / stored;
+    let scale = (BIG_SCREEN_PIXELS_PER_POINT / pixels_per_point).min(1.0);
     // Even, as the video encoder's 4:2:0 chroma wants.
-    let even = |length: u32| ((length as f64 * factor / 2.0).round() as u32) * 2;
-    (even(FRAME_WIDTH), even(FRAME_HEIGHT))
+    let even = |length: f64| (((length * scale / 2.0).round() as u32) * 2).max(2);
+    (even(width), even(height))
 }
 
 /// Fit a capture into a frame and write it to `file_path` as a PNG, unless the
@@ -1098,26 +1100,28 @@ mod tests {
     fn test_frame_size_grows_only_for_big_screens() {
         // A 14" MacBook (1512×982 points) keeps the ordinary frame: 1.14 px a point.
         assert_eq!(frame_size(&blank_capture(3024, 1964, 2.0)), (1800, 1124));
-        // A 2560×1440-point screen at 2x would get 0.7 px a point; it gets 1.4.
-        assert_eq!(frame_size(&blank_capture(5120, 2880, 2.0)), (3584, 2238));
+        // A 2560×1440-point screen at 2x would get 0.7 px a point; it gets 1.4,
+        // in its own shape.
+        assert_eq!(frame_size(&blank_capture(5120, 2880, 2.0)), (3584, 2016));
         // The same screen at 1x has only 1 px a point, so it is kept at that.
-        assert_eq!(frame_size(&blank_capture(2560, 1440, 1.0)), (2560, 1598));
+        assert_eq!(frame_size(&blank_capture(2560, 1440, 1.0)), (2560, 1440));
         // A 4K screen at "looks like 1920×1080" would get 0.94.
-        assert_eq!(frame_size(&blank_capture(3840, 2160, 2.0)), (2688, 1678));
+        assert_eq!(frame_size(&blank_capture(3840, 2160, 2.0)), (2688, 1512));
+        // A 32:9 screen gets no black bars to pay for.
+        assert_eq!(frame_size(&blank_capture(10240, 2880, 2.0)), (7168, 2016));
         // Unknown density: the ordinary frame.
-        assert_eq!(frame_size(&blank_capture(5120, 2880, f64::NAN)), (1800, 1124));
+        for unknown in [f64::NAN, 0.0, -1.0, f64::INFINITY] {
+            assert_eq!(frame_size(&blank_capture(5120, 2880, unknown)), (1800, 1124));
+        }
     }
 
     #[test]
-    fn test_fit_to_frame_keeps_a_1x_monitor_at_full_resolution() {
+    fn test_fit_to_frame_stores_a_big_screen_without_bars() {
         let frame = fit_to_frame(&blank_capture(2560, 1440, 1.0), "test.png").unwrap();
 
-        // 2560×1440 fills the width of 2560×1598 unscaled, with 79px bars.
-        assert_eq!(frame.dimensions(), (2560, 1598));
-        assert_eq!(frame.get_pixel(1280, 78).0, [0, 0, 0]);
-        assert_eq!(frame.get_pixel(1280, 79).0, [200, 200, 200]);
-        assert_eq!(frame.get_pixel(1280, 1518).0, [200, 200, 200]);
-        assert_eq!(frame.get_pixel(1280, 1519).0, [0, 0, 0]);
+        assert_eq!(frame.dimensions(), (2560, 1440));
+        assert_eq!(frame.get_pixel(0, 0).0, [200, 200, 200]);
+        assert_eq!(frame.get_pixel(2559, 1439).0, [200, 200, 200]);
     }
 
     #[test]

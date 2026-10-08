@@ -39,8 +39,9 @@ const LONG_PASS: Duration = Duration::from_secs(60);
 /// How long to wait before re-checking the power source while on battery.
 const BATTERY_SLEEP: Duration = Duration::from_secs(5 * 60);
 
-/// How many frames to read between power-source checks. At ~130 ms per frame
-/// that is a check every few seconds of work.
+/// How many frames to read between power-source checks. At 0.1–0.3 s for an
+/// ordinary frame that is a check every few seconds of work; a big screen's
+/// frame, read in tiles, takes about a second, so up to half a minute.
 const FRAMES_PER_POWER_CHECK: usize = 30;
 
 /// Most video frames handled per pass when there are no new screenshots, so
@@ -82,75 +83,6 @@ pub struct OcrLine {
     pub y: f64,
     pub width: f64,
     pub height: f64,
-}
-
-/// Roughly the size, in frame pixels, of each tile Vision reads on its own:
-/// 2×2 tiles for an ordinary 1800×1124 frame, 3×3 for a big screen's bigger
-/// one. Vision judges text size against the whole image it is given, so on a
-/// big screen it misses small text it reads fine in a tile. On test pages, a
-/// 2560×1440-point screen went from about a quarter of words read to four
-/// fifths, and a laptop from 77% to 82%; smaller tiles read no more.
-const TILE_WIDTH: f64 = 1200.0;
-const TILE_HEIGHT: f64 = 750.0;
-
-/// How far each tile reaches past its own part on every side, as a share of
-/// the frame, so a word on a boundary is whole in one of them.
-const TILE_OVERLAP: f64 = 0.03;
-
-/// One cell of the grid a frame is read in. Vision is given the cell grown by
-/// `TILE_OVERLAP` (`region`), and the tile keeps the lines whose centre is in
-/// its own cell, so a line both tiles see is kept once.
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct Tile {
-    column: usize,
-    row: usize,
-    columns: usize,
-    rows: usize,
-}
-
-/// The tiles to read a `width`×`height` frame in, row by row.
-fn tiles(width: u32, height: u32) -> Vec<Tile> {
-    let columns = (width as f64 / TILE_WIDTH).ceil().max(1.0) as usize;
-    let rows = (height as f64 / TILE_HEIGHT).ceil().max(1.0) as usize;
-    (0..rows)
-        .flat_map(|row| (0..columns).map(move |column| Tile { column, row, columns, rows }))
-        .collect()
-}
-
-/// A rectangle in Vision's normalized coordinates, origin bottom-left.
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct Region {
-    x: f64,
-    y: f64,
-    width: f64,
-    height: f64,
-}
-
-impl Tile {
-    /// The part of the frame Vision reads for this tile.
-    fn region(&self) -> Region {
-        let left = (self.column as f64 / self.columns as f64 - TILE_OVERLAP).max(0.0);
-        let right = ((self.column + 1) as f64 / self.columns as f64 + TILE_OVERLAP).min(1.0);
-        let top = (self.row as f64 / self.rows as f64 - TILE_OVERLAP).max(0.0);
-        let bottom = ((self.row + 1) as f64 / self.rows as f64 + TILE_OVERLAP).min(1.0);
-        Region { x: left, y: 1.0 - bottom, width: right - left, height: bottom - top }
-    }
-
-    /// `line`, as Vision reports it within this tile's region, moved into the
-    /// whole frame's coordinates, or `None` if its centre lies in another
-    /// tile's cell (which reports it too).
-    fn place(&self, line: OcrLine) -> Option<OcrLine> {
-        let region = self.region();
-        let x = region.x + line.x * region.width;
-        let y = region.y + line.y * region.height;
-        let width = line.width * region.width;
-        let height = line.height * region.height;
-        let centre_x = x + width / 2.0;
-        let centre_from_top = 1.0 - (y + height / 2.0);
-        let cell = |at: f64, count: usize| ((at * count as f64).max(0.0) as usize).min(count - 1);
-        let owned = cell(centre_x, self.columns) == self.column && cell(centre_from_top, self.rows) == self.row;
-        owned.then(|| OcrLine { x, y, width, height, ..line })
-    }
 }
 
 pub trait TextRecognizer: Send {
@@ -802,7 +734,8 @@ fn old_enough(path: &Path, now: SystemTime) -> bool {
 
 #[cfg(target_os = "macos")]
 mod vision {
-    use super::{tiles, OcrLine, TextRecognizer};
+    use super::{OcrLine, TextRecognizer};
+    use crate::ocr_tiles::{assemble, tiles};
     use objc2::rc::{autoreleasepool, Retained};
     use objc2::AnyThread;
     use objc2_core_foundation::{CGPoint, CGRect, CGSize};
@@ -812,8 +745,8 @@ mod vision {
     };
     use std::path::Path;
 
-    /// Vision's text recognizer in accurate mode, reading a frame in tiles
-    /// (see `TILE_WIDTH`). Fast mode was tried on real
+    /// Vision's text recognizer in accurate mode, reading a big frame in tiles
+    /// (see `ocr_tiles`). Fast mode was tried on real
     /// captures and garbles too much text to be worth indexing.
     pub struct VisionRecognizer;
 
@@ -864,28 +797,31 @@ mod vision {
                     .performRequests_error(&NSArray::from_retained_slice(&as_requests))
                     .map_err(|error| error.localizedDescription().to_string())?;
 
-                let mut lines = Vec::new();
-                for (tile, request) in tiles.iter().zip(&requests) {
-                    for observation in request.results().iter().flat_map(|results| results.iter()) {
-                        let Some(best) = observation.topCandidates(1).firstObject() else {
-                            continue;
-                        };
-                        // SAFETY: a plain property read on a finished
-                        // observation. The box is relative to the tile.
-                        let bounds = unsafe { observation.boundingBox() };
-                        lines.extend(tile.place(OcrLine {
-                            text: best.string().to_string(),
-                            confidence: best.confidence(),
-                            x: bounds.origin.x,
-                            y: bounds.origin.y,
-                            width: bounds.size.width,
-                            height: bounds.size.height,
-                        }));
-                    }
-                }
-                // Top to bottom, then left to right.
-                lines.sort_by(|a, b| (b.y + b.height).total_cmp(&(a.y + a.height)).then(a.x.total_cmp(&b.x)));
-                Ok(lines)
+                let read = tiles
+                    .iter()
+                    .zip(&requests)
+                    .map(|(tile, request)| {
+                        let mut lines = Vec::new();
+                        for observation in request.results().iter().flat_map(|results| results.iter()) {
+                            let Some(best) = observation.topCandidates(1).firstObject() else {
+                                continue;
+                            };
+                            // SAFETY: a plain property read on a finished
+                            // observation. The box is relative to the tile.
+                            let bounds = unsafe { observation.boundingBox() };
+                            lines.push(OcrLine {
+                                text: best.string().to_string(),
+                                confidence: best.confidence(),
+                                x: bounds.origin.x,
+                                y: bounds.origin.y,
+                                width: bounds.size.width,
+                                height: bounds.size.height,
+                            });
+                        }
+                        (*tile, lines)
+                    })
+                    .collect();
+                Ok(assemble(read))
             })
         }
     }
@@ -902,58 +838,6 @@ mod tests {
     use tempfile::TempDir;
 
     const DAY_1: &str = "2024-01-01";
-
-    fn line(y: f64, height: f64) -> OcrLine {
-        OcrLine { text: "word".into(), confidence: 1.0, x: 0.1, y, width: 0.5, height }
-    }
-
-    #[test]
-    fn frames_are_read_in_tiles_by_size() {
-        assert_eq!(tiles(1200, 750).len(), 1);
-        assert_eq!(tiles(1800, 1124).len(), 4);
-        assert_eq!(tiles(2560, 1598).len(), 9);
-        assert_eq!(tiles(3584, 2238).len(), 9);
-        assert_eq!(tiles(1800, 1124)[1], Tile { column: 1, row: 0, columns: 2, rows: 2 });
-    }
-
-    #[test]
-    fn a_tile_reads_its_cell_and_a_margin() {
-        let top_left = tiles(1800, 1124)[0].region();
-        assert_eq!((top_left.x, top_left.width), (0.0, 0.53));
-        assert!((top_left.y - 0.47).abs() < 1e-9);
-        assert!((top_left.height - 0.53).abs() < 1e-9);
-        let bottom_right = tiles(1800, 1124)[3].region();
-        assert!((bottom_right.x - 0.47).abs() < 1e-9);
-        assert_eq!(bottom_right.y, 0.0);
-    }
-
-    #[test]
-    fn tile_lines_move_into_frame_coordinates() {
-        let bottom_right = tiles(1800, 1124)[3];
-        // Halfway up and across the bottom-right tile's region (0.47–1 both
-        // ways), a tenth of it in size.
-        let placed = bottom_right.place(line(0.5, 0.1)).unwrap();
-        assert!((placed.y - 0.265).abs() < 1e-9);
-        assert!((placed.height - 0.053).abs() < 1e-9);
-        assert!((placed.x - (0.47 + 0.1 * 0.53)).abs() < 1e-9);
-        assert!((placed.width - 0.5 * 0.53).abs() < 1e-9);
-    }
-
-    #[test]
-    fn a_line_in_the_overlap_is_kept_once() {
-        let [top_left, _, bottom_left, _] = tiles(1800, 1124)[..] else { panic!() };
-        // A short line at the left, centred 0.51 from the top: inside the top
-        // tile's region but the bottom tile's cell.
-        let from_top = |tile: Tile, centre: f64| {
-            let region = tile.region();
-            let height = 0.02 / region.height;
-            line((1.0 - centre - 0.01 - region.y) / region.height, height)
-        };
-        let short = |line: OcrLine| OcrLine { width: 0.1, ..line };
-        assert_eq!(top_left.place(short(from_top(top_left, 0.51))), None);
-        assert!(bottom_left.place(short(from_top(bottom_left, 0.51))).is_some());
-        assert!(top_left.place(short(from_top(top_left, 0.49))).is_some());
-    }
     const DAY_2: &str = "2024-01-02";
 
     /// Returns one line naming the file it was given, and remembers the call.
