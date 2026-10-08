@@ -106,6 +106,10 @@ pub struct Encoding {
     pub started_at: DateTime<Local>,
     /// Frames ffmpeg has encoded so far, from its `-progress` output.
     pub frames_done: usize,
+    /// When the encode was paused (unplugged), while it is.
+    pub paused_since: Option<DateTime<Local>>,
+    /// Seconds spent paused before `paused_since`.
+    pub paused_secs: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -223,6 +227,28 @@ impl Activity {
         self.update(|s| {
             if let Some(current) = s.conversion.current.as_mut() {
                 current.frames_done = frames_done.min(current.frames);
+            }
+        });
+    }
+
+    /// The encode is paused until the machine is back on AC power.
+    pub fn encoding_paused(&self) {
+        self.update(|s| {
+            if let Some(current) = s.conversion.current.as_mut() {
+                current.paused_since.get_or_insert_with(Local::now);
+                s.conversion.state = State::OnBattery;
+            }
+        });
+    }
+
+    /// The paused encode carries on.
+    pub fn encoding_resumed(&self) {
+        self.update(|s| {
+            if let Some(current) = s.conversion.current.as_mut() {
+                if let Some(since) = current.paused_since.take() {
+                    current.paused_secs += (Local::now() - since).num_seconds().max(0) as u64;
+                }
+                s.conversion.state = State::Working;
             }
         });
     }
@@ -365,10 +391,21 @@ mod tests {
             frames: 10,
             started_at: Local::now(),
             frames_done: 0,
+            paused_since: None,
+            paused_secs: 0,
         });
         assert_eq!(activity.snapshot(false, || true).conversion.state, State::Working);
         activity.encoding_progress(4);
         assert_eq!(activity.snapshot(false, || true).conversion.current.unwrap().frames_done, 4);
+
+        activity.encoding_paused();
+        let conversion = activity.snapshot(false, || false).conversion;
+        assert_eq!(conversion.state, State::OnBattery);
+        assert!(conversion.current.unwrap().paused_since.is_some());
+        activity.encoding_resumed();
+        let conversion = activity.snapshot(false, || true).conversion;
+        assert_eq!(conversion.state, State::Working);
+        assert!(conversion.current.unwrap().paused_since.is_none());
 
         activity.encoding_finished("v.mov".into(), Duration::from_secs(3), None);
         activity.converter_sleeps(State::Resting, Duration::from_secs(60));

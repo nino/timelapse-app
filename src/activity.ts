@@ -19,6 +19,10 @@ export type Encoding = {
   startedAt: string;
   /** Frames ffmpeg has encoded so far. */
   framesDone: number;
+  /** When the encode was paused (unplugged), while it is. */
+  pausedSince: string | null;
+  /** Seconds spent paused before `pausedSince`. */
+  pausedSecs: number;
 };
 
 /** Mirrors `Snapshot` in `activity.rs`. */
@@ -80,9 +84,16 @@ export function until(time: string, now: number): string {
   return seconds < 1 ? "any moment now" : `in ${formatDuration(seconds)}`;
 }
 
+/** Seconds an encode has spent encoding, as of `now`: time paused doesn't count. */
+export function encodeSeconds(encoding: Encoding, now: number): number {
+  const pausedNow = encoding.pausedSince ? (now - Date.parse(encoding.pausedSince)) / 1000 : 0;
+  return (now - Date.parse(encoding.startedAt)) / 1000 - encoding.pausedSecs - pausedNow;
+}
+
 /**
  * How far along an encode is, as a whole percentage, and an estimate of the
- * seconds left at the rate so far (null until there is a rate to go by).
+ * seconds left at the rate so far (null until there is a rate to go by, and
+ * while the encode is paused).
  */
 export function encodeProgress(
   encoding: Encoding,
@@ -90,9 +101,11 @@ export function encodeProgress(
 ): { percent: number; secondsLeft: number | null } {
   const { frames, framesDone } = encoding;
   const percent = frames > 0 ? Math.floor((framesDone / frames) * 100) : 0;
-  const elapsed = (now - Date.parse(encoding.startedAt)) / 1000;
+  const elapsed = encodeSeconds(encoding, now);
   const secondsLeft =
-    framesDone > 0 && elapsed >= 10 ? ((frames - framesDone) * elapsed) / framesDone : null;
+    framesDone > 0 && elapsed >= 10 && !encoding.pausedSince
+      ? ((frames - framesDone) * elapsed) / framesDone
+      : null;
   return { percent, secondsLeft };
 }
 

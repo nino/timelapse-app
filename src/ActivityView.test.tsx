@@ -89,6 +89,8 @@ describe('ActivityView', () => {
             frames: 3412,
             startedAt: secondsAgo(133),
             framesDone: 1706,
+            pausedSince: null,
+            pausedSecs: 0,
           },
           nextCheckAt: null,
         },
@@ -103,6 +105,36 @@ describe('ActivityView', () => {
     // Half done after 2m 13s: about as long again to go.
     expect(screen.getByRole('progressbar')).toHaveAttribute('aria-valuenow', '50');
     expect(screen.getByText(/^50%/)).toHaveTextContent('50%, about 2m 13s left');
+  });
+
+  it('says when an encode is paused on battery', async () => {
+    const base = activity();
+    mocked(invoke).mockResolvedValue(
+      activity({
+        conversion: {
+          ...base.conversion,
+          state: 'onBattery',
+          current: {
+            video: 'v.mov',
+            day: '2026-10-07',
+            hour: 9,
+            frames: 3412,
+            startedAt: secondsAgo(400),
+            framesDone: 1706,
+            pausedSince: secondsAgo(100),
+            pausedSecs: 167,
+          },
+          nextCheckAt: null,
+        },
+      }),
+    );
+    render(<ActivityView />);
+
+    await waitFor(() =>
+      expect(screen.getByTestId('Video conversion-headline')).toHaveTextContent('Encoding 2026-10-07 09:00 paused on battery'),
+    );
+    expect(screen.getByText('2m 13s')).toBeInTheDocument();
+    expect(screen.getByText(/^50%/)).toHaveTextContent(/^50%$/);
   });
 
   it('says when work waits for AC power', async () => {

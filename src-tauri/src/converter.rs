@@ -531,18 +531,47 @@ fn kill_encode_in(slot: &Mutex<Option<Child>>) {
     }
 }
 
-/// Wait for `child`, killing it if `should_stop` turns true. `should_stop` is
-/// checked every `check_every`; the child's exit is checked every second.
-/// While it runs the child sits in `slot`, where `kill_encode_in` can reach
-/// it.
+/// What a running encode should do, as `wait_or_kill`'s `check` decides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Control {
+    Run,
+    /// Freeze ffmpeg where it is (on battery); `Run` lets it carry on.
+    Pause,
+    /// Kill ffmpeg (the converter is stopping).
+    Stop,
+}
+
+/// Freeze (`SIGSTOP`) or thaw (`SIGCONT`) `child`. Returns whether that
+/// worked; where it can't, the caller kills the encode instead.
+fn set_suspended(child: &Child, suspended: bool) -> bool {
+    #[cfg(unix)]
+    {
+        let signal = if suspended { libc::SIGSTOP } else { libc::SIGCONT };
+        // SAFETY: `kill` only sends a signal; the pid is our own unreaped
+        // child, so it cannot belong to another process.
+        unsafe { libc::kill(child.id() as libc::pid_t, signal) == 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (child, suspended);
+        false
+    }
+}
+
+/// Wait for `child`, asking `check` every `check_every` what it should do:
+/// carry on, pause (frozen until `check` says `Run` again; `on_pause` hears
+/// of each change) or stop (killed). The child's exit is checked every
+/// second. While it runs the child sits in `slot`, where `kill_encode_in` can
+/// reach it.
 fn wait_or_kill(
     slot: &Mutex<Option<Child>>,
     child: Child,
     check_every: Duration,
-    mut should_stop: impl FnMut() -> bool,
+    mut check: impl FnMut() -> Control,
+    mut on_pause: impl FnMut(bool),
 ) -> Result<(), ConvertError> {
     *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(child);
-    let result = wait_in(slot, check_every, &mut should_stop);
+    let result = wait_in(slot, check_every, &mut check, &mut on_pause);
     slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take();
     result
 }
@@ -550,9 +579,11 @@ fn wait_or_kill(
 fn wait_in(
     slot: &Mutex<Option<Child>>,
     check_every: Duration,
-    should_stop: &mut impl FnMut() -> bool,
+    check: &mut impl FnMut() -> Control,
+    on_pause: &mut impl FnMut(bool),
 ) -> Result<(), ConvertError> {
     let mut last_check = Instant::now();
+    let mut paused = false;
     loop {
         let mut guard = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let Some(child) = guard.as_mut() else {
@@ -574,7 +605,28 @@ fn wait_in(
 
         if last_check.elapsed() >= check_every {
             last_check = Instant::now();
-            if should_stop() {
+            let control = check();
+            let stop = match control {
+                Control::Stop => true,
+                Control::Pause if !paused => {
+                    paused = set_suspended(child, true);
+                    if paused {
+                        on_pause(true);
+                    }
+                    !paused
+                }
+                Control::Run if paused => {
+                    // Should it fail, the next check tries again.
+                    if set_suspended(child, false) {
+                        paused = false;
+                        on_pause(false);
+                    }
+                    false
+                }
+                _ => false,
+            };
+            if stop {
+                // A frozen process still dies of SIGKILL.
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(ConvertError::Interrupted);
@@ -591,13 +643,16 @@ fn progress_frame(line: &str) -> Option<usize> {
     line.trim().strip_prefix("frame=")?.trim().parse().ok()
 }
 
-/// Encode with ffmpeg, giving up if power is unplugged or `running` clears.
-/// `on_progress` is called with the number of frames encoded so far.
+/// Encode with ffmpeg, pausing while the power is unplugged and giving up if
+/// `running` clears. `on_progress` is called with the number of frames
+/// encoded so far, and `on_pause` with `true` when the encode pauses and
+/// `false` when it carries on.
 fn encode_with_ffmpeg(
     frames_dir: &Path,
     output: &Path,
     running: &AtomicBool,
     on_progress: impl Fn(usize) + Send + 'static,
+    on_pause: impl FnMut(bool),
 ) -> Result<(), ConvertError> {
     let mut child = ffmpeg_command(frames_dir, output)
         .stdin(Stdio::null())
@@ -626,9 +681,21 @@ fn encode_with_ffmpeg(
         });
     }
 
-    wait_or_kill(&RUNNING_ENCODE, child, ENCODE_POWER_CHECK, || {
-        !running.load(Ordering::SeqCst) || !on_ac_power()
-    })
+    wait_or_kill(
+        &RUNNING_ENCODE,
+        child,
+        ENCODE_POWER_CHECK,
+        || {
+            if !running.load(Ordering::SeqCst) {
+                Control::Stop
+            } else if on_ac_power() {
+                Control::Run
+            } else {
+                Control::Pause
+            }
+        },
+        on_pause,
+    )
 }
 
 /// Runs batches in the background for as long as it is started.
@@ -765,15 +832,30 @@ impl Converter {
             frames: batch.frames.len(),
             started_at: Local::now(),
             frames_done: 0,
+            paused_since: None,
+            paused_secs: 0,
         });
         let root_owned = root.to_path_buf();
         let running_owned = Arc::clone(running);
         let progress = Arc::clone(activity);
+        let pauses = Arc::clone(activity);
         let result = tokio::task::spawn_blocking(move || {
             convert_batch(&root_owned, &batch, |frames_dir, output| {
-                encode_with_ffmpeg(frames_dir, output, &running_owned, move |frames| {
-                    progress.encoding_progress(frames)
-                })
+                encode_with_ffmpeg(
+                    frames_dir,
+                    output,
+                    &running_owned,
+                    move |frames| progress.encoding_progress(frames),
+                    |paused| {
+                        if paused {
+                            println!("Paused the encode: on battery");
+                            pauses.encoding_paused();
+                        } else {
+                            println!("Resumed the encode: on AC power");
+                            pauses.encoding_resumed();
+                        }
+                    },
+                )
             })
         })
         .await
@@ -787,8 +869,8 @@ impl Converter {
                 (State::Resting, rest_after(took))
             }
             Err(ConvertError::Interrupted) => {
-                println!("Video conversion interrupted; the frames were kept");
-                activity.encoding_finished(video_name, took, Some("Stopped because the power was unplugged".to_string()));
+                println!("Video conversion stopped; the frames were kept");
+                activity.encoding_finished(video_name, took, Some("Stopped before it finished".to_string()));
                 (State::OnBattery, ON_BATTERY_POLL)
             }
             Err(e) => {
@@ -1343,7 +1425,7 @@ mod tests {
         let started = Instant::now();
 
         let slot = Mutex::new(None);
-        let result = wait_or_kill(&slot, child, Duration::from_millis(50), || true);
+        let result = wait_or_kill(&slot, child, Duration::from_millis(50), || Control::Stop, |_| {});
 
         assert_eq!(result, Err(ConvertError::Interrupted));
         assert!(started.elapsed() < Duration::from_secs(10));
@@ -1358,7 +1440,7 @@ mod tests {
         let started = Instant::now();
 
         let result = std::thread::scope(|scope| {
-            let waiter = scope.spawn(|| wait_or_kill(&slot, child, Duration::from_secs(60), || false));
+            let waiter = scope.spawn(|| wait_or_kill(&slot, child, Duration::from_secs(60), || Control::Run, |_| {}));
             while slot.lock().unwrap().is_none() {
                 std::thread::sleep(Duration::from_millis(10));
             }
@@ -1376,8 +1458,70 @@ mod tests {
     #[test]
     fn wait_or_kill_reports_failure() {
         let child = Command::new("false").stderr(Stdio::piped()).spawn().unwrap();
-        let result = wait_or_kill(&Mutex::new(None), child, Duration::from_secs(60), || false);
+        let result = wait_or_kill(&Mutex::new(None), child, Duration::from_secs(60), || Control::Run, |_| {});
         assert!(matches!(result, Err(ConvertError::Failed(_))));
+    }
+
+    /// The process state `ps` reports for `pid`: `T` while it is stopped.
+    fn process_state(pid: u32) -> String {
+        let output = Command::new("ps").args(["-o", "stat=", "-p", &pid.to_string()]).output().unwrap();
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn unplugging_pauses_the_encode_and_plugging_in_resumes_it() {
+        let child = Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id();
+        let slot = Mutex::new(None);
+        // Battery for two checks, then AC, then the converter stops.
+        let mut checks = [Control::Pause, Control::Pause, Control::Run, Control::Stop].into_iter();
+        let mut events = Vec::new();
+
+        let result = wait_or_kill(
+            &slot,
+            child,
+            Duration::from_millis(50),
+            || checks.next().unwrap_or(Control::Stop),
+            |paused| events.push((paused, process_state(pid))),
+        );
+
+        assert_eq!(result, Err(ConvertError::Interrupted));
+        assert_eq!(events.len(), 2, "one pause and one resume: {:?}", events);
+        assert!(events[0].0 && events[0].1.starts_with('T'), "frozen while paused: {:?}", events);
+        assert!(!events[1].0 && !events[1].1.starts_with('T'), "running again: {:?}", events);
+    }
+
+    #[test]
+    fn a_paused_encode_still_dies_when_the_app_quits() {
+        let child = Command::new("sleep").arg("30").spawn().unwrap();
+        let slot = Mutex::new(None);
+        let started = Instant::now();
+
+        let result = std::thread::scope(|scope| {
+            let waiter = scope.spawn(|| {
+                wait_or_kill(&slot, child, Duration::from_millis(20), || Control::Pause, |_| {})
+            });
+            std::thread::sleep(Duration::from_millis(200));
+            kill_encode_in(&slot);
+            waiter.join().unwrap()
+        });
+
+        assert!(result.is_err());
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    /// Pausing and killing signal the process `ffmpeg_command` starts, which
+    /// on macOS is `taskpolicy`. That only reaches ffmpeg because taskpolicy
+    /// execs it in place rather than forking.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn taskpolicy_runs_its_command_in_its_own_process() {
+        let mut child = Command::new("taskpolicy").args(["-b", "sleep", "30"]).spawn().unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        let output = Command::new("ps").args(["-o", "comm=", "-p", &child.id().to_string()]).output().unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(String::from_utf8_lossy(&output.stdout).trim().ends_with("sleep"));
     }
 
     /// End to end with the real ffmpeg command, when ffmpeg (with libx265) is
@@ -1423,7 +1567,7 @@ mod tests {
         let progress = Arc::new(std::sync::Mutex::new(Vec::new()));
         let reported = Arc::clone(&progress);
         let name = convert_batch(root, &batch, |dir, out| {
-            encode_with_ffmpeg(dir, out, &running, move |frames| reported.lock().unwrap().push(frames))
+            encode_with_ffmpeg(dir, out, &running, move |frames| reported.lock().unwrap().push(frames), |_| {})
         })
         .unwrap();
         // The reader thread may still be draining the pipe for a moment.
