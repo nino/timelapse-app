@@ -5,8 +5,8 @@
 //! read, stores the text in `screenshots.db` for full-text search, and moves
 //! that day's progress mark forward (see `ScreenshotDatabase::record_ocr_frame`).
 //! It only works while the machine is on AC power, like the video converter,
-//! and the converter in turn only deletes PNGs that the progress mark covers
-//! (`delete_check`).
+//! and the converter in turn only converts and deletes PNGs that the progress
+//! mark covers (`ocr_check`).
 //!
 //! Days that only exist as video (the old script's whole-day videos, whose
 //! screenshots were deleted before OCR existed) are read from the videos
@@ -18,8 +18,9 @@
 //! macOS; everything else here is platform-independent and tested with a fake
 //! recognizer.
 
-use crate::converter::{is_day_folder_name, on_ac_power, DeleteCheck, HourBatch};
-use crate::database::{OcrProgress, ScreenshotDatabase};
+use crate::activity::{Activity, State};
+use crate::converter::{is_day_folder_name, on_ac_power, OcrCheck, HourBatch};
+use crate::database::{LineBox, OcrProgress, ScreenshotDatabase};
 use frame_source::{FrameSource, RawFrame};
 use image::{imageops, GrayImage};
 use serde::Serialize;
@@ -108,10 +109,11 @@ pub fn ocr_covers(
     }
 }
 
-/// The video converter's `DeleteCheck`: an hour's PNGs may go once OCR has
-/// handled every one of them. It keeps its own connection to the library's
-/// database; if that cannot be opened, nothing is deleted.
-pub fn delete_check(root: &Path) -> DeleteCheck {
+/// The video converter's `OcrCheck`: an hour is converted, and its PNGs may
+/// go, once OCR has handled every one of them. It keeps its own connection to
+/// the library's database; if that cannot be opened, nothing is converted or
+/// deleted.
+pub fn ocr_check(root: &Path) -> OcrCheck {
     let db = match ScreenshotDatabase::new(root.join("screenshots.db")) {
         Ok(db) => Mutex::new(db),
         Err(error) => {
@@ -121,14 +123,7 @@ pub fn delete_check(root: &Path) -> DeleteCheck {
     };
 
     Arc::new(move |batch: &HourBatch| {
-        let Some(frame_numbers) = batch
-            .frames
-            .iter()
-            .map(|path| frame_number(path))
-            .collect::<Option<Vec<u32>>>()
-        else {
-            return false;
-        };
+        let frame_numbers = batch.frames.iter().map(|frame| frame.number);
         db.lock()
             .map(|db| ocr_covers(&db, &batch.day, frame_numbers))
             .unwrap_or(false)
@@ -205,9 +200,11 @@ pub struct OcrWorker {
     recognizer: Box<dyn TextRecognizer>,
     /// Thumbnail of the last frame read in each day.
     last_read: HashMap<String, Thumbnail>,
+    /// Text of the last frame recorded in each day.
+    last_text: HashMap<String, String>,
+    activity: Arc<Activity>,
     videos: Option<VideoReader>,
 }
-
 /// What the worker needs to read days that only exist as video.
 pub struct VideoReader {
     source: FrameSource,
@@ -229,6 +226,8 @@ impl VideoReader {
     }
 }
 
+
+
 impl OcrWorker {
     pub fn new(root: PathBuf, db: ScreenshotDatabase, recognizer: Box<dyn TextRecognizer>) -> Self {
         OcrWorker {
@@ -236,6 +235,8 @@ impl OcrWorker {
             db,
             recognizer,
             last_read: Default::default(),
+            last_text: Default::default(),
+            activity: Arc::default(),
             videos: None,
         }
     }
@@ -243,6 +244,12 @@ impl OcrWorker {
     /// Also read days that only exist as video (`run_video_pass`).
     pub fn with_videos(mut self, videos: VideoReader) -> Self {
         self.videos = Some(videos);
+        self
+    }
+
+    /// Report progress to `activity`, for the Activity window.
+    pub fn reporting_to(mut self, activity: Arc<Activity>) -> Self {
+        self.activity = activity;
         self
     }
 
@@ -259,10 +266,18 @@ impl OcrWorker {
     ) -> std::io::Result<PassSummary> {
         let mut summary = PassSummary::default();
 
+        // Listed up front so the Activity window can say how much is left.
+        let mut pending = Vec::new();
         for day in day_folders(&self.root)? {
             let done_through = self.db.ocr_done_through(&day).unwrap_or(None).unwrap_or(0);
+            let frames = frames_after(&self.root.join(&day), done_through)?;
+            pending.push((day, frames));
+        }
+        self.activity
+            .ocr_pass_started(pending.iter().map(|(_, frames)| frames.len()).sum());
 
-            for (frame_number, path) in frames_after(&self.root.join(&day), done_through)? {
+        for (day, frames) in pending {
+            for (frame_number, path) in frames {
                 if summary.handled() >= max_frames {
                     return Ok(summary);
                 }
@@ -276,20 +291,27 @@ impl OcrWorker {
                     break;
                 }
 
-                match self.handle_frame(&day, frame_number, &path) {
-                    Ok(true) => summary.recognized += 1,
-                    Ok(false) => summary.skipped += 1,
+                let recognized = match self.handle_frame(&day, frame_number, &path) {
+                    Ok(recognized) => recognized,
                     Err(error) => {
                         // A frame that cannot be read (deleted meanwhile, or
                         // corrupt) is passed over rather than retried forever,
                         // which would hold back the rest of the day.
                         eprintln!("OCR: skipping {}: {}", path.display(), error);
+                        self.activity
+                            .ocr_failed(format!("Skipped {} frame {}: {}", day, frame_number, error));
                         self.db
                             .record_ocr_frame(&day, frame_number, None)
                             .map_err(std::io::Error::other)?;
-                        summary.skipped += 1;
+                        false
                     }
+                };
+                if recognized {
+                    summary.recognized += 1;
+                } else {
+                    summary.skipped += 1;
                 }
+                self.activity.ocr_frame_handled(&day, frame_number, recognized);
             }
         }
 
@@ -299,20 +321,20 @@ impl OcrWorker {
     /// Read one frame if the screen changed. Returns whether it was read.
     fn handle_frame(&mut self, day: &str, frame_number: u32, path: &Path) -> Result<bool, String> {
         let thumbnail = Thumbnail::of(path)?;
-        self.read_if_changed(day, thumbnail, path, &|db, result| {
+        self.read_if_changed(day, thumbnail, &|| Ok(path.to_path_buf()), &|db, result| {
             db.record_ocr_frame(day, frame_number, result)
         })
     }
 
-    /// Run `image` through the recognizer if `thumbnail` differs from the
-    /// last frame read in `day`, and store the result with `record`. Returns
-    /// whether it was read.
+    /// Run the image `image` gives through the recognizer if `thumbnail`
+    /// differs from the last frame read in `day`, and store the result with
+    /// `record`. Returns whether it was read.
     fn read_if_changed(
         &mut self,
         day: &str,
         thumbnail: Thumbnail,
-        image: &Path,
-        record: &dyn Fn(&ScreenshotDatabase, Option<(&str, &str)>) -> rusqlite::Result<()>,
+        image: &dyn Fn() -> Result<PathBuf, String>,
+        record: &dyn Fn(&ScreenshotDatabase, Option<(&str, &[LineBox])>) -> rusqlite::Result<()>,
     ) -> Result<bool, String> {
         let changed = self
             .last_read
@@ -324,16 +346,26 @@ impl OcrWorker {
             return Ok(false);
         }
 
-        let lines = self.recognizer.recognize(image)?;
+        let lines = self.recognizer.recognize(&image()?)?;
+        // One line of text per box, so a line's own newlines go.
         let text = lines
             .iter()
-            .map(|line| line.text.as_str())
+            .map(|line| line.text.replace('\n', " "))
             .collect::<Vec<_>>()
             .join("\n");
-        let lines_json = serde_json::to_string(&lines).map_err(|e| e.to_string())?;
 
-        record(&self.db, Some((&text, &lines_json))).map_err(|e| e.to_string())?;
+        // Pixels change without the text changing (video, images, colours).
+        // A row already stands for every frame up to the next one, so the
+        // same text again needs no row of its own.
+        let result = if self.last_text.get(day) == Some(&text) {
+            None
+        } else {
+            Some(lines.iter().map(|l| [l.x, l.y, l.width, l.height]).collect::<Vec<_>>())
+        };
+        record(&self.db, result.as_deref().map(|boxes| (text.as_str(), boxes)))
+            .map_err(|e| e.to_string())?;
         self.last_read.insert(day.to_string(), thumbnail);
+        self.last_text.insert(day.to_string(), text);
         Ok(true)
     }
 
@@ -362,9 +394,13 @@ impl OcrWorker {
         keep_going: &mut dyn FnMut() -> bool,
     ) -> Result<PassSummary, String> {
         let mut summary = PassSummary::default();
+
+        // Listed up front, newest first, so the Activity window can say how
+        // many days are left. Probing a day's videos is cached after the
+        // first pass, so this is cheap from then on.
+        let mut pending = Vec::new();
         let mut days = videos.source.days().map_err(|e| e.to_string())?;
         days.reverse();
-
         for day in days {
             let done = match self.db.ocr_progress(&day).map_err(|e| e.to_string())? {
                 None => 0,
@@ -375,13 +411,20 @@ impl OcrWorker {
             else {
                 continue;
             };
+            let unread: Vec<_> = day_videos
+                .into_iter()
+                .filter(|video| video.first_index + video.frame_count > done)
+                .filter(|video| !videos.failed.contains(&video.path))
+                .collect();
+            if !unread.is_empty() {
+                pending.push((day, done, unread));
+            }
+        }
+        self.activity.ocr_video_pass_started(pending.len());
 
+        for (day, done, day_videos) in pending {
             for video in day_videos {
                 let end = video.first_index + video.frame_count;
-                if end <= done || videos.failed.contains(&video.path) {
-                    continue;
-                }
-
                 let mut stopped = false;
                 let mut failure = None;
                 let scratch = videos.scratch.as_path();
@@ -398,21 +441,32 @@ impl OcrWorker {
                             return false;
                         }
                         let position = (video.first_index + index + 1) as u32;
-                        match self.handle_video_frame(&day, position, &frame, scratch) {
-                            Ok(true) => summary.recognized += 1,
-                            Ok(false) => summary.skipped += 1,
-                            Err(error) => {
-                                // As for an unreadable screenshot: pass over
-                                // it so the rest of the day is not held back.
-                                eprintln!("OCR: skipping frame {} of {}: {}", position, day, error);
-                                let recorded = self.db.record_video_ocr_frame(&day, position, None);
-                                if let Err(error) = recorded {
-                                    failure = Some(error.to_string());
-                                    return false;
+                        let recognized =
+                            match self.handle_video_frame(&day, position, &frame, scratch) {
+                                Ok(recognized) => recognized,
+                                Err(error) => {
+                                    // As for an unreadable screenshot: pass
+                                    // over it so the rest of the day is not
+                                    // held back.
+                                    eprintln!("OCR: skipping frame {} of {}: {}", position, day, error);
+                                    self.activity.ocr_failed(format!(
+                                        "Skipped {} video frame {}: {}",
+                                        day, position, error
+                                    ));
+                                    let recorded = self.db.record_video_ocr_frame(&day, position, None);
+                                    if let Err(error) = recorded {
+                                        failure = Some(error.to_string());
+                                        return false;
+                                    }
+                                    false
                                 }
-                                summary.skipped += 1;
-                            }
+                            };
+                        if recognized {
+                            summary.recognized += 1;
+                        } else {
+                            summary.skipped += 1;
                         }
+                        self.activity.ocr_frame_handled(&day, position, recognized);
                         true
                     },
                 );
@@ -433,6 +487,8 @@ impl OcrWorker {
                         .map_err(|e| e.to_string())?,
                     Err(error) => {
                         eprintln!("OCR: cannot decode {}: {}", video.path.display(), error);
+                        self.activity
+                            .ocr_failed(format!("Cannot decode {}: {}", video.path.display(), error));
                         videos.failed.insert(video.path.clone());
                         // Later videos would move the mark past this one's
                         // unread frames.
@@ -453,12 +509,12 @@ impl OcrWorker {
         scratch: &Path,
     ) -> Result<bool, String> {
         let thumbnail = Thumbnail::of_rgb(frame)?;
-        // Only written when it is going to be read.
-        let image = scratch.join("video-frame.png");
-        let changed = self.last_read.get(day).map_or(true, |last| thumbnail.differs_from(last));
-        if changed {
-            write_png(&image, frame)?;
-        }
+        // Written only when it is going to be read.
+        let image = || {
+            let path = scratch.join("video-frame.png");
+            write_png(&path, frame)?;
+            Ok(path)
+        };
         self.read_if_changed(day, thumbnail, &image, &|db, result| {
             db.record_video_ocr_frame(day, position, result)
         })
@@ -485,8 +541,13 @@ fn write_png(path: &Path, frame: &RawFrame) -> Result<(), String> {
 /// app. Returns `false` on platforms without a text recognizer. Days that
 /// only exist as video are read too when there is a `work_dir` (outside the
 /// library) for decoded frames.
-pub fn start_background_ocr(root: PathBuf, work_dir: Option<PathBuf>) -> bool {
+pub fn start_background_ocr(
+    root: PathBuf,
+    work_dir: Option<PathBuf>,
+    activity: Arc<Activity>,
+) -> bool {
     let Some(recognizer) = system_recognizer() else {
+        activity.ocr_unavailable();
         return false;
     };
 
@@ -519,7 +580,7 @@ pub fn start_background_ocr(root: PathBuf, work_dir: Option<PathBuf>) -> bool {
                     }
                 }
             });
-            let mut worker = OcrWorker::new(root, db, recognizer);
+            let mut worker = OcrWorker::new(root, db, recognizer).reporting_to(activity);
             if let Some(videos) = videos {
                 worker = worker.with_videos(videos);
             }
@@ -540,9 +601,14 @@ fn lower_thread_priority() {
 }
 
 fn run_forever(worker: &mut OcrWorker) {
+    let activity = Arc::clone(&worker.activity);
+    let sleep = |state: State, wait: Duration| {
+        activity.ocr_sleeps(state, wait);
+        std::thread::sleep(wait);
+    };
     loop {
         if !on_ac_power() {
-            std::thread::sleep(BATTERY_SLEEP);
+            sleep(State::OnBattery, BATTERY_SLEEP);
             continue;
         }
 
@@ -560,10 +626,11 @@ fn run_forever(worker: &mut OcrWorker) {
                 "OCR: read {} {}, skipped {} unchanged",
                 summary.recognized, kind, summary.skipped
             ),
-            Ok(_) => std::thread::sleep(IDLE_SLEEP),
+            Ok(_) => sleep(State::Idle, IDLE_SLEEP),
             Err(error) => {
                 eprintln!("OCR pass failed: {}", error);
-                std::thread::sleep(IDLE_SLEEP);
+                activity.ocr_failed(format!("Pass failed: {}", error));
+                sleep(State::Idle, IDLE_SLEEP);
             }
         }
     }
@@ -668,6 +735,7 @@ mod vision {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::converter::Frame;
     use image::{GrayImage, Luma};
     use std::cell::RefCell;
     use std::fs::{File, FileTimes};
@@ -749,11 +817,17 @@ mod tests {
 
     impl Library {
         fn new() -> Library {
+            let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            Library::with(seen.clone(), Box::new(FakeRecognizer { seen }))
+        }
+
+        fn with(
+            seen: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+            recognizer: Box<dyn TextRecognizer>,
+        ) -> Library {
             let temp_dir = TempDir::new().unwrap();
             let root = temp_dir.path().to_path_buf();
             let db = ScreenshotDatabase::new(root.join("screenshots.db")).unwrap();
-            let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-            let recognizer = Box::new(FakeRecognizer { seen: seen.clone() });
             let worker = OcrWorker::new(root.clone(), db, recognizer);
             Library { _temp_dir: temp_dir, root, seen, worker }
         }
@@ -771,6 +845,26 @@ mod tests {
         fn done_through(&self, day: &str) -> Option<u32> {
             self.worker.db.ocr_done_through(day).unwrap()
         }
+    }
+
+    #[test]
+    fn reports_progress_to_the_activity_window() {
+        let mut library = Library::new();
+        let activity = Arc::new(Activity::default());
+        let db = ScreenshotDatabase::new(library.root.join("screenshots.db")).unwrap();
+        library.worker = OcrWorker::new(library.root.clone(), db, Box::new(SameText))
+            .reporting_to(Arc::clone(&activity));
+        frame(&library.root, DAY_1, 1, 0, false);
+        frame(&library.root, DAY_1, 2, 0, false);
+        frame(&library.root, DAY_1, 3, 0, true);
+
+        library.pass();
+
+        let ocr = activity.snapshot(false, || true).ocr;
+        assert_eq!((ocr.recognized, ocr.skipped), (1, 1));
+        assert_eq!(ocr.current.map(|f| (f.day, f.number)), Some((DAY_1.to_string(), 2)));
+        // The fresh frame waits for the next pass.
+        assert_eq!(ocr.remaining, 1);
     }
 
     #[test]
@@ -811,6 +905,46 @@ mod tests {
 
         // Nothing new, nothing done.
         assert_eq!(library.pass(), PassSummary::default());
+    }
+
+    /// Reads the same text off every frame.
+    struct SameText;
+
+    impl TextRecognizer for SameText {
+        fn recognize(&self, _image: &Path) -> Result<Vec<OcrLine>, String> {
+            Ok(vec![OcrLine {
+                text: "a video\nplaying".into(),
+                confidence: 1.0,
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+            }])
+        }
+    }
+
+    #[test]
+    fn same_text_again_gets_no_row() {
+        let mut library = Library::with(Default::default(), Box::new(SameText));
+        frame(&library.root, DAY_1, 1, 0, false);
+        frame(&library.root, DAY_1, 2, 200, false);
+        frame(&library.root, DAY_1, 3, 0, false);
+        frame(&library.root, DAY_2, 1, 0, false);
+
+        let summary = library.pass();
+
+        // The pixels changed each time, so every frame was read.
+        assert_eq!(summary, PassSummary { recognized: 4, skipped: 0 });
+        assert_eq!(library.done_through(DAY_1), Some(3));
+        let db = &library.worker.db;
+        // Vision's one line with a newline in it stays one line.
+        assert_eq!(
+            db.ocr_lines(DAY_1, 1).unwrap(),
+            Some(("a video playing".to_string(), vec![[0.0, 0.0, 1.0, 1.0]]))
+        );
+        assert_eq!(db.ocr_lines(DAY_1, 2).unwrap(), None);
+        assert_eq!(db.ocr_lines(DAY_1, 3).unwrap(), None);
+        assert!(db.ocr_lines(DAY_2, 1).unwrap().is_some());
     }
 
     #[test]
@@ -912,27 +1046,33 @@ mod tests {
     }
 
     #[test]
-    fn delete_check_waits_for_ocr() {
+    fn ocr_check_waits_for_ocr() {
         let temp_dir = TempDir::new().unwrap();
         let root = temp_dir.path();
-        let check = delete_check(root);
-        let batch = |frames: &[&str]| HourBatch {
+        let check = ocr_check(root);
+        let batch = |numbers: &[u32]| HourBatch {
             day: DAY_1.to_string(),
             hour: 9,
-            start: chrono::Local::now(),
+            start: chrono::Local::now().naive_local(),
             part: 0,
-            frames: frames.iter().map(|name| root.join(DAY_1).join(name)).collect(),
+            frames: numbers
+                .iter()
+                .map(|&number| Frame {
+                    number,
+                    path: root.join(DAY_1).join(format!("{:05}.png", number)),
+                    modified: chrono::Local::now(),
+                })
+                .collect(),
         };
 
-        assert!(!check(&batch(&["00001.png", "00002.png"])));
+        assert!(!check(&batch(&[1, 2])));
 
         // OCR's own connection records progress; the check sees it.
         let db = ScreenshotDatabase::new(root.join("screenshots.db")).unwrap();
         db.record_ocr_frame(DAY_1, 2, None).unwrap();
 
-        assert!(check(&batch(&["00001.png", "00002.png"])));
-        assert!(!check(&batch(&["00002.png", "00003.png"])));
-        assert!(!check(&batch(&["00001.png", "notes.png"])));
+        assert!(check(&batch(&[1, 2])));
+        assert!(!check(&batch(&[2, 3])));
     }
 
     /// Encode `blocks` (see `write_frame`) as a 15 fps video at `path`, or
@@ -1003,15 +1143,11 @@ mod tests {
             .map(|hit| (hit.day, hit.frame_number, hit.from_video))
             .collect();
         hits.sort();
+        // The fake reads the same text off every video frame, so each day
+        // keeps only its first row.
         assert_eq!(
             hits,
-            vec![
-                (DAY_1.to_string(), 1, true),
-                (DAY_1.to_string(), 3, true),
-                (DAY_1.to_string(), 5, true),
-                (DAY_2.to_string(), 1, true),
-                (DAY_2.to_string(), 2, true),
-            ]
+            vec![(DAY_1.to_string(), 1, true), (DAY_2.to_string(), 1, true)]
         );
 
         // Done is done.
@@ -1067,7 +1203,6 @@ mod tests {
         }
         assert!(!lines.is_empty());
     }
-
     /// Runs a real video pass over a library named by `OCR_TEST_LIBRARY`,
     /// reading at most `OCR_TEST_FRAMES` frames (default 900) of its newest
     /// video-only day. The library is only read; the database and decoded

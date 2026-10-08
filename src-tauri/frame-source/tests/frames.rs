@@ -5,8 +5,10 @@
 use std::fs;
 use std::path::Path;
 use std::process::Command;
+use std::sync::mpsc;
+use std::time::Duration;
 
-use frame_source::{FrameSource, Source, Tools, CHUNK_FRAMES};
+use frame_source::{FrameRange, FrameSource, Source, Tools, CHUNK_FRAMES, READ_AHEAD_FRAMES};
 use tempfile::TempDir;
 
 const LEVEL_STEP: usize = 4;
@@ -284,6 +286,239 @@ fn stitches_converted_hours_and_remaining_screenshots_in_time_order() {
     );
 }
 
+/// Record `times` as the converter's `video_frames` rows for `video`.
+fn record_video(root: &Path, video: &str, times: &[&str]) {
+    let conn = rusqlite::Connection::open(root.join("screenshots.db")).unwrap();
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS video_frames (video TEXT, frame_index INTEGER, day TEXT,
+                                                  frame_number INTEGER, local_time TEXT)",
+        [],
+    )
+    .unwrap();
+    for (index, time) in times.iter().enumerate() {
+        conn.execute(
+            "INSERT INTO video_frames VALUES (?1, ?2, substr(?1, 1, 10), ?2 + 1, ?3)",
+            rusqlite::params![video, index, time],
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn times_hourly_videos_from_the_frames_the_converter_recorded() {
+    let lib = Library::new();
+    let root = lib.root.path();
+    make_video(&root.join("2026-10-04--09-00-05--hourly.mov"), 3, 0);
+    // The screen was locked from 09:00:07 to 09:40, so one second per frame
+    // would put the last frame at 09:00:07.
+    write_db(root, &[]);
+    record_video(
+        root,
+        "2026-10-04--09-00-05--hourly.mov",
+        &[
+            "2026-10-04T09:00:05.3+02:00",
+            "2026-10-04T09:00:06.7+02:00",
+            "2026-10-04T09:40:00.1+02:00",
+        ],
+    );
+    let source = lib.source(u64::MAX);
+
+    let time = |index| source.frame_time("2026-10-04", index).unwrap().unwrap();
+    assert_eq!(
+        (time(0).local_time.as_str(), time(0).exact),
+        ("2026-10-04T09:00:05.3+02:00", true)
+    );
+    assert_eq!(
+        (time(2).local_time.as_str(), time(2).exact),
+        ("2026-10-04T09:40:00.1+02:00", true)
+    );
+}
+
+#[test]
+fn ignores_a_record_that_does_not_match_the_video() {
+    let lib = Library::new();
+    let root = lib.root.path();
+    make_video(&root.join("2026-10-04--09-00-05--hourly.mov"), 3, 0);
+    write_db(root, &[]);
+    record_video(
+        root,
+        "2026-10-04--09-00-05--hourly.mov",
+        &["2026-10-04T09:00:05.3+02:00", "2026-10-04T09:40:00.1+02:00"],
+    );
+    let source = lib.source(u64::MAX);
+
+    let time = source.frame_time("2026-10-04", 1).unwrap().unwrap();
+    assert_eq!((time.local_time.as_str(), time.exact), ("2026-10-04T09:00:06", false));
+}
+
+#[test]
+fn lines_up_unrecorded_hourly_videos_with_the_database() {
+    let lib = Library::new();
+    let root = lib.root.path();
+    // Converted before frames were recorded. Named after its first frame's
+    // file time; each row is written a moment after its file.
+    make_video(&root.join("2026-10-04--09-00-05--hourly.mov"), 3, 0);
+    write_db(
+        root,
+        &[
+            "2026-10-04T08:59:59.9+02:00", // the hour before
+            "2026-10-04T09:00:03.6+02:00", // deleted before the conversion
+            "2026-10-04T09:00:05.9+02:00",
+            "2026-10-04T09:00:07.3+02:00",
+            "2026-10-04T09:40:00.1+02:00", // after the screen was locked
+            "2026-10-04T10:00:00.5+02:00", // the next hour
+        ],
+    );
+    let source = lib.source(u64::MAX);
+
+    let time = |index| {
+        let time = source.frame_time("2026-10-04", index).unwrap().unwrap();
+        assert!(!time.exact);
+        time.local_time
+    };
+    assert_eq!(
+        [time(0), time(1), time(2)],
+        [
+            "2026-10-04T09:00:05.9+02:00",
+            "2026-10-04T09:00:07.3+02:00",
+            "2026-10-04T09:40:00.1+02:00"
+        ]
+    );
+}
+
+#[test]
+fn reports_video_frames_that_are_not_decoded_yet() {
+    let lib = Library::new();
+    let root = lib.root.path();
+    let day_dir = root.join("2026-10-04");
+    fs::create_dir(&day_dir).unwrap();
+    // 09:00 is video, two chunks and a bit; 10:00 is still screenshots.
+    let long = 2 * CHUNK_FRAMES + 10;
+    make_video(&root.join("2026-10-04--09-00-00--hourly.mov"), long, 0);
+    write_shot(&day_dir, "03601.png", b"ten", "2026-10-04 10:00:00");
+    make_video(&root.join("2026-10-04--11-00-00--hourly.mov"), 5, 0);
+    let source = lib.source(u64::MAX);
+    let range = |start, end| FrameRange { start, end };
+
+    assert_eq!(source.pending("2026-10-04").unwrap().frame_count, long + 6);
+    // Nothing decoded: both videos are pending, the screenshot between them isn't.
+    assert_eq!(
+        source.pending("2026-10-04").unwrap().ranges,
+        vec![range(0, long), range(long + 1, long + 6)]
+    );
+
+    // Showing a frame decodes its whole chunk.
+    source.frame("2026-10-04", CHUNK_FRAMES + 3).unwrap();
+    assert_eq!(
+        source.pending("2026-10-04").unwrap().ranges,
+        vec![
+            range(0, CHUNK_FRAMES),
+            range(2 * CHUNK_FRAMES, long),
+            range(long + 1, long + 6),
+        ]
+    );
+
+    source.frame("2026-10-04", long + 1).unwrap();
+    assert_eq!(
+        source.pending("2026-10-04").unwrap().ranges,
+        vec![range(0, CHUNK_FRAMES), range(2 * CHUNK_FRAMES, long)]
+    );
+
+    // A chunk cleared from the cache behind the source's back is pending again.
+    for video in fs::read_dir(lib.cache.path()).unwrap() {
+        let chunk = video.unwrap().path().join("000000");
+        if chunk.is_dir() {
+            fs::remove_dir_all(chunk).unwrap();
+        }
+    }
+    assert_eq!(
+        source.pending("2026-10-04").unwrap().ranges,
+        vec![
+            range(0, CHUNK_FRAMES),
+            range(2 * CHUNK_FRAMES, long),
+            range(long + 1, long + 6)
+        ]
+    );
+}
+
+#[test]
+fn reads_ahead_into_the_next_chunk_before_the_viewer_gets_there() {
+    let lib = Library::new();
+    make_video(
+        &lib.root.path().join("2024-12-20--09-00-00.mov"),
+        3 * CHUNK_FRAMES,
+        0,
+    );
+    let (decoded, read_ahead) = mpsc::channel();
+    let source = lib.source(u64::MAX).read_ahead(move |date| {
+        decoded.send(date.to_owned()).unwrap();
+    });
+    let range = |start, end| FrameRange { start, end };
+    let wait = || {
+        read_ahead
+            .recv_timeout(Duration::from_secs(60))
+            .expect("read-ahead should decode a chunk")
+    };
+
+    // Mid-chunk, moving forward: nothing to read ahead yet.
+    source.frame("2024-12-20", 0).unwrap();
+    source.frame("2024-12-20", 10).unwrap();
+    // Within READ_AHEAD_FRAMES of the next chunk: it gets decoded without
+    // being asked for.
+    source.frame("2024-12-20", CHUNK_FRAMES - READ_AHEAD_FRAMES).unwrap();
+    assert_eq!(wait(), "2024-12-20");
+    assert_eq!(
+        source.pending("2024-12-20").unwrap().ranges,
+        vec![range(2 * CHUNK_FRAMES, 3 * CHUNK_FRAMES)]
+    );
+    // And its frames are the right ones.
+    assert_frame(
+        &source,
+        "2024-12-20",
+        CHUNK_FRAMES + 7,
+        (CHUNK_FRAMES + 7) * LEVEL_STEP % 256,
+        lib.scratch.path(),
+    );
+}
+
+#[test]
+fn reads_back_from_the_end_of_a_day_it_opens_on() {
+    let lib = Library::new();
+    // Two sessions: 200 frames, then 40.
+    make_video(&lib.root.path().join("2024-12-20--09-00-00.mov"), 200, 0);
+    make_video(&lib.root.path().join("2024-12-20--17-05-22.mov"), 40, 100);
+    let (decoded, read_ahead) = mpsc::channel();
+    let source = lib.source(u64::MAX).read_ahead(move |date| {
+        decoded.send(date.to_owned()).unwrap();
+    });
+
+    // The viewer opens a day on its last frame; the first video's two
+    // chunks are both within reach behind it.
+    source.frame("2024-12-20", 239).unwrap();
+    for _ in 0..2 {
+        read_ahead
+            .recv_timeout(Duration::from_secs(60))
+            .expect("read-ahead should decode a chunk");
+    }
+    assert_eq!(source.pending("2024-12-20").unwrap().ranges, vec![]);
+}
+
+#[test]
+fn plays_the_parts_of_an_hour_in_order_when_they_start_together() {
+    let lib = Library::new();
+    let root = lib.root.path();
+    // Frames written after midnight are filed at 23:59:59, so every part of
+    // such an hour has the same start.
+    make_video(&root.join("2026-10-04--23-59-59--hourly-2.mov"), 1, 100);
+    make_video(&root.join("2026-10-04--23-59-59--hourly.mov"), 2, 0);
+    let source = lib.source(u64::MAX);
+
+    let scratch = lib.scratch.path();
+    assert_frame(&source, "2026-10-04", 0, 0, scratch);
+    assert_frame(&source, "2026-10-04", 1, LEVEL_STEP, scratch);
+    assert_frame(&source, "2026-10-04", 2, 100, scratch);
+}
+
 #[test]
 fn serves_a_fully_converted_day_from_its_hourly_videos() {
     let lib = Library::new();
@@ -382,4 +617,91 @@ fn streams_every_frame_of_a_video_only_day() {
     fs::create_dir_all(&day_dir).unwrap();
     write_shot(&day_dir, "00001.png", b"png", "2024-12-20 09:00:00");
     assert!(source.video_only_day("2024-12-20").unwrap().is_none());
+}
+
+#[test]
+fn finds_frames_by_number_in_screenshots_and_converted_hours() {
+    let lib = Library::new();
+    let root = lib.root.path();
+    let day_dir = root.join("2026-10-04");
+    fs::create_dir(&day_dir).unwrap();
+    // 09:00 held frames 1-3 and was converted in two parts; 10:00 is still
+    // screenshots, with a gap where frame 5 was deleted.
+    make_video(&root.join("2026-10-04--09-00-05--hourly.mov"), 2, 0);
+    make_video(&root.join("2026-10-04--09-40-00--hourly-2.mov"), 1, 100);
+    write_shot(&day_dir, "00004.png", b"four", "2026-10-04 10:00:00");
+    write_shot(&day_dir, "00006.png", b"six", "2026-10-04 10:00:02");
+    let conn = rusqlite::Connection::open(root.join("screenshots.db")).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE screenshots (id INTEGER PRIMARY KEY, day TEXT, frame_number INTEGER, local_time TEXT);
+         INSERT INTO screenshots (day, frame_number, local_time) VALUES
+             ('2026-10-04', 1, '2026-10-04T09:00:05+02:00'),
+             ('2026-10-04', 2, '2026-10-04T09:00:06+02:00'),
+             ('2026-10-04', 3, '2026-10-04T09:40:00+02:00'),
+             ('2026-10-04', 4, '2026-10-04T10:00:00+02:00'),
+             ('2026-10-04', 6, '2026-10-04T10:00:02+02:00'),
+             ('2026-10-05', 1, '2026-10-05T09:00:00+02:00');",
+    )
+    .unwrap();
+    let source = lib.source(u64::MAX);
+
+    assert_eq!(
+        source
+            .indices_of_frames("2026-10-04", &[6, 1, 3, 4, 5, 2, 99])
+            .unwrap(),
+        vec![Some(4), Some(0), Some(2), Some(3), None, Some(1), None]
+    );
+}
+
+#[test]
+fn finds_frames_on_legacy_days_by_their_database_rank() {
+    let lib = Library::new();
+    make_video(&lib.root.path().join("2025-12-01--23-00-00.mov"), 3, 0);
+    make_video(&lib.root.path().join("2025-12-02--23-00-00.mov"), 3, 0);
+    // Frame 3 was a deleted black frame, so the video's third frame is 4.
+    write_db(lib.root.path(), &[]);
+    let conn = rusqlite::Connection::open(lib.root.path().join("screenshots.db")).unwrap();
+    conn.execute_batch(
+        "INSERT INTO screenshots (frame_number, local_time) VALUES
+             (1, '2025-12-01T09:00:00'), (2, '2025-12-01T09:00:01'), (4, '2025-12-01T09:00:03'),
+             (1, '2025-12-02T09:00:00');",
+    )
+    .unwrap();
+    let source = lib.source(u64::MAX);
+
+    assert_eq!(
+        source.indices_of_frames("2025-12-01", &[1, 4, 3]).unwrap(),
+        vec![Some(0), Some(2), None]
+    );
+    // One row for three frames: the rows can't say which frame is which.
+    assert_eq!(source.indices_of_frames("2025-12-02", &[1]).unwrap(), vec![None]);
+}
+
+#[test]
+fn finds_frames_in_recorded_videos_exactly() {
+    let lib = Library::new();
+    let root = lib.root.path();
+    // 09:00 was recorded by the converter (frames 1-3); 10:00 was converted
+    // before it recorded frames, so it falls back to the hour's rows.
+    make_video(&root.join("2026-10-04--09-00-05--hourly.mov"), 3, 0);
+    make_video(&root.join("2026-10-04--10-00-00--hourly.mov"), 2, 0);
+    record_video(
+        root,
+        "2026-10-04--09-00-05--hourly.mov",
+        &["2026-10-04T09:00:05", "2026-10-04T09:00:06", "2026-10-04T09:30:00"],
+    );
+    let conn = rusqlite::Connection::open(root.join("screenshots.db")).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE screenshots (id INTEGER PRIMARY KEY, day TEXT, frame_number INTEGER, local_time TEXT);
+         INSERT INTO screenshots (day, frame_number, local_time) VALUES
+             ('2026-10-04', 10, '2026-10-04T10:00:00'),
+             ('2026-10-04', 11, '2026-10-04T10:00:01');",
+    )
+    .unwrap();
+    let source = lib.source(u64::MAX);
+
+    assert_eq!(
+        source.indices_of_frames("2026-10-04", &[3, 11, 1, 10, 4]).unwrap(),
+        vec![Some(2), Some(4), Some(0), Some(3), None]
+    );
 }

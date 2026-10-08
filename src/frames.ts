@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 /** What the frame source knows about one day. Mirrors `DaySummary` in Rust. */
 export type Day = {
@@ -16,6 +17,12 @@ export type FrameTime = {
   exact: boolean;
 };
 
+/** Day-wide frame indices `start..end` (end exclusive). Mirrors `FrameRange` in Rust. */
+export type FrameRange = {
+  start: number;
+  end: number;
+};
+
 export function listDays(): Promise<Array<string>> {
   return invoke<Array<string>>("list_days");
 }
@@ -29,6 +36,26 @@ export function getFrameTime(
   index: number,
 ): Promise<FrameTime | null> {
   return invoke<FrameTime | null>("get_frame_time", { date, index });
+}
+
+/** Mirrors `PendingFrames` in Rust. */
+export type PendingFrames = {
+  /** The day's frame count when the ranges were found. */
+  frameCount: number;
+  ranges: Array<FrameRange>;
+};
+
+/** The stretches of `date` that still have to be decoded from video. */
+export function getPendingFrames(date: string): Promise<PendingFrames> {
+  return invoke<PendingFrames>("get_pending_frames", { date });
+}
+
+/**
+ * Calls `handler` with a day's date whenever the frame source has decoded a
+ * stretch of it ahead of the viewer, without being asked for a frame there.
+ */
+export function onFramesDecoded(handler: (date: string) => void): Promise<UnlistenFn> {
+  return listen<string>("frames-decoded", (event) => handler(event.payload));
 }
 
 /**

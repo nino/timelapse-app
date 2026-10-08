@@ -85,6 +85,18 @@ fn parse_rate(value: &str) -> Option<f64> {
     (rate > 0.0).then_some(rate * scale)
 }
 
+/// How urgently a decode is wanted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Priority {
+    /// Someone is waiting for this frame.
+    Now,
+    /// Read-ahead: runs at a lower CPU priority (nice 10), so it gives way to
+    /// decodes someone is waiting for and to the capture loop. Not
+    /// background-throttled like the converter's encodes, because the viewer
+    /// may reach the chunk and wait for it to finish.
+    Background,
+}
+
 /// Decode `count` frames starting at frame `first` into `out_dir` as
 /// `0001.jpg`, `0002.jpg`, …, returning how many were written (fewer than
 /// `count` at the end of the video).
@@ -95,10 +107,15 @@ pub fn extract_frames(
     first: usize,
     count: usize,
     out_dir: &Path,
+    priority: Priority,
 ) -> Result<usize, Error> {
     fs::create_dir_all(out_dir)?;
     let seek = seek_to(first, info);
-    let output = Command::new(&tools.ffmpeg)
+    let mut command = Command::new(&tools.ffmpeg);
+    if priority == Priority::Background {
+        lower_priority(&mut command);
+    }
+    let output = command
         .args(["-v", "error", "-nostdin", "-ss", &format!("{seek:.6}")])
         .arg("-i")
         .arg(video)
@@ -131,8 +148,8 @@ pub struct RawFrame<'a> {
 /// `on_frame` with its index in the video, without writing anything to disk.
 /// Stops early, killing ffmpeg, when `on_frame` returns false.
 ///
-/// This is for bulk work that reads a whole video once, such as OCR, so on
-/// macOS ffmpeg runs under `taskpolicy -b` like the converter's encodes.
+/// This is for bulk work that reads a whole video once, such as OCR, so
+/// ffmpeg always runs at background priority.
 pub fn stream_frames(
     tools: &Tools,
     video: &Path,
@@ -140,13 +157,8 @@ pub fn stream_frames(
     first: usize,
     on_frame: &mut dyn FnMut(usize, RawFrame) -> bool,
 ) -> Result<(), Error> {
-    let mut command = if cfg!(target_os = "macos") {
-        let mut command = Command::new("taskpolicy");
-        command.arg("-b").arg(&tools.ffmpeg);
-        command
-    } else {
-        Command::new(&tools.ffmpeg)
-    };
+    let mut command = Command::new(&tools.ffmpeg);
+    lower_priority(&mut command);
     // PPM rather than raw video: each frame carries its own size, so nothing
     // has to be probed first.
     let mut child = command
@@ -246,6 +258,23 @@ fn seek_to(first: usize, info: VideoInfo) -> f64 {
         (first as f64 - 0.25) / info.fps
     }
 }
+
+#[cfg(unix)]
+fn lower_priority(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: setpriority is a single system call, safe between fork and exec.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpriority(libc::PRIO_PROCESS, 0, 10) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(unix))]
+fn lower_priority(_command: &mut Command) {}
 
 #[cfg(test)]
 mod tests {

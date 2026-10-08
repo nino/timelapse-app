@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# A new push to a PR supersedes the run on its previous commit. Runs on main
+# are never cancelled, so every merged commit gets a result.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: oven-sh/setup-bun@v2
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Lint
+        run: bun run lint
+
+      - name: Type-check and build
+        run: bun run build
+
+      - name: Test
+        run: bun test
+
+  rust:
+    # macOS, because that is what the app ships for: it compiles the
+    # macOS-only code (Apple Vision OCR, taskpolicy) and tests against the
+    # ffmpeg the app bundles rather than one from a package manager.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: oven-sh/setup-bun@v2
+
+      # Dependencies only, keyed on Cargo.lock and the compiler version: the
+      # app's own crates are cleaned out before saving, since they change on
+      # every commit anyway. Saved even when the job fails, so a red run still
+      # leaves the next one a warm cache. CI and the release job keep separate
+      # caches, because only the release job also builds the release profile.
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          shared-key: ci
+          cache-on-failure: true
+
+      - name: Install frontend dependencies
+        run: bun install --frozen-lockfile
+
+      # tauri::generate_context! fails to compile when frontendDist (../dist)
+      # does not exist.
+      - name: Build the frontend
+        run: bun run build
+
+      # build.rs refuses to compile without the ffmpeg sidecar. The tests run
+      # `ffmpeg` from PATH (paths::ffmpeg() falls back to it outside the app
+      # bundle), so the sidecar is put on PATH too.
+      - name: Fetch the bundled ffmpeg
+        run: |
+          bun run fetch:ffmpeg
+          triple=$(rustc -vV | sed -n 's/^host: //p')
+          mkdir -p "$RUNNER_TEMP/bin"
+          ln -sf "$PWD/src-tauri/binaries/ffmpeg-$triple" "$RUNNER_TEMP/bin/ffmpeg"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Test the app and the frame-source crate
+        working-directory: src-tauri
+        run: |
+          which ffmpeg
+          cargo test --workspace

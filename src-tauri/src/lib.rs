@@ -1,17 +1,25 @@
+mod activity;
 mod converter;
 mod timelapse;
 mod database;
 mod ocr;
 mod paths;
+mod settings;
+mod updater;
 
-use frame_source::{DaySummary, FrameSource, FrameTime, Tools};
+use frame_source::{DaySummary, FrameSource, FrameTime, PendingFrames, Tools};
 use tauri::http::{header, Response, StatusCode};
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use tauri::{Manager, State};
-use database::{OcrHit, ScreenshotDatabase};
+use tauri::menu::{Menu, MenuItem, MenuItemKind, PredefinedMenuItem, WINDOW_SUBMENU_ID};
+use tauri::{AppHandle, Emitter, Manager, Runtime, State, WebviewUrl, WebviewWindowBuilder};
+use activity::{Activity, Snapshot};
+use database::{OcrHit, OcrProgress, ScreenshotDatabase};
+use serde::Serialize;
+use settings::{Settings, SettingsStore};
 use timelapse::Photographer;
+use updater::UpdaterState;
 
 // Shared state to manage the timelapse photographer
 type PhotographerState = Arc<Mutex<Option<Photographer>>>;
@@ -20,9 +28,22 @@ type PhotographerState = Arc<Mutex<Option<Photographer>>>;
 /// resolved the cache directory.
 type FrameSourceState = Arc<FrameSource>;
 
+/// What capture, conversion and OCR are doing, for the Activity window.
+type ActivityState = Arc<Activity>;
+
+/// Label of the Activity window, and id of the menu item that opens it.
+const ACTIVITY_WINDOW: &str = "activity";
+/// Label of the Settings window, and id of the menu item that opens it.
+const SETTINGS_WINDOW: &str = "settings";
+/// Id of the "Check for Updates…" menu item.
+const CHECK_FOR_UPDATES: &str = "check-for-updates";
+
 /// Decoded video frames are disposable, so the cache lives in the OS cache
 /// directory rather than in the (possibly synced) library.
 const FRAME_CACHE_CAP_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Event sent with a day's date when read-ahead has decoded a chunk of it.
+const FRAMES_DECODED: &str = "frames-decoded";
 
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 #[tauri::command]
@@ -115,9 +136,15 @@ fn get_screenshot_metadata_impl(
 }
 
 #[tauri::command]
-async fn start_timelapse(state: State<'_, PhotographerState>) -> Result<String, String> {
+async fn start_timelapse(
+    state: State<'_, PhotographerState>,
+    activity: State<'_, ActivityState>,
+) -> Result<String, String> {
+    let activity = Arc::clone(activity.inner());
     start_timelapse_impl(state.inner(), || {
-        Photographer::new().map_err(|e| e.to_string())
+        Photographer::new()
+            .map(|photographer| photographer.reporting_to(activity))
+            .map_err(|e| e.to_string())
     })
 }
 
@@ -143,6 +170,15 @@ async fn clear_error_logs(state: State<'_, PhotographerState>) -> Result<String,
     clear_error_logs_impl(state.inner())
 }
 
+/// Run blocking work (ffmpeg, SQLite) off the async runtime's worker threads.
+async fn run_blocking<T: Send + 'static>(
+    f: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    tauri::async_runtime::spawn_blocking(f)
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 /// Run a blocking frame-source call (it may shell out to ffmpeg) off the
 /// async runtime's worker threads.
 async fn with_frame_source<T: Send + 'static>(
@@ -150,10 +186,7 @@ async fn with_frame_source<T: Send + 'static>(
     f: impl FnOnce(&FrameSource) -> Result<T, frame_source::Error> + Send + 'static,
 ) -> Result<T, String> {
     let source = Arc::clone(source);
-    tauri::async_runtime::spawn_blocking(move || f(&source))
-        .await
-        .map_err(|e| e.to_string())?
-        .map_err(|e| e.to_string())
+    run_blocking(move || f(&source).map_err(|e| e.to_string())).await
 }
 
 /// Every day with frames, oldest first.
@@ -174,6 +207,15 @@ async fn get_frame_time(
     index: usize,
 ) -> Result<Option<FrameTime>, String> {
     with_frame_source(source.inner(), move |s| s.frame_time(&date, index)).await
+}
+
+/// Frame ranges of `date` that still have to be decoded from video.
+#[tauri::command]
+async fn get_pending_frames(
+    source: State<'_, FrameSourceState>,
+    date: String,
+) -> Result<PendingFrames, String> {
+    with_frame_source(source.inner(), move |s| s.pending(&date)).await
 }
 
 /// The response for a `frames://localhost/<YYYY-MM-DD>/<index>` request.
@@ -232,6 +274,182 @@ async fn search_ocr(query: String, limit: Option<u32>) -> Result<Vec<OcrHit>, St
     search_ocr_impl(&timelapse_root, &query, limit.unwrap_or(100))
 }
 
+/// Where one OCR match sits on a day's scrubber.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DayMatch {
+    /// The OCR'd frame whose text matched.
+    index: usize,
+    /// One past the last frame that frame's text stands for (OCR skips frames
+    /// that look the same as the last one it read).
+    end_index: usize,
+    /// The OCR'd frame's number, to ask `get_match_lines` for its lines.
+    frame: u32,
+}
+
+/// The read-only library database in `root`, or `None` before it exists.
+fn library_db(root: &Path) -> Result<Option<ScreenshotDatabase>, String> {
+    ScreenshotDatabase::open_read_only(root.join("screenshots.db")).map_err(|e| e.to_string())
+}
+
+/// Every place on `date`'s scrubber where OCR read text matching `query`, in
+/// order. Matches whose frame the day no longer has are left out.
+fn search_ocr_day_impl(
+    root: &Path,
+    source: &FrameSource,
+    date: &str,
+    query: &str,
+) -> Result<Vec<DayMatch>, String> {
+    let Some(db) = library_db(root)? else {
+        return Ok(Vec::new());
+    };
+    let found = db.search_ocr_in_day(date, query).map_err(|e| e.to_string())?;
+    if found.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // For each match: its own frame, then where its run ends. That is the next
+    // OCR'd frame (exclusive) or, if that one is gone, the frame just before
+    // it (inclusive); for the day's last OCR'd frame, the last frame OCR
+    // handled (inclusive).
+    let numbers: Vec<u32> = found
+        .iter()
+        .flat_map(|m| match m.next_frame {
+            Some(next) => [m.frame_number, next, next - 1],
+            None => {
+                let last = m.done_through.unwrap_or(m.frame_number);
+                [m.frame_number, last, last]
+            }
+        })
+        .collect();
+    // A day OCR read from video (see `ocr::OcrWorker::run_video_pass`)
+    // recorded 1-based positions in the day, so a position is an index plus
+    // one. A position past the day's end means its videos changed since.
+    let by_position = matches!(db.ocr_progress(date), Ok(Some(OcrProgress::VideoPosition(_))));
+    let indices = if by_position {
+        let count = source.day(date).map_err(|e| e.to_string())?.frame_count;
+        numbers
+            .iter()
+            .map(|&position| (position as usize).checked_sub(1).filter(|&index| index < count))
+            .collect()
+    } else {
+        source
+            .indices_of_frames(date, &numbers)
+            .map_err(|e| e.to_string())?
+    };
+
+    let mut matches: Vec<DayMatch> = found
+        .iter()
+        .zip(indices.chunks(3))
+        .filter_map(|(m, found)| {
+            let index = found[0]?;
+            let end_index = match (m.next_frame, found[1], found[2]) {
+                (Some(_), Some(next), _) => next,
+                (_, _, Some(last)) | (None, Some(last), _) => last + 1,
+                _ => index + 1,
+            };
+            Some(DayMatch {
+                index,
+                end_index: end_index.max(index + 1),
+                frame: m.frame_number,
+            })
+        })
+        .collect();
+    matches.sort_by_key(|m| m.index);
+    Ok(matches)
+}
+
+#[tauri::command]
+async fn search_ocr_day(
+    source: State<'_, FrameSourceState>,
+    date: String,
+    query: String,
+) -> Result<Vec<DayMatch>, String> {
+    let timelapse_root = paths::timelapse_root().ok_or("Unable to find home directory")?;
+    let source = Arc::clone(source.inner());
+    run_blocking(move || search_ocr_day_impl(&timelapse_root, &source, &date, &query)).await
+}
+
+/// A line of recognized text, normalized to the frame's size with the origin
+/// at the top-left corner, ready to draw over the image.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct LineBox {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+
+/// The lines of OCR'd frame `frame` of `date` holding a word of `query`.
+fn match_lines_impl(root: &Path, date: &str, frame: u32, query: &str) -> Result<Vec<LineBox>, String> {
+    let Some(db) = library_db(root)? else {
+        return Ok(Vec::new());
+    };
+    let Some((text, boxes)) = db.ocr_lines(date, frame).map_err(|e| e.to_string())? else {
+        return Ok(Vec::new());
+    };
+    let texts: Vec<&str> = text.split('\n').collect();
+    // Line N of the text has box N; a row that lost its boxes has none.
+    if texts.len() != boxes.len() {
+        return Ok(Vec::new());
+    }
+    let matching = database::lines_matching(&texts, query).map_err(|e| e.to_string())?;
+    // Vision's boxes have their origin at the bottom-left.
+    Ok(matching
+        .into_iter()
+        .map(|i| boxes[i])
+        .map(|[x, y, width, height]| LineBox {
+            x,
+            y: 1.0 - y - height,
+            width,
+            height,
+        })
+        .collect())
+}
+
+#[tauri::command]
+async fn get_match_lines(date: String, frame: u32, query: String) -> Result<Vec<LineBox>, String> {
+    let timelapse_root = paths::timelapse_root().ok_or("Unable to find home directory")?;
+    run_blocking(move || match_lines_impl(&timelapse_root, &date, frame, &query)).await
+}
+
+/// How many times the searched text came onto the screen on one day.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct DayCount {
+    day: String,
+    count: u32,
+}
+
+fn count_ocr_matches_impl(root: &Path, query: &str) -> Result<Vec<DayCount>, String> {
+    let Some(db) = library_db(root)? else {
+        return Ok(Vec::new());
+    };
+    let counts = db.count_ocr_matches(query).map_err(|e| e.to_string())?;
+    Ok(counts
+        .into_iter()
+        .map(|(day, count)| DayCount { day, count })
+        .collect())
+}
+
+/// Days whose OCR text matches `query`, newest first.
+#[tauri::command]
+async fn count_ocr_matches(query: String) -> Result<Vec<DayCount>, String> {
+    let timelapse_root = paths::timelapse_root().ok_or("Unable to find home directory")?;
+    run_blocking(move || count_ocr_matches_impl(&timelapse_root, &query)).await
+}
+
+/// Changes whenever OCR has recorded something new; see
+/// `ScreenshotDatabase::ocr_version`.
+#[tauri::command]
+async fn get_ocr_version() -> Result<String, String> {
+    let timelapse_root = paths::timelapse_root().ok_or("Unable to find home directory")?;
+    run_blocking(move || match library_db(&timelapse_root)? {
+        Some(db) => db.ocr_version().map_err(|e| e.to_string()),
+        None => Ok(String::new()),
+    })
+    .await
+}
+
 /// Delete every directory directly under `<root>/.cache` whose mtime is more
 /// than 15 days old, and report how many went.
 ///
@@ -288,14 +506,162 @@ async fn evict_old_cache() -> Result<String, String> {
     evict_old_cache_impl(&timelapse_root)
 }
 
+/// What capture, conversion and OCR are doing right now. It only reads
+/// memory (and, every few seconds, the power source), so the Activity window
+/// can poll it.
+#[tauri::command]
+async fn get_activity(
+    activity: State<'_, ActivityState>,
+    photographer: State<'_, PhotographerState>,
+) -> Result<Snapshot, String> {
+    let capturing = is_timelapse_running_impl(photographer.inner())?;
+    let activity = Arc::clone(activity.inner());
+    run_blocking(move || Ok(activity.snapshot(capturing, converter::on_ac_power))).await
+}
+
+/// The app's settings. Changes apply at once and are saved straight away.
+#[tauri::command]
+fn get_settings(settings: State<'_, SettingsStore>) -> Settings {
+    settings.get()
+}
+
+#[tauri::command]
+fn set_update_automatically(
+    enabled: bool,
+    settings: State<'_, SettingsStore>,
+    updater: State<'_, UpdaterState>,
+) -> Result<Settings, String> {
+    let saved = settings.update(|s| s.update_automatically = enabled);
+    updater.setting_changed();
+    saved
+}
+
+/// The standard menu bar, with "Check for Updates…" and "Settings…" (⌘,)
+/// under About in the app menu, and "Activity" added to the Window menu.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn app_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
+    let menu = Menu::default(app)?;
+    // On macOS the first submenu is the app menu, which starts with About.
+    if let Some(MenuItemKind::Submenu(app_submenu)) = menu.items()?.first() {
+        app_submenu.insert(
+            &MenuItem::with_id(
+                app,
+                CHECK_FOR_UPDATES,
+                "Check for Updates…",
+                true,
+                None::<&str>,
+            )?,
+            1,
+        )?;
+        app_submenu.insert(&PredefinedMenuItem::separator(app)?, 2)?;
+        app_submenu.insert(
+            &MenuItem::with_id(app, SETTINGS_WINDOW, "Settings…", true, Some("CmdOrCtrl+,"))?,
+            3,
+        )?;
+    }
+    if let Some(MenuItemKind::Submenu(window)) = menu.get(WINDOW_SUBMENU_ID) {
+        window.append(&PredefinedMenuItem::separator(app)?)?;
+        window.append(&MenuItem::with_id(app, ACTIVITY_WINDOW, "Activity", true, None::<&str>)?)?;
+    }
+    Ok(menu)
+}
+
+/// Bring the Settings window to the front, opening it if it isn't open. Like
+/// a macOS settings window it has no Save button and doesn't resize.
+fn show_settings_window<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
+    if let Some(window) = app.get_webview_window(SETTINGS_WINDOW) {
+        window.unminimize()?;
+        window.show()?;
+        return window.set_focus();
+    }
+    // It opens hidden, and `grow_settings_window` shows it once it is sized to
+    // its content, so it never visibly jumps. Shown anyway after a second in
+    // case the page never gets that far.
+    let window =
+        WebviewWindowBuilder::new(app, SETTINGS_WINDOW, WebviewUrl::App("index.html".into()))
+            .title("Settings")
+            .inner_size(SETTINGS_WIDTH, 140.0)
+            .resizable(false)
+            .minimizable(false)
+            .maximizable(false)
+            .visible(false)
+            .build()?;
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let _ = window.show();
+    });
+    Ok(())
+}
+
+/// Width of the Settings window, in logical pixels.
+const SETTINGS_WIDTH: f64 = 440.0;
+
+/// Makes the Settings window `by` logical pixels taller (shorter when
+/// negative) and shows it. The page asks for the difference between its
+/// content and its viewport rather than for a height, because what
+/// `set_size` sets on macOS is not the viewport's height (on Nino's Mac a
+/// 170pt window showed about 138pt of page), so only a change is reliable.
+#[tauri::command]
+fn grow_settings_window(by: f64, window: tauri::WebviewWindow) -> Result<(), String> {
+    let resize = || -> tauri::Result<()> {
+        if by.abs() >= 0.5 {
+            let size = window.inner_size()?.to_logical::<f64>(window.scale_factor()?);
+            window.set_size(tauri::LogicalSize::new(size.width, (size.height + by).round()))?;
+        }
+        window.show()
+    };
+    resize().map_err(|e| e.to_string())
+}
+
+/// Bring the Activity window to the front, opening it if it isn't open. It
+/// loads the same page as the main window, which picks the view by the
+/// window's label.
+fn show_activity_window<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
+    if let Some(window) = app.get_webview_window(ACTIVITY_WINDOW) {
+        window.unminimize()?;
+        window.show()?;
+        return window.set_focus();
+    }
+    WebviewWindowBuilder::new(app, ACTIVITY_WINDOW, WebviewUrl::App("index.html".into()))
+        .title("Activity")
+        .inner_size(460.0, 700.0)
+        .min_inner_size(360.0, 360.0)
+        .build()?;
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let photographer_state: PhotographerState = Arc::new(Mutex::new(None));
+    let activity: ActivityState = Arc::default();
 
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    // Elsewhere a menu would add a menu bar to the main window.
+    #[cfg(target_os = "macos")]
+    let builder = builder.menu(app_menu);
+
+    builder
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_dialog::init())
         .manage(photographer_state)
+        .manage(activity)
+        .manage(UpdaterState::default())
+        .on_menu_event(|app, event| {
+            let opened = match event.id().as_ref() {
+                ACTIVITY_WINDOW => show_activity_window(app),
+                SETTINGS_WINDOW => show_settings_window(app),
+                CHECK_FOR_UPDATES => {
+                    updater::check_from_menu(app.clone());
+                    Ok(())
+                }
+                _ => Ok(()),
+            };
+            if let Err(e) = opened {
+                eprintln!("Could not open the {} window: {}", event.id().as_ref(), e);
+            }
+        })
         .register_asynchronous_uri_scheme_protocol("frames", |ctx, request, responder| {
             let source = ctx
                 .app_handle()
@@ -309,6 +675,9 @@ pub fn run() {
             });
         })
         .setup(|app| {
+            app.manage(SettingsStore::load(app.path().app_config_dir().ok()));
+            updater::spawn(app.handle().clone());
+
             // Create the library up front. The frontend calls readDir on it
             // during its first render, which happens well before the delayed
             // task below builds the Photographer — without this, a first run
@@ -330,6 +699,16 @@ pub fn run() {
                             let dir = dir.join(paths::TIMELAPSE_DIR_NAME).join("frames");
                             FrameSource::new(root, dir, FRAME_CACHE_CAP_BYTES, Tools::new(paths::ffmpeg()))
                                 .map_err(|e| e.to_string())
+                        })
+                        .map(|source| {
+                            // Tell the viewer, so the scrubber stops drawing
+                            // the read-ahead stretch as not decoded yet.
+                            let app = app.handle().clone();
+                            source.read_ahead(move |date| {
+                                if let Err(e) = app.emit(FRAMES_DECODED, date) {
+                                    eprintln!("Could not report decoded frames: {}", e);
+                                }
+                            })
                         });
                     match source {
                         Ok(source) => {
@@ -352,6 +731,7 @@ pub fn run() {
             // Start timelapse automatically when app is ready
             let photographer_state = app.state::<PhotographerState>();
             let state_clone = Arc::clone(&photographer_state.inner());
+            let activity = Arc::clone(app.state::<ActivityState>().inner());
 
             tauri::async_runtime::spawn(async move {
                 tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
@@ -364,6 +744,7 @@ pub fn run() {
 
                 match Photographer::new() {
                     Ok(photographer) => {
+                        let photographer = photographer.reporting_to(Arc::clone(&activity));
                         photographer.start();
                         let mut guard = state_clone.lock().unwrap();
                         *guard = Some(photographer);
@@ -381,13 +762,14 @@ pub fn run() {
                 // own yet.
                 match paths::timelapse_root() {
                     Some(root) => {
-                        converter::Converter::with_delete_check(
+                        converter::Converter::with_ocr_check(
                             root.clone(),
-                            ocr::delete_check(&root),
+                            ocr::ocr_check(&root),
                         )
+                        .reporting_to(Arc::clone(&activity))
                         .start();
 
-                        if ocr::start_background_ocr(root, ocr_dir) {
+                        if ocr::start_background_ocr(root, ocr_dir, activity) {
                             println!("OCR started");
                         } else {
                             println!("OCR is not available on this platform");
@@ -412,7 +794,16 @@ pub fn run() {
             list_days,
             get_day,
             get_frame_time,
-            search_ocr
+            get_pending_frames,
+            search_ocr,
+            search_ocr_day,
+            get_match_lines,
+            count_ocr_matches,
+            get_ocr_version,
+            get_activity,
+            get_settings,
+            set_update_automatically,
+            grow_settings_window
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -759,10 +1150,119 @@ mod tests {
     }
 
     #[test]
+    fn test_search_ocr_day_places_matches_on_the_scrubber() {
+        let library = TempDir::new().unwrap();
+        let day_dir = library.path().join("2026-10-04");
+        fs::create_dir(&day_dir).unwrap();
+        // Frame 4 was removed by hand, so frames 1-7 are indices 0-5.
+        for n in [1, 2, 3, 5, 6, 7] {
+            fs::write(day_dir.join(format!("{n:05}.png")), b"png").unwrap();
+        }
+        let db = ScreenshotDatabase::new(library.path().join("screenshots.db")).unwrap();
+        db.record_ocr_frame("2026-10-04", 2, Some(("cargo build", &[]))).unwrap();
+        db.record_ocr_frame("2026-10-04", 3, None).unwrap();
+        db.record_ocr_frame("2026-10-04", 4, Some(("cargo check", &[]))).unwrap();
+        db.record_ocr_frame("2026-10-04", 5, Some(("bun test", &[]))).unwrap();
+        db.record_ocr_frame("2026-10-04", 6, Some(("cargo test", &[]))).unwrap();
+        db.record_ocr_frame("2026-10-04", 7, None).unwrap();
+        let (_cache, source) = frame_source_in(library.path());
+
+        let matches = search_ocr_day_impl(library.path(), &source, "2026-10-04", "cargo").unwrap();
+        assert_eq!(
+            matches,
+            vec![
+                // Its run would end at frame 4, which is gone, so it runs
+                // through frame 3, the last one before it.
+                DayMatch { index: 1, end_index: 3, frame: 2 },
+                // Frame 4 is left out; frame 6 runs to the last frame OCR handled.
+                DayMatch { index: 4, end_index: 6, frame: 6 },
+            ]
+        );
+        assert!(search_ocr_day_impl(library.path(), &source, "2026-10-04", "")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn test_search_ocr_day_places_video_positions_on_the_scrubber() {
+        let library = TempDir::new().unwrap();
+        // A day that only exists as one of the old script's videos, 6 frames.
+        let made = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-f", "lavfi", "-i", "color=c=gray:s=32x32:r=15"])
+            .args(["-frames:v", "6", "-c:v", "libx264", "-pix_fmt", "yuv420p"])
+            .arg(library.path().join("2024-12-20--23-00-00.mov"))
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if !made {
+            eprintln!("skipping: ffmpeg with libx264 is not available");
+            return;
+        }
+        let db = ScreenshotDatabase::new(library.path().join("screenshots.db")).unwrap();
+        db.record_video_ocr_frame("2024-12-20", 1, Some(("cargo build", &[]))).unwrap();
+        db.record_video_ocr_frame("2024-12-20", 3, Some(("bun test", &[]))).unwrap();
+        db.record_video_ocr_frame("2024-12-20", 5, Some(("cargo test", &[]))).unwrap();
+        db.record_video_ocr_frame("2024-12-20", 6, None).unwrap();
+        let (_cache, source) = frame_source_in(library.path());
+
+        let matches = search_ocr_day_impl(library.path(), &source, "2024-12-20", "cargo").unwrap();
+        assert_eq!(
+            matches,
+            vec![
+                DayMatch { index: 0, end_index: 2, frame: 1 },
+                // Runs to the last frame OCR handled, the day's last.
+                DayMatch { index: 4, end_index: 6, frame: 5 },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_search_without_a_database_finds_nothing() {
+        let library = TempDir::new().unwrap();
+        let (_cache, source) = frame_source_in(library.path());
+        assert!(search_ocr_day_impl(library.path(), &source, "2026-10-04", "cargo")
+            .unwrap()
+            .is_empty());
+        assert!(count_ocr_matches_impl(library.path(), "cargo").unwrap().is_empty());
+        assert!(match_lines_impl(library.path(), "2026-10-04", 1, "cargo").unwrap().is_empty());
+        // Searching must not create the database either.
+        assert!(!library.path().join("screenshots.db").exists());
+    }
+
+    #[test]
+    fn test_match_lines_flips_vision_boxes() {
+        let library = TempDir::new().unwrap();
+        let db = ScreenshotDatabase::new(library.path().join("screenshots.db")).unwrap();
+        let boxes = [[0.125, 0.5, 0.5, 0.25], [0.0, 0.0, 1.0, 0.1]];
+        db.record_ocr_frame("2026-10-04", 2, Some(("$ Cargo build\nFinished", &boxes))).unwrap();
+
+        let found = match_lines_impl(library.path(), "2026-10-04", 2, "cargo").unwrap();
+        assert_eq!(found.len(), 1);
+        // Stored to a 65535th, so compare to well under a pixel.
+        let LineBox { x, y, width, height } = found[0];
+        for (got, want) in [(x, 0.125), (y, 0.25), (width, 0.5), (height, 0.25)] {
+            assert!((got - want).abs() < 1e-4, "{got} vs {want}");
+        }
+        assert!(match_lines_impl(library.path(), "2026-10-04", 3, "cargo").unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_count_ocr_matches_reads_the_library_database() {
+        let temp_dir = TempDir::new().unwrap();
+        let db = ScreenshotDatabase::new(temp_dir.path().join("screenshots.db")).unwrap();
+        db.record_ocr_frame("2024-01-01", 4, Some(("cargo test", &[]))).unwrap();
+
+        assert_eq!(
+            count_ocr_matches_impl(temp_dir.path(), "cargo").unwrap(),
+            vec![DayCount { day: "2024-01-01".to_string(), count: 1 }]
+        );
+    }
+
+    #[test]
     fn test_search_ocr_reads_the_library_database() {
         let temp_dir = TempDir::new().unwrap();
         let db = ScreenshotDatabase::new(temp_dir.path().join("screenshots.db")).unwrap();
-        db.record_ocr_frame("2024-01-01", 4, Some(("cargo test", "[]"))).unwrap();
+        db.record_ocr_frame("2024-01-01", 4, Some(("cargo test", &[]))).unwrap();
 
         let hits = search_ocr_impl(temp_dir.path(), "cargo", 10).unwrap();
         assert_eq!(hits.len(), 1);

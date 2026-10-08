@@ -1,0 +1,326 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+    # A beta: the same signed, notarised build, published as a prerelease under
+    # the `beta` tag instead of replacing the stable one. Move the tag and push
+    # it to cut one (`git push --force origin HEAD:refs/tags/beta`).
+    tags: [beta]
+  # Re-run a release without inventing a commit. A run that failed on
+  # credentials rather than on code has nothing to fix in the tree.
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: Which channel to publish
+        type: choice
+        options: [stable, beta]
+        default: stable
+
+permissions:
+  contents: write
+
+# One release build at a time per ref; a newer push supersedes an in-flight
+# one, but a beta never cancels the stable release.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # productName in tauri.conf.json, which names the bundle.
+  APP: Timelapse App
+  # The same without the space, for release assets: GitHub rewrites spaces in
+  # download URLs, and the updater manifest has to point at something that
+  # resolves.
+  ASSET: Timelapse-App
+
+jobs:
+  release:
+    # Builds for the runner's own architecture, Apple Silicon.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # the version is derived from the commit count
+
+      - uses: oven-sh/setup-bun@v2
+
+      # Dependencies only, keyed on Cargo.lock and the compiler version: the
+      # app's own crates are cleaned out before saving, since they change on
+      # every commit anyway. Saved even when the job fails, so a red run still
+      # leaves the next one a warm cache. CI and the release job keep separate
+      # caches, because only the release job also builds the release profile.
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          shared-key: release
+          cache-on-failure: true
+
+      # A future updater decides there is something to install by comparing
+      # versions, so every release needs one that is both new and larger than
+      # the one before. Major and minor come from tauri.conf.json (so
+      # `bun run version:bump major|minor` still means something); the patch is
+      # the commit count, which only grows, and re-running on the same commit
+      # stamps the same version. Nothing is committed back.
+      #
+      # A beta adds the run number, so it sorts above the stable build of the
+      # same commit and below the next one, and rebuilding a beta from an
+      # unchanged tree is still an update.
+      - name: Work out the channel and the version
+        run: |
+          CHANNEL="${{ inputs.channel }}"
+          if [ -z "$CHANNEL" ]; then
+            case "$GITHUB_REF" in
+              refs/heads/main) CHANNEL=stable ;;
+              refs/tags/beta) CHANNEL=beta ;;
+              *) echo "::error::nothing to release from $GITHUB_REF"; exit 1 ;;
+            esac
+          fi
+          MAJOR_MINOR=$(python3 -c "import json;v=json.load(open('src-tauri/tauri.conf.json'))['version'].split('.');print(f'{v[0]}.{v[1]}')")
+          COMMITS=$(git rev-list --count HEAD)
+          if [ "$CHANNEL" = stable ]; then
+            # workflow_dispatch offers every branch, and a stable release
+            # replaces the one installed copies will update from. Fail before
+            # anything is signed.
+            if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+              echo "::error::a stable release can only be built from main (got $GITHUB_REF)"
+              exit 1
+            fi
+            VERSION="$MAJOR_MINOR.$COMMITS"
+            BUILD="$VERSION"
+            TAG=latest
+          else
+            VERSION="$MAJOR_MINOR.$COMMITS-beta.$GITHUB_RUN_NUMBER"
+            # CFBundleVersion is meant to be digits and dots only.
+            BUILD="$MAJOR_MINOR.$COMMITS.$GITHUB_RUN_NUMBER"
+            TAG=beta
+          fi
+          {
+            echo "CHANNEL=$CHANNEL"
+            echo "VERSION=$VERSION"
+            echo "BUILD=$BUILD"
+            echo "TAG=$TAG"
+          } >> "$GITHUB_ENV"
+          echo "Building $CHANNEL version $VERSION (bundle version $BUILD)"
+
+      - name: Install frontend dependencies
+        run: bun install --frozen-lockfile
+
+      # build.rs refuses to compile without the ffmpeg sidecar, and `cargo test`
+      # does not run Tauri's beforeBuildCommand, which is what fetches it for
+      # `tauri build`.
+      - name: Fetch the bundled ffmpeg
+        run: bun run fetch:ffmpeg
+
+      - name: Test
+        run: |
+          bun test
+          (cd src-tauri && cargo test)
+
+      # notarytool wants the App Store Connect key as a file, so the secret has
+      # to land on disk. RUNNER_TEMP dies with the runner, and the last step
+      # removes it regardless of how the job ends.
+      - name: Write the App Store Connect key
+        env:
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+        run: |
+          if [ -z "$APPLE_API_KEY_P8" ]; then
+            echo "::error::APPLE_API_KEY_P8 is not set"
+            exit 1
+          fi
+          umask 077
+          printf '%s\n' "$APPLE_API_KEY_P8" > "$RUNNER_TEMP/apple-api-key.p8"
+
+      - name: Import the signing certificate
+        env:
+          MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          if [ -z "$MACOS_CERTIFICATE_P12" ]; then
+            echo "::error::MACOS_CERTIFICATE_P12 is not set"
+            exit 1
+          fi
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          keychain_password=$(openssl rand -base64 24)
+          certificate="$RUNNER_TEMP/certificate.p12"
+
+          umask 077
+          printf '%s' "$MACOS_CERTIFICATE_P12" | base64 --decode > "$certificate"
+
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$certificate" -k "$keychain" -P "$MACOS_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
+            -k "$keychain_password" "$keychain" > /dev/null
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          rm -f "$certificate"
+
+          security find-identity -v -p codesigning "$keychain"
+          identity=$(security find-identity -v -p codesigning "$keychain" \
+            | sed -n 's/.*"\(Developer ID Application.*\)"/\1/p' | head -1)
+          if [ -z "$identity" ]; then
+            echo "::error::the certificate holds no Developer ID Application identity — wrong export?"
+            exit 1
+          fi
+          echo "IDENTITY=$identity" >> "$GITHUB_ENV"
+
+      # Tauri signs the app and its ffmpeg sidecar with the hardened runtime,
+      # then notarises and staples it itself when the APPLE_API_* variables are
+      # set. The version is passed as a config override so the tree keeps its
+      # own.
+      #
+      # The override also turns on the updater artifacts: a tarball of the
+      # notarised app plus its minisign signature, made with the updater key.
+      # They are off in the tree so a local `tauri build` needs no key.
+      - name: Build, sign and notarise the app
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ env.IDENTITY }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER_ID }}
+          APPLE_API_KEY_PATH: ${{ runner.temp }}/apple-api-key.p8
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ]; then
+            echo "::error::TAURI_SIGNING_PRIVATE_KEY is not set"
+            exit 1
+          fi
+          # An update signed with a key the app does not trust is downloaded by
+          # every installed copy and then refused, every hour, forever.
+          if grep -q REPLACE_WITH_UPDATER_PUBLIC_KEY src-tauri/tauri.conf.json; then
+            echo "::error::plugins.updater.pubkey in tauri.conf.json is still the placeholder"
+            exit 1
+          fi
+          config=$(printf '{"version":"%s","bundle":{"createUpdaterArtifacts":true,"macOS":{"bundleVersion":"%s"}}}' "$VERSION" "$BUILD")
+          bun run tauri build --bundles app --config "$config"
+          bundle="src-tauri/target/release/bundle/macos"
+          app="$bundle/$APP.app"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          mkdir -p dist
+          cp "$bundle/$APP.app.tar.gz" "dist/$ASSET-$VERSION.app.tar.gz"
+          cp "$bundle/$APP.app.tar.gz.sig" "dist/$ASSET-$VERSION.app.tar.gz.sig"
+          {
+            echo "APP_PATH=$app"
+            echo "UPDATE=dist/$ASSET-$VERSION.app.tar.gz"
+          } >> "$GITHUB_ENV"
+
+      # Built here rather than by Tauri so the disk image itself is signed,
+      # notarised and stapled; Tauri only does that for the app inside it.
+      - name: Build, sign, notarise and staple the disk image
+        env:
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: |
+          staging="$RUNNER_TEMP/dmg"
+          rm -rf "$staging" && mkdir -p "$staging" dist
+          cp -R "$APP_PATH" "$staging/"
+          ln -s /Applications "$staging/Applications"
+          dmg="dist/$ASSET-$VERSION.dmg"
+          hdiutil create -volname "$APP" -srcfolder "$staging" -ov -format ULFO "$dmg"
+          codesign --force --timestamp --sign "$IDENTITY" "$dmg"
+          xcrun notarytool submit "$dmg" \
+            --key "$RUNNER_TEMP/apple-api-key.p8" \
+            --key-id "$APPLE_API_KEY_ID" \
+            --issuer "$APPLE_API_ISSUER_ID" \
+            --wait
+          xcrun stapler staple "$dmg"
+          echo "DMG=$dmg" >> "$GITHUB_ENV"
+
+      # What a downloader's Mac will check, checked here instead.
+      - name: Verify the signature and the tickets
+        run: |
+          signature=$(codesign --display --verbose=4 "$APP_PATH" 2>&1)
+          echo "$signature" | grep -E "Authority|TeamIdentifier|flags="
+          if ! echo "$signature" | grep -q "Authority=Developer ID Application"; then
+            echo "::error::not signed with a Developer ID Application certificate"
+            exit 1
+          fi
+          if ! echo "$signature" | grep -q "flags=.*runtime"; then
+            echo "::error::hardened runtime is not enabled"
+            exit 1
+          fi
+
+          xcrun stapler validate "$APP_PATH"
+          xcrun stapler validate "$DMG"
+
+          assessment=$(spctl --assess --type exec -vv "$APP_PATH" 2>&1)
+          echo "$assessment"
+          if ! echo "$assessment" | grep -q "source=Notarized Developer ID"; then
+            echo "::error::Gatekeeper does not see a notarised Developer ID app"
+            exit 1
+          fi
+
+      # What installed copies read (plugins.updater.endpoints in
+      # tauri.conf.json). The updater installs only when this version is
+      # greater than its own, and only a tarball whose signature matches its
+      # public key.
+      - name: Write the update manifest
+        run: |
+          if [ "$CHANNEL" = stable ]; then
+            BASE="https://github.com/$GITHUB_REPOSITORY/releases/latest/download"
+          else
+            BASE="https://github.com/$GITHUB_REPOSITORY/releases/download/beta"
+          fi
+          export BASE
+          python3 - <<'PY'
+          import datetime, json, os, pathlib
+          update = pathlib.Path(os.environ["UPDATE"])
+          signature = pathlib.Path(f"{update}.sig").read_text().strip()
+          manifest = {
+              "version": os.environ["VERSION"],
+              "notes": f"Build of {os.environ['GITHUB_SHA']}",
+              "pub_date": datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "platforms": {
+                  "darwin-aarch64": {
+                      "signature": signature,
+                      "url": f"{os.environ['BASE']}/{update.name}",
+                  }
+              },
+          }
+          pathlib.Path("dist/latest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+          print(json.dumps(manifest, indent=2))
+          PY
+
+      # The stable release is a rolling one under the `latest` tag, so
+      # `releases/latest/download/<asset>` always resolves to the newest stable
+      # build without a GitHub API call, which is where the updater reads
+      # latest.json from. A beta is a prerelease, which
+      # `releases/latest` skips, so it can never reach the stable channel.
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          SHORT_SHA=${GITHUB_SHA:0:7}
+          if [ "$CHANNEL" = stable ]; then
+            # Recreate the rolling release so its tag always points at this commit.
+            gh release delete "$TAG" --yes --cleanup-tag || true
+            gh release create "$TAG" \
+              --title "$APP v${VERSION} (${SHORT_SHA})" \
+              --notes "Automated build of \`${GITHUB_SHA}\` from \`main\`. Signed and notarised Apple Silicon macOS build." \
+              "$DMG" "$UPDATE" dist/latest.json
+          else
+            # Point the tag at this commit when it is not already there — a
+            # dispatched beta has no tag push behind it. A tag written with
+            # GITHUB_TOKEN starts no further workflow run.
+            at=$(git rev-parse -q --verify "refs/tags/$TAG^{commit}" || true)
+            if [ "$at" != "$GITHUB_SHA" ]; then
+              git tag -f "$TAG" "$GITHUB_SHA"
+              git push --force origin "refs/tags/$TAG"
+            fi
+            # Delete only the release; the tag stays where it is.
+            gh release delete "$TAG" --yes || true
+            gh release create "$TAG" \
+              --prerelease --latest=false \
+              --title "$APP v${VERSION} (beta, ${SHORT_SHA})" \
+              --notes "Beta build of \`${GITHUB_SHA}\`. Signed and notarised Apple Silicon macOS build." \
+              "$DMG" "$UPDATE" dist/latest.json
+          fi
+
+      - name: Remove the signing material
+        if: always()
+        run: |
+          rm -f "$RUNNER_TEMP/apple-api-key.p8" "$RUNNER_TEMP/certificate.p12"
+          security delete-keychain "$RUNNER_TEMP/signing.keychain-db" 2>/dev/null || true

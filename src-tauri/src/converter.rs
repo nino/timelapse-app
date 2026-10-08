@@ -2,34 +2,39 @@
 //!
 //! This replaces the `all-timelapses-to-video` / `timelapse-to-video` scripts,
 //! which encoded whole days at once. Here the unit of work is one clock hour of
-//! screenshots, and one batch runs at a time with a cool-down between batches,
-//! so the machine never encodes for long stretches. Nothing is encoded unless
-//! the machine is on AC power, and an encode in progress is killed if the
-//! power is unplugged.
+//! screenshots. An hour is converted only once it has ended and OCR has read
+//! all of it, and one batch runs at a time, starting at most once every ten
+//! minutes, so a backlog (say, after a stretch on battery) is worked off
+//! quickly once OCR has caught up. Nothing is encoded unless the machine is on
+//! AC power, and an encode in progress is killed if the power is unplugged.
 //!
-//! An hour whose video exists counts as converted. Its PNGs are deleted, as
-//! the scripts did, but only once `DeleteCheck` agrees: the PNGs have to be
-//! read by OCR first, and nothing marks that yet, so for now the default check
-//! keeps every PNG.
+//! An hour whose video exists counts as converted. Its PNGs are then deleted,
+//! as the scripts did, once `OcrCheck` still agrees that OCR has read them.
 //!
 //! A batch is converted like this:
 //! 1. Hard-link its PNGs into `.cache/.convert-<video>/` as a gapless
 //!    `00001.png, 00002.png, …` sequence. Screenshot numbering has gaps (black
 //!    frames are deleted), and ffmpeg's `%05d` input stops at the first gap.
 //! 2. Encode that folder into `.cache/.convert-<video>/out.mov`.
-//! 3. Rename the finished video into the library root, where `useVideos`
-//!    lists it.
+//! 3. Record in `video_frames` which screenshot each video frame came from,
+//!    so the frame source can show a frame's capture time once its PNG is
+//!    gone.
+//! 4. Rename the finished video into the library root, where the frame
+//!    source finds it.
 //!
 //! An interrupted batch leaves only a staging folder behind, which the next
 //! run clears.
 
-use chrono::{DateTime, Local, NaiveDate, Timelike};
+use crate::activity::{Activity, Encoding, State};
+use crate::database::ScreenshotDatabase;
+use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, TimeZone, Timelike};
+use frame_source::filed_at;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 /// Frames per second of the output video, as in `timelapse-to-video`.
 const FRAMERATE: &str = "15";
@@ -39,8 +44,15 @@ const FRAMERATE: &str = "15";
 /// copied from elsewhere can have a whole day stamped with one time).
 const MAX_FRAMES_PER_BATCH: usize = 3600;
 
-/// How long to rest after a batch before starting the next one.
-const COOL_DOWN: Duration = Duration::from_secs(10 * 60);
+/// How long after an hour ends before it counts as ended. A screenshot taken
+/// in the hour's last second can be written a moment later, and once the hour
+/// is converted a late frame would be deleted without being in the video.
+const LATE_WRITE_GRACE_SECS: i64 = 60;
+
+/// How often a batch may start. When more hours are ready, the next batch
+/// starts this long after the previous one started; an encode that takes
+/// longer than this is followed by the next one straight away.
+const BATCH_INTERVAL: Duration = Duration::from_secs(10 * 60);
 
 /// How long to wait before looking again when there is nothing to convert.
 const IDLE_POLL: Duration = Duration::from_secs(5 * 60);
@@ -54,29 +66,40 @@ const ENCODE_POWER_CHECK: Duration = Duration::from_secs(30);
 /// Prefix of the staging folders under `.cache`.
 const STAGING_PREFIX: &str = ".convert-";
 
-/// Decides whether a converted batch's PNGs may be deleted. Every part of an
-/// hour has to pass before any of that hour's PNGs go.
-pub type DeleteCheck = Arc<dyn Fn(&HourBatch) -> bool + Send + Sync>;
+/// Decides whether OCR has read every PNG of a batch. A batch is converted
+/// only once it passes, and a converted hour's PNGs are deleted only once
+/// every part of it passes.
+pub type OcrCheck = Arc<dyn Fn(&HourBatch) -> bool + Send + Sync>;
 
 /// One clock hour of screenshots from one day folder.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HourBatch {
     /// Day folder name, `YYYY-MM-DD`.
     pub day: String,
-    /// Local hour of the frames' modification times, 0–23.
+    /// The hour the frames are filed under, 0–23: see `filed_at`.
     pub hour: u32,
-    /// Modification time of the first frame.
-    pub start: DateTime<Local>,
+    /// When the first frame is filed: see `filed_at`.
+    pub start: NaiveDateTime,
     /// Which slice of the hour this is, from 0. Only non-zero when the hour
     /// has more than `MAX_FRAMES_PER_BATCH` frames.
     pub part: usize,
     /// The PNGs, in frame-number order.
-    pub frames: Vec<PathBuf>,
+    pub frames: Vec<Frame>,
+}
+
+/// One screenshot of a batch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Frame {
+    pub number: u32,
+    pub path: PathBuf,
+    /// When the file was written, just after the screenshot was taken.
+    pub modified: DateTime<Local>,
 }
 
 impl HourBatch {
     /// File name of the video: `YYYY-MM-DD--HH-MM-SS--hourly.mov`, where the
-    /// time is the first frame's, with `-2`, `-3`, … after `hourly` for later
+    /// date is the day folder's and the time is the first frame's (as filed,
+    /// so always within that date), with `-2`, `-3`, … after `hourly` for later
     /// parts of an oversized hour.
     ///
     /// The viewer reads the leading date and time as the video's start, and
@@ -141,7 +164,30 @@ fn parse_pmset_power_source(output: &str) -> Option<bool> {
 
 /// Is `name` a day folder name (`YYYY-MM-DD`)?
 pub(crate) fn is_day_folder_name(name: &str) -> bool {
-    name.len() == 10 && NaiveDate::parse_from_str(name, "%Y-%m-%d").is_ok()
+    parse_day_folder_name(name).is_some()
+}
+
+/// The date of a day folder name (`YYYY-MM-DD`).
+fn parse_day_folder_name(name: &str) -> Option<NaiveDate> {
+    if name.len() != 10 {
+        return None;
+    }
+    NaiveDate::parse_from_str(name, "%Y-%m-%d").ok()
+}
+
+/// Whether clock hour `hour` of `date` ended, with `LATE_WRITE_GRACE_SECS`
+/// to spare, by `now`. Measured in real time, so a clock change at the end
+/// of the hour doesn't skip the grace; when the clock goes back, the hour's
+/// end is the later of its two.
+fn hour_has_ended(date: NaiveDate, hour: u32, now: DateTime<Local>) -> bool {
+    let start = date.and_hms_opt(hour, 0, 0).expect("every hour exists as a naive time");
+    let grace = chrono::Duration::seconds(LATE_WRITE_GRACE_SECS);
+    match Local.from_local_datetime(&start).latest() {
+        Some(start) => start + chrono::Duration::hours(1) + grace <= now,
+        // The hour was skipped when the clock went forward: no frame can be
+        // filed in it, but fall back to wall-clock time all the same.
+        None => start + chrono::Duration::hours(1) + grace <= now.naive_local(),
+    }
 }
 
 /// Frame number of a screenshot file name such as `00042.png`.
@@ -161,18 +207,38 @@ pub fn find_ready_batches(root: &Path, now: DateTime<Local>) -> std::io::Result<
         .collect())
 }
 
+/// The oldest batch that is ready to convert and that OCR has read in full.
+/// Hours OCR has not finished wait, so the video is only made once the text
+/// has been read from the full-quality PNGs.
+#[cfg(test)]
+pub fn next_batch(root: &Path, now: DateTime<Local>, ocr_done: &OcrCheck) -> std::io::Result<Option<HourBatch>> {
+    Ok(read_batches(root, now, ocr_done)?.0.into_iter().next())
+}
+
+/// Every batch that is ready to convert, split into those OCR has read in
+/// full, oldest first, and how many still wait for OCR.
+pub fn read_batches(
+    root: &Path,
+    now: DateTime<Local>,
+    ocr_done: &OcrCheck,
+) -> std::io::Result<(Vec<HourBatch>, usize)> {
+    let (read, unread): (Vec<_>, Vec<_>) =
+        find_ready_batches(root, now)?.into_iter().partition(|batch| ocr_done(batch));
+    Ok((read, unread.len()))
+}
+
 /// Find every hour whose PNGs may be deleted, oldest first, as the batches
 /// that make it up.
 ///
 /// That is an hour that has ended, has a video for every part, and passes
-/// `may_delete` for every part. In today's folder the hour holding the
+/// `ocr_done` for every part. In today's folder the hour holding the
 /// highest-numbered frame is kept regardless: `next_filename` numbers new
 /// screenshots as `max + 1`, so deleting the newest frame would restart
 /// today's numbering at `00001`.
 pub fn find_deletable_hours(
     root: &Path,
     now: DateTime<Local>,
-    may_delete: &DeleteCheck,
+    ocr_done: &OcrCheck,
 ) -> std::io::Result<Vec<Vec<HourBatch>>> {
     Ok(find_ended_hours(root, now)?
         .into_iter()
@@ -180,26 +246,54 @@ pub fn find_deletable_hours(
         .filter(|hour| {
             hour.parts
                 .iter()
-                .all(|batch| root.join(batch.video_name()).exists() && may_delete(batch))
+                .all(|batch| root.join(batch.video_name()).exists() && ocr_done(batch))
         })
         .map(|hour| hour.parts)
         .collect())
+}
+
+/// Record in the library's database which screenshots each of `parts` was
+/// encoded from, so the frame source can time a video's frames once the PNGs
+/// are gone. With `only_missing`, a part that already has a record is left
+/// alone.
+pub fn record_frames(root: &Path, parts: &[HourBatch], only_missing: bool) -> rusqlite::Result<()> {
+    let db = ScreenshotDatabase::new(root.join("screenshots.db"))?;
+    for batch in parts {
+        let video = batch.video_name();
+        if only_missing && db.has_video_frames(&video)? {
+            continue;
+        }
+        let frames: Vec<_> = batch.frames.iter().map(|frame| (frame.number, frame.modified)).collect();
+        db.record_video_frames(&video, &batch.day, &frames)?;
+    }
+    Ok(())
+}
+
+/// Whether each of `parts` holds exactly the frames its video was recorded
+/// with. A frame that joined the hour after its video was made is in no
+/// video, so none of that hour's PNGs may go.
+pub fn matches_record(root: &Path, parts: &[HourBatch]) -> rusqlite::Result<bool> {
+    let db = ScreenshotDatabase::new(root.join("screenshots.db"))?;
+    for batch in parts {
+        let numbers: Vec<u32> = batch.frames.iter().map(|frame| frame.number).collect();
+        if db.video_frame_numbers(&batch.video_name())? != numbers {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Delete the PNGs of a converted hour, and return how many went.
 pub fn delete_frames(parts: &[HourBatch]) -> usize {
     let mut deleted = 0;
     for frame in parts.iter().flat_map(|batch| &batch.frames) {
-        match std::fs::remove_file(frame) {
+        match std::fs::remove_file(&frame.path) {
             Ok(()) => deleted += 1,
-            Err(e) => eprintln!("Could not delete converted frame {:?}: {}", frame, e),
+            Err(e) => eprintln!("Could not delete converted frame {:?}: {}", frame.path, e),
         }
     }
     deleted
 }
-
-/// A screenshot's frame number, path and modification time.
-type Frame = (u32, PathBuf, DateTime<Local>);
 
 /// One ended clock hour of one day folder.
 struct EndedHour {
@@ -210,23 +304,26 @@ struct EndedHour {
 }
 
 /// Every hour that has ended, oldest first.
+///
+/// Frames are bucketed by `frame_source::filed_at`: the local hour of their
+/// mtime, kept within the day folder's date. An hour ends a minute after its
+/// last second, so a frame written a moment late still makes it in.
 fn find_ended_hours(root: &Path, now: DateTime<Local>) -> std::io::Result<Vec<EndedHour>> {
     let today = now.format("%Y-%m-%d").to_string();
     let mut hours = Vec::new();
 
-    let mut day_names: Vec<String> = std::fs::read_dir(root)?
+    let mut days: Vec<(String, NaiveDate)> = std::fs::read_dir(root)?
         .filter_map(|entry| entry.ok())
         .filter(|entry| entry.file_type().map(|t| t.is_dir()).unwrap_or(false))
         .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
-        .filter(|name| is_day_folder_name(name))
+        .filter_map(|name| parse_day_folder_name(&name).map(|date| (name, date)))
         .collect();
-    day_names.sort();
+    days.sort();
 
-    for day in day_names {
+    for (day, date) in days {
         let day_dir = root.join(&day);
 
-        // (frame number, path, mtime, hour start) for every screenshot.
-        let mut frames: Vec<(u32, PathBuf, DateTime<Local>, DateTime<Local>)> = Vec::new();
+        let mut frames: Vec<Frame> = Vec::new();
         for entry in std::fs::read_dir(&day_dir)?.filter_map(|entry| entry.ok()) {
             let Some(number) = entry.file_name().to_str().and_then(frame_number) else {
                 continue;
@@ -234,44 +331,41 @@ fn find_ended_hours(root: &Path, now: DateTime<Local>) -> std::io::Result<Vec<En
             let Ok(modified) = entry.metadata().and_then(|m| m.modified()) else {
                 continue;
             };
-            let modified: DateTime<Local> = modified.into();
-            let Some(hour_start) = modified
-                .with_minute(0)
-                .and_then(|t| t.with_second(0))
-                .and_then(|t| t.with_nanosecond(0))
-            else {
-                continue;
-            };
-            frames.push((number, entry.path(), modified, hour_start));
+            frames.push(Frame {
+                number,
+                path: entry.path(),
+                modified: modified.into(),
+            });
         }
-        frames.sort_by_key(|(number, _, _, _)| *number);
+        frames.sort_by_key(|frame| frame.number);
 
         let todays_newest = if day == today {
-            frames.last().map(|(number, _, _, _)| *number)
+            frames.last().map(|frame| frame.number)
         } else {
             None
         };
 
-        let mut by_hour: BTreeMap<DateTime<Local>, Vec<Frame>> = BTreeMap::new();
-        for (number, path, modified, hour_start) in frames {
-            by_hour.entry(hour_start).or_default().push((number, path, modified));
+        let filed = |frame: &Frame| filed_at(frame.modified.naive_local(), date);
+        let mut by_hour: BTreeMap<u32, Vec<Frame>> = BTreeMap::new();
+        for frame in frames {
+            by_hour.entry(filed(&frame).hour()).or_default().push(frame);
         }
 
-        for (hour_start, hour_frames) in by_hour {
-            if hour_start + chrono::Duration::hours(1) > now {
+        for (hour, hour_frames) in by_hour {
+            if !hour_has_ended(date, hour, now) {
                 continue;
             }
             let holds_todays_newest_frame =
-                todays_newest.is_some_and(|newest| hour_frames.iter().any(|(n, _, _)| *n == newest));
+                todays_newest.is_some_and(|newest| hour_frames.iter().any(|frame| frame.number == newest));
             let parts = hour_frames
                 .chunks(MAX_FRAMES_PER_BATCH)
                 .enumerate()
                 .map(|(part, chunk)| HourBatch {
                     day: day.clone(),
-                    hour: hour_start.hour(),
-                    start: chunk[0].2,
+                    hour,
+                    start: filed(&chunk[0]),
                     part,
-                    frames: chunk.iter().map(|(_, path, _)| path.clone()).collect(),
+                    frames: chunk.to_vec(),
                 })
                 .collect();
             hours.push(EndedHour {
@@ -287,13 +381,14 @@ fn find_ended_hours(root: &Path, now: DateTime<Local>) -> std::io::Result<Vec<En
 /// Remove day folders that are empty, except today's, which the photographer
 /// is writing into. `all-timelapses-to-video` did the same.
 pub fn remove_empty_day_folders(root: &Path, now: DateTime<Local>) -> std::io::Result<usize> {
-    let today = now.format("%Y-%m-%d").to_string();
     let mut removed = 0;
     for entry in std::fs::read_dir(root)?.filter_map(|entry| entry.ok()) {
-        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+        let Some(date) = entry.file_name().to_str().and_then(parse_day_folder_name) else {
             continue;
         };
-        if !is_day_folder_name(&name) || name == today || !entry.path().is_dir() {
+        // Yesterday's folder can still be about to receive the frame taken
+        // in its last second.
+        if !hour_has_ended(date, 23, now) || !entry.path().is_dir() {
             continue;
         }
         if std::fs::read_dir(entry.path())?.next().is_none() {
@@ -349,8 +444,8 @@ pub fn convert_batch(
             // A hard link costs nothing and the staging folder sits in the
             // same library, so it is on the same filesystem. Copy if that
             // still fails.
-            if std::fs::hard_link(frame, &link).is_err() {
-                std::fs::copy(frame, &link).map_err(|e| failed("Failed to stage frame", e))?;
+            if std::fs::hard_link(&frame.path, &link).is_err() {
+                std::fs::copy(&frame.path, &link).map_err(|e| failed("Failed to stage frame", e))?;
             }
         }
 
@@ -370,6 +465,13 @@ pub fn convert_batch(
         let published = root.join(&video_name);
         if published.exists() {
             return Err(ConvertError::Failed(format!("{} already exists", video_name)));
+        }
+
+        // Before publishing, so the video's record is in place when the
+        // viewer first sees it. A failure doesn't throw the encode away: the
+        // hour's PNGs are only deleted once the record has been written.
+        if let Err(e) = record_frames(root, std::slice::from_ref(batch), false) {
+            eprintln!("Could not record the frames of {}; will retry before deleting them: {}", video_name, e);
         }
         std::fs::rename(&staged_video, &published)
             .map_err(|e| failed("Failed to publish video", e))?;
@@ -467,16 +569,24 @@ fn encode_with_ffmpeg(frames_dir: &Path, output: &Path, running: &AtomicBool) ->
 pub struct Converter {
     root: PathBuf,
     running: Arc<AtomicBool>,
-    may_delete: DeleteCheck,
+    ocr_done: OcrCheck,
+    activity: Arc<Activity>,
 }
 
 impl Converter {
-    pub fn with_delete_check(root: PathBuf, may_delete: DeleteCheck) -> Self {
+    pub fn with_ocr_check(root: PathBuf, ocr_done: OcrCheck) -> Self {
         Converter {
             root,
             running: Arc::new(AtomicBool::new(false)),
-            may_delete,
+            ocr_done,
+            activity: Arc::default(),
         }
+    }
+
+    /// Report progress to `activity`, for the Activity window.
+    pub fn reporting_to(mut self, activity: Arc<Activity>) -> Self {
+        self.activity = activity;
+        self
     }
 
     /// Spawn the conversion loop. Like `Photographer::start`, this calls
@@ -486,7 +596,8 @@ impl Converter {
         self.running.store(true, Ordering::SeqCst);
         let root = self.root.clone();
         let running = Arc::clone(&self.running);
-        let may_delete = Arc::clone(&self.may_delete);
+        let ocr_done = Arc::clone(&self.ocr_done);
+        let activity = Arc::clone(&self.activity);
 
         tokio::spawn(async move {
             println!("Starting video conversion background task...");
@@ -495,7 +606,8 @@ impl Converter {
             }
 
             while running.load(Ordering::SeqCst) {
-                let wait = Self::run_once(&root, &running, &may_delete).await;
+                let (state, wait) = Self::run_once(&root, &running, &ocr_done, &activity).await;
+                activity.converter_sleeps(state, wait);
                 tokio::time::sleep(wait).await;
             }
 
@@ -512,15 +624,39 @@ impl Converter {
     }
 
     /// Delete the PNGs of every hour that may go, convert at most one batch,
-    /// and return how long to wait before the next attempt.
-    async fn run_once(root: &Path, running: &Arc<AtomicBool>, may_delete: &DeleteCheck) -> Duration {
+    /// and return what the converter waits for and how long before the next
+    /// attempt.
+    async fn run_once(
+        root: &Path,
+        running: &Arc<AtomicBool>,
+        ocr_done: &OcrCheck,
+        activity: &Activity,
+    ) -> (State, Duration) {
         let now = Local::now();
 
         // Deleting is cheap, so it does not wait for AC power.
-        match find_deletable_hours(root, now, may_delete) {
+        match find_deletable_hours(root, now, ocr_done) {
             Ok(hours) => {
                 for parts in hours {
+                    // Videos converted before frames were recorded get their
+                    // record here, while the PNGs still say what is in them.
+                    if let Err(e) = record_frames(root, &parts, true) {
+                        eprintln!("Kept the frames of {} {:02}:00: could not record them: {}", parts[0].day, parts[0].hour, e);
+                        continue;
+                    }
+                    match matches_record(root, &parts) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            eprintln!("Kept the frames of {} {:02}:00: some are not in its video", parts[0].day, parts[0].hour);
+                            continue;
+                        }
+                        Err(e) => {
+                            eprintln!("Kept the frames of {} {:02}:00: could not check its video: {}", parts[0].day, parts[0].hour, e);
+                            continue;
+                        }
+                    }
                     let deleted = delete_frames(&parts);
+                    activity.frames_deleted(deleted);
                     println!("Deleted {} converted frames from {} {:02}:00", deleted, parts[0].day, parts[0].hour);
                 }
             }
@@ -531,18 +667,21 @@ impl Converter {
         }
 
         if !on_ac_power() {
-            return ON_BATTERY_POLL;
+            return (State::OnBattery, ON_BATTERY_POLL);
         }
 
-        let batches = match find_ready_batches(root, now) {
-            Ok(batches) => batches,
+        let batch = match read_batches(root, now, ocr_done) {
+            Ok((read, waiting_for_ocr)) => {
+                activity.conversion_backlog(read.len().saturating_sub(1), waiting_for_ocr);
+                match read.into_iter().next() {
+                    Some(batch) => batch,
+                    None => return (State::Idle, IDLE_POLL),
+                }
+            }
             Err(e) => {
                 eprintln!("Failed to scan for screenshots to convert: {}", e);
-                return IDLE_POLL;
+                return (State::Idle, IDLE_POLL);
             }
-        };
-        let Some(batch) = batches.into_iter().next() else {
-            return IDLE_POLL;
         };
 
         println!(
@@ -551,7 +690,15 @@ impl Converter {
             batch.day,
             batch.hour
         );
-        let started = SystemTime::now();
+        let started = Instant::now();
+        let video_name = batch.video_name();
+        activity.encoding_started(Encoding {
+            video: video_name.clone(),
+            day: batch.day.clone(),
+            hour: batch.hour,
+            frames: batch.frames.len(),
+            started_at: Local::now(),
+        });
         let root_owned = root.to_path_buf();
         let running_owned = Arc::clone(running);
         let result = tokio::task::spawn_blocking(move || {
@@ -562,22 +709,31 @@ impl Converter {
         .await
         .unwrap_or_else(|e| Err(ConvertError::Failed(format!("Conversion task panicked: {}", e))));
 
+        let took = started.elapsed();
         match result {
             Ok(video_name) => {
-                let took = started.elapsed().unwrap_or_default().as_secs();
-                println!("Published {} after {}s", video_name, took);
-                COOL_DOWN
+                println!("Published {} after {}s", video_name, took.as_secs());
+                activity.encoding_finished(video_name, took, None);
+                (State::Resting, rest_after(took))
             }
             Err(ConvertError::Interrupted) => {
                 println!("Video conversion interrupted; the frames were kept");
-                ON_BATTERY_POLL
+                activity.encoding_finished(video_name, took, Some("Stopped because the power was unplugged".to_string()));
+                (State::OnBattery, ON_BATTERY_POLL)
             }
             Err(e) => {
                 eprintln!("Video conversion failed, frames kept: {}", e);
-                COOL_DOWN
+                activity.encoding_finished(video_name, took, Some(e.to_string()));
+                (State::Resting, rest_after(took))
             }
         }
     }
+}
+
+/// How long to wait after a batch that took `took`, so that the next one
+/// starts `BATCH_INTERVAL` after this one started.
+fn rest_after(took: Duration) -> Duration {
+    BATCH_INTERVAL.saturating_sub(took)
 }
 
 #[cfg(test)]
@@ -585,6 +741,7 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
     use std::fs::{self, File, FileTimes};
+    use std::time::SystemTime;
     use tempfile::TempDir;
 
     fn at(day: &str, hour: u32, minute: u32) -> DateTime<Local> {
@@ -650,6 +807,55 @@ mod tests {
     }
 
     #[test]
+    fn files_a_frame_written_after_midnight_under_its_folders_last_hour() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        frame(root, "2026-10-01", 1, at("2026-10-01", 0, 10));
+        frame(root, "2026-10-01", 2, at("2026-10-01", 23, 30));
+        // Taken at 23:59:59 and written just after midnight, into the folder
+        // of the day it was taken.
+        frame(root, "2026-10-01", 3, at("2026-10-02", 0, 0));
+
+        let batches = find_ready_batches(root, at("2026-10-02", 0, 5)).unwrap();
+
+        let summary: Vec<(u32, String, usize)> = batches
+            .iter()
+            .map(|b| (b.hour, b.video_name(), b.frames.len()))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                (0, "2026-10-01--00-10-00--hourly.mov".to_string(), 1),
+                (23, "2026-10-01--23-30-00--hourly.mov".to_string(), 2),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_frame_written_after_midnight_alone_is_named_within_its_day() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        frame(root, "2026-10-01", 1, at("2026-10-02", 0, 0));
+
+        let batches = find_ready_batches(root, at("2026-10-02", 0, 5)).unwrap();
+
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].hour, 23);
+        assert_eq!(batches[0].video_name(), "2026-10-01--23-59-59--hourly.mov");
+    }
+
+    #[test]
+    fn waits_a_minute_after_the_hour_for_late_writes() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        frame(root, "2026-10-01", 1, at("2026-10-01", 9, 30));
+        let just_after = at("2026-10-01", 10, 0) + chrono::Duration::seconds(30);
+
+        assert!(find_ready_batches(root, just_after).unwrap().is_empty());
+        assert_eq!(find_ready_batches(root, at("2026-10-01", 10, 1)).unwrap().len(), 1);
+    }
+
+    #[test]
     fn skips_hours_that_already_have_a_video() {
         let temp = TempDir::new().unwrap();
         let root = temp.path();
@@ -677,7 +883,7 @@ mod tests {
         assert!(find_deletable_hours(root, now, &always(true)).unwrap().is_empty());
     }
 
-    fn always(answer: bool) -> DeleteCheck {
+    fn always(answer: bool) -> OcrCheck {
         Arc::new(move |_| answer)
     }
 
@@ -760,7 +966,8 @@ mod tests {
         let batches = find_ready_batches(root, at("2026-10-02", 0, 0)).unwrap();
 
         assert_eq!(batches.len(), 1);
-        assert_eq!(batches[0].frames, vec![f9, f10]);
+        let paths: Vec<PathBuf> = batches[0].frames.iter().map(|frame| frame.path.clone()).collect();
+        assert_eq!(paths, vec![f9, f10]);
     }
 
     #[test]
@@ -806,6 +1013,102 @@ mod tests {
             fs::read_dir(root.join(".cache")).unwrap().next().is_none(),
             "the staging folder is cleaned up"
         );
+    }
+
+    /// The recorded (day, frame number, local time) of each frame of `video`,
+    /// in video order.
+    fn recorded(root: &Path, video: &str) -> Vec<(String, u32, String)> {
+        let conn = rusqlite::Connection::open(root.join("screenshots.db")).unwrap();
+        let mut statement = conn
+            .prepare("SELECT day, frame_number, local_time FROM video_frames WHERE video = ?1 ORDER BY frame_index")
+            .unwrap();
+        let rows = statement
+            .query_map([video], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        rows
+    }
+
+    #[test]
+    fn converting_records_which_screenshot_each_video_frame_is() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        frame(root, "2026-10-01", 1, at("2026-10-01", 9, 0));
+        frame(root, "2026-10-01", 7, at("2026-10-01", 9, 40));
+        // Frame 1 has a database row, written a moment after its file; frame
+        // 7 has none, so its file time stands in.
+        let captured = at("2026-10-01", 9, 0) + chrono::Duration::milliseconds(300);
+        ScreenshotDatabase::new(root.join("screenshots.db"))
+            .unwrap()
+            .insert_screenshot("2026-10-01", 1, captured.into(), captured)
+            .unwrap();
+        let batch = find_ready_batches(root, at("2026-10-02", 0, 0)).unwrap().remove(0);
+
+        let mut seen = 0;
+        let name = convert_batch(root, &batch, fake_encode(&mut seen)).unwrap();
+
+        assert_eq!(
+            recorded(root, &name),
+            vec![
+                ("2026-10-01".to_string(), 1, captured.to_rfc3339()),
+                ("2026-10-01".to_string(), 7, at("2026-10-01", 9, 40).to_rfc3339()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_database_it_cannot_write_does_not_waste_the_encode() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        frame(root, "2026-10-01", 1, at("2026-10-01", 9, 0));
+        fs::create_dir(root.join("screenshots.db")).unwrap();
+        let batch = find_ready_batches(root, at("2026-10-02", 0, 0)).unwrap().remove(0);
+
+        let mut seen = 0;
+        let name = convert_batch(root, &batch, fake_encode(&mut seen)).unwrap();
+
+        assert!(root.join(&name).exists());
+        let hours = find_deletable_hours(root, at("2026-10-02", 0, 0), &always(true)).unwrap();
+        assert!(
+            record_frames(root, &hours[0], true).is_err(),
+            "so run_once keeps the PNGs"
+        );
+    }
+
+    #[test]
+    fn a_failed_encode_records_nothing() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        frame(root, "2026-10-01", 1, at("2026-10-01", 9, 0));
+        let batch = find_ready_batches(root, at("2026-10-02", 0, 0)).unwrap().remove(0);
+
+        let _ = convert_batch(root, &batch, |_, _| Err(ConvertError::Interrupted));
+
+        assert!(!root.join("screenshots.db").exists() || recorded(root, &batch.video_name()).is_empty());
+    }
+
+    #[test]
+    fn records_videos_converted_before_frames_were_recorded() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        frame(root, "2026-10-01", 3, at("2026-10-01", 9, 0));
+        frame(root, "2026-10-01", 4, at("2026-10-01", 9, 1));
+        fs::write(root.join("2026-10-01--09-00-00--hourly.mov"), b"video").unwrap();
+        let hours = find_deletable_hours(root, at("2026-10-02", 0, 0), &always(true)).unwrap();
+
+        record_frames(root, &hours[0], true).unwrap();
+        let numbers: Vec<u32> = recorded(root, "2026-10-01--09-00-00--hourly.mov")
+            .into_iter()
+            .map(|(_, number, _)| number)
+            .collect();
+        assert_eq!(numbers, vec![3, 4]);
+
+        // An existing record is what the video was encoded from; it stays.
+        let mut fewer = hours[0].clone();
+        fewer[0].frames.truncate(1);
+        record_frames(root, &fewer, true).unwrap();
+        assert_eq!(recorded(root, "2026-10-01--09-00-00--hourly.mov").len(), 2);
     }
 
     #[test]
@@ -875,6 +1178,37 @@ mod tests {
     }
 
     #[test]
+    fn keeps_yesterdays_empty_folder_for_a_minute_after_midnight() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        fs::create_dir_all(root.join("2026-10-01")).unwrap();
+        let just_after = at("2026-10-02", 0, 0) + chrono::Duration::seconds(30);
+
+        assert_eq!(remove_empty_day_folders(root, just_after).unwrap(), 0);
+        assert_eq!(remove_empty_day_folders(root, at("2026-10-02", 0, 1)).unwrap(), 1);
+    }
+
+    #[test]
+    fn a_frame_that_joined_after_conversion_keeps_its_hour() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        frame(root, "2026-10-01", 1, at("2026-10-01", 23, 30));
+        let now = at("2026-10-02", 0, 5);
+        let batch = find_ready_batches(root, now).unwrap().remove(0);
+        let mut seen = 0;
+        convert_batch(root, &batch, fake_encode(&mut seen)).unwrap();
+        let hours = find_deletable_hours(root, now, &always(true)).unwrap();
+        assert!(matches_record(root, &hours[0]).unwrap());
+
+        // Written very late, after its hour was converted.
+        frame(root, "2026-10-01", 2, at("2026-10-02", 0, 3));
+
+        let hours = find_deletable_hours(root, now, &always(true)).unwrap();
+        assert_eq!(hours[0][0].frames.len(), 2);
+        assert!(!matches_record(root, &hours[0]).unwrap());
+    }
+
+    #[test]
     fn clears_stale_staging_but_not_frame_caches() {
         let temp = TempDir::new().unwrap();
         let root = temp.path();
@@ -887,6 +1221,42 @@ mod tests {
 
         assert!(!stale.exists());
         assert!(frames.exists());
+    }
+
+    #[test]
+    fn batches_start_every_ten_minutes_while_behind() {
+        let minutes = |m: u64| Duration::from_secs(m * 60);
+        assert_eq!(rest_after(minutes(4)), minutes(6));
+        assert_eq!(rest_after(Duration::ZERO), minutes(10));
+        assert_eq!(rest_after(minutes(10)), Duration::ZERO);
+        assert_eq!(rest_after(minutes(25)), Duration::ZERO);
+    }
+
+    #[test]
+    fn converts_only_hours_ocr_has_read() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        frame(root, "2026-10-01", 1, at("2026-10-01", 8, 0));
+        frame(root, "2026-10-01", 2, at("2026-10-01", 9, 0));
+        frame(root, "2026-10-01", 3, at("2026-10-01", 10, 0));
+        let now = at("2026-10-02", 0, 0);
+
+        assert_eq!(next_batch(root, now, &always(false)).unwrap(), None);
+
+        let read_through = |last: u32| -> OcrCheck {
+            Arc::new(move |batch: &HourBatch| batch.frames.iter().all(|f| f.number <= last))
+        };
+        assert_eq!(next_batch(root, now, &read_through(2)).unwrap().unwrap().hour, 8);
+
+        fs::write(root.join("2026-10-01--08-00-00--hourly.mov"), b"video").unwrap();
+        assert_eq!(next_batch(root, now, &read_through(2)).unwrap().unwrap().hour, 9);
+
+        fs::write(root.join("2026-10-01--09-00-00--hourly.mov"), b"video").unwrap();
+        assert_eq!(
+            next_batch(root, now, &read_through(2)).unwrap(),
+            None,
+            "10:00 waits for OCR"
+        );
     }
 
     #[test]
