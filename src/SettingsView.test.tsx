@@ -27,6 +27,15 @@ describe('SettingsView', () => {
     expect(invoke).toHaveBeenCalledWith('get_settings');
   });
 
+  it('sizes the window to its content once loaded', async () => {
+    mocked(invoke).mockResolvedValue({ updateAutomatically: true });
+    render(<SettingsView />);
+
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith('fit_settings_window', { height: expect.any(Number) }),
+    );
+  });
+
   it('saves a change as soon as it is made', async () => {
     answer(async (cmd, args) =>
       cmd === 'get_settings'

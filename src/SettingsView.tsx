@@ -1,7 +1,7 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 
 import "./App.css";
-import { getSettings, setUpdateAutomatically, type Settings } from "./settings";
+import { fitSettingsWindow, getSettings, setUpdateAutomatically, type Settings } from "./settings";
 import { focusRing } from "./ui";
 
 /**
@@ -11,10 +11,27 @@ import { focusRing } from "./ui";
 export function SettingsView(): React.ReactNode {
   const [settings, setSettings] = useState<Settings | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const main = useRef<HTMLElement>(null);
+  const loaded = settings !== null || error !== null;
 
   useEffect(() => {
     getSettings().then(setSettings, (e: unknown) => setError(String(e)));
   }, []);
+
+  // The window is exactly as tall as its content, so the margin below the
+  // card matches the margin above it. Measured once the fonts are in, since
+  // they set how the description wraps.
+  useEffect(() => {
+    if (!loaded) return;
+    // happy-dom, in tests, has no FontFaceSet.
+    void (document.fonts?.ready ?? Promise.resolve()).then(() => {
+      if (main.current) {
+        fitSettingsWindow(main.current.getBoundingClientRect().height).catch((e: unknown) =>
+          console.error("Could not size the Settings window:", e),
+        );
+      }
+    });
+  }, [loaded, error]);
 
   const toggleUpdates = (enabled: boolean): void => {
     const previous = settings;
@@ -27,7 +44,7 @@ export function SettingsView(): React.ReactNode {
   };
 
   return (
-    <main className="min-h-screen bg-page p-4 text-sm flex flex-col gap-3">
+    <main ref={main} className="bg-page p-4 text-sm flex flex-col gap-3">
       {error && (
         <p role="alert" className="text-danger">
           Could not save the setting: {error}
