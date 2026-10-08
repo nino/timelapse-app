@@ -42,6 +42,9 @@ frame_source = { path = "frame-source" }
 libc = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
+# The version the `screenshots` crate uses, for capturing without its PNG round trip.
+core-graphics = "0.22"
+foreign-types = "0.3"
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSDictionary", "NSEnumerator", "NSError", "NSString", "NSURL"] }
 objc2-vision = { version = "0.3", default-features = false, features = ["std", "objc2-core-foundation", "VNObservation", "VNRecognizeTextRequest", "VNRequest", "VNRequestHandler", "VNTypes"] }
@@ -54,9 +57,11 @@ tempfile = "3.17"
 [workspace]
 members = ["frame-source"]
 
-# The capture loop decodes, resizes and re-encodes a screen-sized PNG every
-# second. Unoptimized, that alone overruns the interval under `tauri dev`, so
-# the image crates are optimized even in debug builds.
+# The capture loop resizes a screen-sized capture and encodes a PNG every
+# second (and off macOS decodes a screen-sized PNG first). Unoptimized, that
+# alone overruns the interval under `tauri dev`, so the image crates are
+# optimized even in debug builds. The channel swap in `fit_to_frame` is the
+# one per-pixel loop left in the app crate, on the small frame.
 [profile.dev.package.image]
 opt-level = 3
 [profile.dev.package.png]

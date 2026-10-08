@@ -1,11 +1,12 @@
 use active_win_pos_rs::get_active_window;
 use chrono::{DateTime, Utc, Local};
-use fast_image_resize::images::CroppedImageMut;
-use fast_image_resize::{FilterType, ResizeAlg, ResizeOptions, Resizer};
+use fast_image_resize::images::{CroppedImageMut, ImageRef};
+use fast_image_resize::{FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer};
 use image::{ImageFormat, RgbImage};
 use screenshots::Screen;
 use serde::{Deserialize, Serialize};
 use std::{
+    borrow::Cow,
     path::PathBuf,
     sync::atomic::{AtomicBool, Ordering},
     sync::{Arc, Mutex},
@@ -189,12 +190,15 @@ impl Photographer {
                 .ok_or(Error::UnableToConvertScreenshotPathToString)?,
         );
 
-        let image_data = capture_screenshot().await?;
+        // Get the focused screen by finding which screen contains the active window
+        let screen = get_focused_screen().await?;
 
-        // Decoding, resizing and encoding take a good part of a second, so
-        // they run on the blocking pool rather than holding up a runtime worker.
+        // Capturing, resizing and encoding take tens of milliseconds, so they
+        // run on the blocking pool rather than holding up a runtime worker.
         let path = screenshot_path.clone();
-        let is_black = tokio::task::spawn_blocking(move || store_frame(&image_data, &path))
+        let is_black = tokio::task::spawn_blocking(move || {
+            with_capture(&screen, |capture| store_frame(capture, &path))
+        })
             .await
             .map_err(|e| Error::UnableToWriteScreenshot {
                 path: screenshot_path.clone(),
@@ -256,24 +260,143 @@ fn next_filename(day_dir: &PathBuf) -> Result<String, Error> {
     Ok(format!("{:05}.png", max + 1))
 }
 
-async fn capture_screenshot() -> Result<Vec<u8>, Error> {
-    // Get the focused screen by finding which screen contains the active window
-    let focused_screen = get_focused_screen().await?;
+/// A captured screen as raw pixels, four bytes each, rows `bytes_per_row`
+/// apart (which can be more than `width * 4`). On macOS the pixels are
+/// borrowed from Core Graphics' own copy of the screen.
+struct Capture<'a> {
+    width: u32,
+    height: u32,
+    bytes_per_row: usize,
+    pixels: Cow<'a, [u8]>,
+    /// Whether each pixel is blue, green, red, alpha (Core Graphics' order)
+    /// rather than red, green, blue, alpha.
+    bgra: bool,
+}
 
-    // Capture screenshot using system API
-    let image = focused_screen
-        .capture()
-        .map_err(|err| Error::UnableToCreateScreenshot {
-            reason: err.to_string(),
-        })?;
+impl Capture<'_> {
+    /// Decode a PNG, as the `screenshots` crate returns captures off macOS.
+    #[cfg(any(not(target_os = "macos"), test))]
+    fn from_png(data: &[u8]) -> Result<Capture<'static>, Error> {
+        let image = image::load_from_memory_with_format(data, ImageFormat::Png)
+            .map_err(|e| Error::UnableToCreateScreenshot {
+                reason: format!("Failed to read image: {}", e),
+            })?
+            .into_rgba8();
+        let (width, height) = image.dimensions();
+        Ok(Capture {
+            width,
+            height,
+            bytes_per_row: width as usize * 4,
+            pixels: Cow::Owned(image.into_raw()),
+            bgra: false,
+        })
+    }
+}
 
-    // The Image struct contains PNG data in its buffer
-    // We need to save it as a file
-    let buffer = image.buffer();
-    // std::fs::write(screenshot_path, buffer).map_err(|_| Error::UnableToCreateScreenshot)?;
+/// Capture `screen` and hand the capture to `use_capture`.
+///
+/// On macOS this asks Core Graphics directly and lends out its pixels as they
+/// are. The `screenshots` crate's own `capture()` swaps every pixel to RGBA and
+/// encodes a full-resolution PNG, which `fit_to_frame` would only decode again.
+/// The capture can't outlive the Core Graphics image, which isn't `Send`,
+/// hence the callback rather than a return value.
+#[cfg(target_os = "macos")]
+fn with_capture<R>(
+    screen: &Screen,
+    use_capture: impl FnOnce(&Capture) -> Result<R, Error>,
+) -> Result<R, Error> {
+    use core_graphics::base::{kCGBitmapByteOrder32Little, kCGImageAlphaNoneSkipFirst};
+    use core_graphics::color_space::CGColorSpace;
+    use core_graphics::context::CGContext;
+    use core_graphics::display::{
+        kCGNullWindowID, kCGWindowImageDefault, kCGWindowListOptionOnScreenOnly, CGDisplay,
+    };
+    use core_graphics::geometry::{CGPoint, CGRect, CGSize};
 
-    // println!("Screenshot saved to {}", screenshot_path);
-    Ok(buffer.clone())
+    let image = CGDisplay::screenshot(
+        CGDisplay::new(screen.display_info.id).bounds(),
+        kCGWindowListOptionOnScreenOnly,
+        kCGNullWindowID,
+        kCGWindowImageDefault,
+    )
+    .ok_or_else(|| Error::UnableToCreateScreenshot {
+        reason: format!("Screen {} could not be captured", screen.display_info.id),
+    })?;
+    let (width, height) = (image.width(), image.height());
+
+    if is_bgra(&image) {
+        let data = image.data();
+        return use_capture(&Capture {
+            width: width as u32,
+            height: height as u32,
+            bytes_per_row: image.bytes_per_row(),
+            pixels: Cow::Borrowed(data.bytes()),
+            bgra: true,
+        });
+    }
+
+    // Any other layout (16-bit pixels from an HDR display, say) is drawn into
+    // a BGRA buffer of our own, which costs about as much as the PNG round
+    // trip did.
+    let mut pixels = vec![0u8; width * height * 4];
+    {
+        let context = CGContext::create_bitmap_context(
+            Some(pixels.as_mut_ptr().cast()),
+            width,
+            height,
+            8,
+            width * 4,
+            &CGColorSpace::create_device_rgb(),
+            kCGImageAlphaNoneSkipFirst | kCGBitmapByteOrder32Little,
+        );
+        let bounds = CGRect::new(&CGPoint::new(0.0, 0.0), &CGSize::new(width as f64, height as f64));
+        context.draw_image(bounds, &image);
+    }
+    use_capture(&Capture {
+        width: width as u32,
+        height: height as u32,
+        bytes_per_row: width * 4,
+        pixels: Cow::Owned(pixels),
+        bgra: true,
+    })
+}
+
+/// Whether `image` is 8-bit BGRA (or BGRX) in memory, which is what Core
+/// Graphics returns for an ordinary display.
+#[cfg(target_os = "macos")]
+fn is_bgra(image: &core_graphics::image::CGImage) -> bool {
+    use core_graphics::base::{
+        kCGBitmapByteOrder32Little, kCGImageAlphaFirst, kCGImageAlphaNoneSkipFirst,
+        kCGImageAlphaPremultipliedFirst,
+    };
+    use foreign_types::ForeignType;
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        // core-graphics 0.22 has no wrapper for it.
+        fn CGImageGetBitmapInfo(image: core_graphics::sys::CGImageRef) -> u32;
+    }
+    const ALPHA_INFO_MASK: u32 = 0x1F;
+    const BYTE_ORDER_MASK: u32 = 0x7000;
+
+    // SAFETY: a plain property read on a valid image.
+    let info = unsafe { CGImageGetBitmapInfo(image.as_ptr()) };
+    image.bits_per_pixel() == 32
+        && image.bits_per_component() == 8
+        && info & BYTE_ORDER_MASK == kCGBitmapByteOrder32Little
+        && [kCGImageAlphaPremultipliedFirst, kCGImageAlphaFirst, kCGImageAlphaNoneSkipFirst]
+            .contains(&(info & ALPHA_INFO_MASK))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn with_capture<R>(
+    screen: &Screen,
+    use_capture: impl FnOnce(&Capture) -> Result<R, Error>,
+) -> Result<R, Error> {
+    let image = screen.capture().map_err(|err| Error::UnableToCreateScreenshot {
+        reason: err.to_string(),
+    })?;
+    use_capture(&Capture::from_png(image.buffer())?)
 }
 
 async fn get_focused_screen() -> Result<Screen, Error> {
@@ -333,14 +456,14 @@ fn window_overlaps_screen(window: (i32, i32, i32, i32), screen: (i32, i32, u32, 
 const FRAME_WIDTH: u32 = 1800;
 const FRAME_HEIGHT: u32 = 1124;
 
-/// Fit a captured PNG into a frame and write it to `file_path`, unless the
+/// Fit a capture into a frame and write it to `file_path` as a PNG, unless the
 /// frame is all black. Returns whether it was black (and so not written).
 ///
 /// The PNG is written to a hidden temporary file beside `file_path` and renamed
 /// into place, so an interrupted write never leaves a truncated `NNNNN.png`
 /// for `next_filename`, the viewer and the converter to trip over.
-fn store_frame(data: &[u8], file_path: &str) -> Result<bool, Error> {
-    let frame = fit_to_frame(data, file_path)?;
+fn store_frame(capture: &Capture, file_path: &str) -> Result<bool, Error> {
+    let frame = fit_to_frame(capture, file_path)?;
     if is_image_all_black(&frame) {
         return Ok(true);
     }
@@ -377,24 +500,42 @@ thread_local! {
     static RESIZER: std::cell::RefCell<Resizer> = std::cell::RefCell::new(Resizer::new());
 }
 
-/// Decode a captured PNG, scale it to fit `FRAME_WIDTH`×`FRAME_HEIGHT` keeping
-/// its aspect ratio, and centre it on a black canvas of exactly that size.
-fn fit_to_frame(data: &[u8], file_path: &str) -> Result<RgbImage, Error> {
+/// Scale a capture to fit `FRAME_WIDTH`×`FRAME_HEIGHT` keeping its aspect
+/// ratio, and centre it on a black canvas of exactly that size.
+fn fit_to_frame(capture: &Capture, file_path: &str) -> Result<RgbImage, Error> {
     let resize_error = |reason: String| Error::UnableToResizeScreenshot {
         path: file_path.to_string(),
         reason,
     };
 
-    // Captures are RGBA, for which this is not a copy. The alpha is opaque, so
-    // it is resized as a plain fourth channel and dropped once the frame is
-    // small.
-    let source = image::load_from_memory_with_format(data, ImageFormat::Png)
-        .map_err(|e| resize_error(format!("Failed to read image: {}", e)))?
-        .into_rgba8();
-    let (orig_width, orig_height) = source.dimensions();
+    let (orig_width, orig_height) = (capture.width, capture.height);
     if orig_width == 0 || orig_height == 0 {
         return Err(resize_error("Captured image is empty".to_string()));
     }
+    let row_len = orig_width as usize * 4;
+    let bytes_per_row = capture.bytes_per_row;
+    if bytes_per_row < row_len || bytes_per_row % 4 != 0 {
+        return Err(resize_error(format!("Rows of {} bytes can't hold {} pixels", bytes_per_row, orig_width)));
+    }
+    // Core Graphics pads each row (to 3040 pixels for a 3024-pixel screen), so
+    // the source is the whole padded buffer and the resize is told to read
+    // only the image's own columns, rather than copying the rows together
+    // first. A buffer whose last row stops short of the padding is padded out.
+    let full_len = bytes_per_row * orig_height as usize;
+    let padded: Cow<[u8]> = if capture.pixels.len() >= full_len {
+        Cow::Borrowed(&capture.pixels[..full_len])
+    } else if capture.pixels.len() >= full_len - (bytes_per_row - row_len) {
+        let mut pixels = capture.pixels.to_vec();
+        pixels.resize(full_len, 0);
+        Cow::Owned(pixels)
+    } else {
+        return Err(resize_error("Captured image is shorter than its size".to_string()));
+    };
+    // The channel order doesn't matter to the resizer, so BGRA is resized as
+    // it is and swapped once the frame is small. The alpha is opaque, so it is
+    // resized as a plain fourth channel and dropped.
+    let source = ImageRef::new((bytes_per_row / 4) as u32, orig_height, &padded, PixelType::U8x4)
+        .map_err(|e| resize_error(format!("Failed to read image: {}", e)))?;
 
     let scale = (FRAME_WIDTH as f64 / orig_width as f64).min(FRAME_HEIGHT as f64 / orig_height as f64);
     let new_width = ((orig_width as f64 * scale) as u32).clamp(1, FRAME_WIDTH);
@@ -404,17 +545,26 @@ fn fit_to_frame(data: &[u8], file_path: &str) -> Result<RgbImage, Error> {
 
     // Resize straight into the centre of an opaque black canvas. Box filter, as
     // the ImageMagick version used: each output pixel is the average of the
-    // source pixels it covers, which keeps text legible.
+    // source pixels it covers, which keeps text legible. It is also what keeps
+    // the row padding out: `crop` bounds where output pixels are taken from,
+    // but a wider filter (Lanczos3, say) would still reach into the padding
+    // for the rightmost column.
     let mut canvas = image::RgbaImage::from_pixel(FRAME_WIDTH, FRAME_HEIGHT, image::Rgba([0, 0, 0, 255]));
     let mut target = CroppedImageMut::new(&mut canvas, x_offset, y_offset, new_width, new_height)
         .map_err(|e| resize_error(format!("Failed to place image: {}", e)))?;
     let options = ResizeOptions::new()
         .resize_alg(ResizeAlg::Convolution(FilterType::Box))
+        .crop(0.0, 0.0, orig_width as f64, orig_height as f64)
         .use_alpha(false);
     RESIZER
         .with(|resizer| resizer.borrow_mut().resize(&source, &mut target, &options))
         .map_err(|e| resize_error(format!("Failed to resize image: {}", e)))?;
 
+    if capture.bgra {
+        for pixel in canvas.chunks_exact_mut(4) {
+            pixel.swap(0, 2);
+        }
+    }
     Ok(image::DynamicImage::ImageRgba8(canvas).into_rgb8())
 }
 
@@ -686,17 +836,23 @@ mod tests {
         assert_eq!(deserialized.unwrap().error_message, "Test error message");
     }
 
-    fn png_of(image: &RgbImage) -> Vec<u8> {
-        let mut bytes = std::io::Cursor::new(Vec::new());
-        image.write_to(&mut bytes, ImageFormat::Png).unwrap();
-        bytes.into_inner()
+    /// An RGBA capture of `image`, rows packed.
+    fn capture_of(image: &RgbImage) -> Capture<'static> {
+        let rgba = image::DynamicImage::ImageRgb8(image.clone()).into_rgba8();
+        Capture {
+            width: image.width(),
+            height: image.height(),
+            bytes_per_row: image.width() as usize * 4,
+            pixels: Cow::Owned(rgba.into_raw()),
+            bgra: false,
+        }
     }
 
     #[test]
     fn test_fit_to_frame_letterboxes_a_taller_screen() {
         // 1000×1000 scales to 1124×1124, centred with 338px black bars each side.
         let white = RgbImage::from_pixel(1000, 1000, image::Rgb([255, 255, 255]));
-        let frame = fit_to_frame(&png_of(&white), "test.png").unwrap();
+        let frame = fit_to_frame(&capture_of(&white), "test.png").unwrap();
 
         assert_eq!(frame.dimensions(), (FRAME_WIDTH, FRAME_HEIGHT));
         assert_eq!(frame.get_pixel(0, 562).0, [0, 0, 0]);
@@ -710,7 +866,7 @@ mod tests {
     #[test]
     fn test_fit_to_frame_downscales_a_retina_capture() {
         let capture = RgbImage::from_pixel(3456, 2234, image::Rgb([10, 200, 30]));
-        let frame = fit_to_frame(&png_of(&capture), "test.png").unwrap();
+        let frame = fit_to_frame(&capture_of(&capture), "test.png").unwrap();
 
         assert_eq!(frame.dimensions(), (FRAME_WIDTH, FRAME_HEIGHT));
         // 3456×2234 fits as 1738×1124, leaving 31px bars left and right.
@@ -720,9 +876,117 @@ mod tests {
     }
 
     #[test]
-    fn test_fit_to_frame_rejects_garbage() {
-        let result = fit_to_frame(b"not a png", "/test/path");
+    fn test_fit_to_frame_reads_padded_bgra_rows() {
+        // Core Graphics' layout: blue, green, red, alpha, and rows that may
+        // run past the image. Here each 900px row carries 16 bytes of padding,
+        // filled with white so it would show if it leaked into the frame.
+        let (width, height, bytes_per_row) = (900, 562, 900 * 4 + 16);
+        let mut pixels = vec![255u8; bytes_per_row * height];
+        for row in pixels.chunks_mut(bytes_per_row) {
+            for pixel in row[..width * 4].chunks_mut(4) {
+                pixel.copy_from_slice(&[30, 200, 10, 255]);
+            }
+        }
+        let capture = Capture { width: width as u32, height: height as u32, bytes_per_row, pixels: Cow::Owned(pixels), bgra: true };
+
+        let frame = fit_to_frame(&capture, "test.png").unwrap();
+
+        // 900×562 scales by 2 to 1800×1124, filling the frame.
+        assert_eq!(frame.get_pixel(0, 0).0, [10, 200, 30]);
+        assert_eq!(frame.get_pixel(1799, 1123).0, [10, 200, 30]);
+    }
+
+    /// A BGRA capture the size of a 14" MacBook screen, its 3024-pixel rows
+    /// padded to 3040 as Core Graphics pads them, the padding white.
+    fn padded_retina_capture() -> (usize, Vec<u8>) {
+        let (width, height, bytes_per_row) = (3024, 1964, 3040 * 4);
+        let mut pixels = vec![255u8; bytes_per_row * height];
+        for row in pixels.chunks_mut(bytes_per_row) {
+            for pixel in row[..width * 4].chunks_mut(4) {
+                pixel.copy_from_slice(&[30, 200, 10, 255]);
+            }
+        }
+        (bytes_per_row, pixels)
+    }
+
+    #[test]
+    fn test_fit_to_frame_keeps_row_padding_out_of_a_downscaled_frame() {
+        let (bytes_per_row, pixels) = padded_retina_capture();
+        let capture = Capture { width: 3024, height: 1964, bytes_per_row, pixels: Cow::Owned(pixels), bgra: true };
+
+        let frame = fit_to_frame(&capture, "test.png").unwrap();
+
+        // 3024×1964 fits as 1730×1124, from x = 35 to 1764.
+        assert_eq!(frame.get_pixel(34, 562).0, [0, 0, 0]);
+        assert_eq!(frame.get_pixel(35, 562).0, [10, 200, 30]);
+        assert_eq!(frame.get_pixel(1764, 562).0, [10, 200, 30], "no padding in the last column");
+        assert_eq!(frame.get_pixel(1765, 562).0, [0, 0, 0]);
+    }
+
+    #[test]
+    fn test_fit_to_frame_accepts_a_last_row_without_padding() {
+        let (bytes_per_row, mut pixels) = padded_retina_capture();
+        pixels.truncate(pixels.len() - 16 * 4);
+        let capture = Capture { width: 3024, height: 1964, bytes_per_row, pixels: Cow::Owned(pixels), bgra: true };
+
+        let frame = fit_to_frame(&capture, "test.png").unwrap();
+
+        assert_eq!(frame.get_pixel(1764, 1123).0, [10, 200, 30]);
+    }
+
+    #[test]
+    fn test_fit_to_frame_rejects_rows_too_short_for_the_width() {
+        for bytes_per_row in [399, 402] {
+            let capture = Capture { width: 100, height: 100, bytes_per_row, pixels: Cow::Owned(vec![0; 402 * 100]), bgra: true };
+            let result = fit_to_frame(&capture, "/test/path");
+            assert!(matches!(result, Err(Error::UnableToResizeScreenshot { .. })), "{} bytes a row", bytes_per_row);
+        }
+    }
+
+    #[test]
+    fn test_fit_to_frame_rejects_a_short_buffer() {
+        let capture = Capture { width: 100, height: 100, bytes_per_row: 400, pixels: Cow::Owned(vec![0; 399 * 100]), bgra: true };
+        let result = fit_to_frame(&capture, "/test/path");
         assert!(matches!(result, Err(Error::UnableToResizeScreenshot { .. })));
+    }
+
+    /// Captures the main screen the way the Photographer does and fits it into
+    /// a frame. Needs Screen Recording permission to see more than the
+    /// wallpaper: `cargo test real_capture_fits -- --ignored --nocapture`
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore]
+    fn test_real_capture_fits_a_frame() {
+        let screen = Screen::from_point(0, 0).unwrap();
+        let frame = with_capture(&screen, |capture| {
+            println!(
+                "{}×{}, {} bytes a row, bgra {}, borrowed {}",
+                capture.width,
+                capture.height,
+                capture.bytes_per_row,
+                capture.bgra,
+                matches!(capture.pixels, Cow::Borrowed(_))
+            );
+            fit_to_frame(capture, "test.png")
+        })
+        .unwrap();
+        assert_eq!(frame.dimensions(), (FRAME_WIDTH, FRAME_HEIGHT));
+        // A locked or sleeping screen captures black.
+        println!("all black: {}", is_image_all_black(&frame));
+    }
+
+    #[test]
+    fn test_capture_from_png() {
+        let image = RgbImage::from_pixel(3, 2, image::Rgb([1, 2, 3]));
+        let mut png = std::io::Cursor::new(Vec::new());
+        image.write_to(&mut png, ImageFormat::Png).unwrap();
+
+        let capture = Capture::from_png(png.get_ref()).unwrap();
+
+        assert_eq!((capture.width, capture.height, capture.bytes_per_row), (3, 2, 12));
+        assert_eq!(&capture.pixels[..4], &[1, 2, 3, 255]);
+        assert!(!capture.bgra);
+        assert!(Capture::from_png(b"not a png").is_err());
     }
 
     #[test]
@@ -750,7 +1014,7 @@ mod tests {
         let path = temp.path().join("00001.png");
         let capture = RgbImage::from_pixel(3456, 2234, image::Rgb([200, 200, 200]));
 
-        let is_black = store_frame(&png_of(&capture), path.to_str().unwrap()).unwrap();
+        let is_black = store_frame(&capture_of(&capture), path.to_str().unwrap()).unwrap();
 
         assert!(!is_black);
         let written = image::open(&path).unwrap();
@@ -768,7 +1032,7 @@ mod tests {
         let path = temp.path().join("00001.png");
         let capture = RgbImage::new(3456, 2234);
 
-        assert!(store_frame(&png_of(&capture), path.to_str().unwrap()).unwrap());
+        assert!(store_frame(&capture_of(&capture), path.to_str().unwrap()).unwrap());
         assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 0, "nothing is written");
     }
 
@@ -780,7 +1044,7 @@ mod tests {
         fs::create_dir(&path).unwrap();
         let capture = RgbImage::from_pixel(100, 100, image::Rgb([200, 200, 200]));
 
-        let result = store_frame(&png_of(&capture), path.to_str().unwrap());
+        let result = store_frame(&capture_of(&capture), path.to_str().unwrap());
 
         assert!(matches!(result, Err(Error::UnableToWriteScreenshot { .. })));
         assert!(!temp.path().join(".00001.png.tmp").exists());
