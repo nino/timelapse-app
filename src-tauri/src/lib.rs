@@ -539,6 +539,20 @@ async fn get_activity(
     .await
 }
 
+/// Clear a "Last error" line of the Activity window: the error from `source`
+/// that happened `at` (RFC 3339, as `get_activity` reported it). A newer
+/// error from the same source stays.
+#[tauri::command]
+fn dismiss_error(
+    activity: State<'_, ActivityState>,
+    source: activity::ErrorSource,
+    at: String,
+) -> Result<(), String> {
+    let at = chrono::DateTime::parse_from_rfc3339(&at).map_err(|e| e.to_string())?;
+    activity.dismiss_error(source, at);
+    Ok(())
+}
+
 /// Run conversion and OCR at full speed for `minutes`, on battery too if
 /// `allow_battery`, replacing any boost in progress. Returns the new boost.
 #[tauri::command]
@@ -1143,6 +1157,7 @@ pub fn run() {
             count_ocr_matches,
             get_ocr_version,
             get_activity,
+            dismiss_error,
             start_boost,
             stop_boost,
             start_low_power,

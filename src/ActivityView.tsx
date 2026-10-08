@@ -4,6 +4,7 @@ import "./App.css";
 import {
   ago,
   count,
+  dismissError,
   encodeProgress,
   encodeSeconds,
   formatDuration,
@@ -15,6 +16,7 @@ import {
   until,
   type Activity,
   type Encoding,
+  type ErrorSource,
   type Failure,
 } from "./activity";
 import { useActivity } from "./hooks/useActivity";
@@ -97,12 +99,36 @@ function Row({ label, children }: { label: string; children: React.ReactNode }):
   );
 }
 
-function ErrorRow({ failure, now }: { failure: Failure | null; now: number }): React.ReactNode {
-  if (!failure) return null;
+function ErrorRow({
+  source,
+  failure,
+  now,
+}: {
+  source: ErrorSource;
+  failure: Failure | null;
+  now: number;
+}): React.ReactNode {
+  // Hidden as soon as it is dismissed, rather than on the next poll.
+  const [dismissed, setDismissed] = React.useState<string | null>(null);
+  if (!failure || failure.at === dismissed) return null;
+  const dismiss = (): void => {
+    setDismissed(failure.at);
+    dismissError(source, failure.at).catch((error: unknown) => {
+      console.error("Could not dismiss the error:", error);
+      setDismissed(null);
+    });
+  };
   return (
     <Row label="Last error">
       <span className="text-danger">{failure.message}</span>{" "}
-      <span className="whitespace-nowrap text-muted-fg">({ago(failure.at, now)})</span>
+      <span className="whitespace-nowrap text-muted-fg">({ago(failure.at, now)})</span>{" "}
+      <button
+        type="button"
+        onClick={dismiss}
+        className={`rounded-md px-1 text-muted-fg underline underline-offset-2 hover:text-fg ${focusRing}`}
+      >
+        Dismiss
+      </button>
     </Row>
   );
 }
@@ -280,7 +306,7 @@ function Capture({ capture, now }: { capture: Activity["capture"]; now: number }
         </Row>
       )}
       <Row label="Since launch">{count(framesSaved, "frame")} saved</Row>
-      <ErrorRow failure={lastError} now={now} />
+      <ErrorRow source="capture" failure={lastError} now={now} />
     </Section>
   );
 }
@@ -435,7 +461,7 @@ function Ocr({ ocr, now }: { ocr: Activity["ocr"]; now: number }): React.ReactNo
       <Row label="Since launch">
         {count(recognized, "frame")} read, {skipped.toLocaleString("en-US")} unchanged
       </Row>
-      <ErrorRow failure={lastError} now={now} />
+      <ErrorRow source="ocr" failure={lastError} now={now} />
     </Section>
   );
 }
