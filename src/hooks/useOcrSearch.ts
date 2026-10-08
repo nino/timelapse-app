@@ -104,11 +104,23 @@ export function useDayMatches(
   return { matches: blank ? [] : value, matchesError: error };
 }
 
-/** Days where `query` was on screen, newest first. Empty for a blank query. */
+/**
+ * Days where `query` was on screen, newest first. Empty for a blank query.
+ * While a changed query loads, the previous query's days stay, so the
+ * "Also on" bar doesn't vanish and reappear on every keystroke; it goes only
+ * when a search finds nothing (or fails).
+ */
 export function useMatchCounts(query: string, version: string | null): Array<DayCount> {
   const blank = query.trim() === "";
-  const { value } = useAnswer(blank ? null : query, version, () => countMatches(query));
-  return blank ? [] : (value ?? []);
+  const { value, error } = useAnswer(blank ? null : query, version, () => countMatches(query));
+  const settled = blank || error !== null ? [] : value;
+  // The last settled answer, kept in state (set during render, as React
+  // allows for values derived from earlier renders).
+  const [shown, setShown] = React.useState<Array<DayCount>>([]);
+  if (settled !== null && settled !== shown && !(settled.length === 0 && shown.length === 0)) {
+    setShown(settled);
+  }
+  return settled ?? shown;
 }
 
 /**
