@@ -40,6 +40,8 @@ function activity(overrides: Partial<Activity> = {}): Activity {
       skipped: 780,
       nextCheckAt: null,
       lastError: null,
+      readingVideo: false,
+      videoDaysLeft: null,
     },
     ...overrides,
   };
@@ -107,6 +109,27 @@ describe('ActivityView', () => {
     await waitFor(() => expect(screen.getByTestId('Power-headline')).toHaveTextContent(/On battery/));
     expect(screen.getByTestId('Video conversion-headline')).toHaveTextContent('Paused on battery; next check in 45s');
     expect(screen.getByTestId('OCR-headline')).toHaveTextContent('Paused on battery; next check in 3m 20s');
+  });
+
+  it('shows OCR reading old videos and how many days are left', async () => {
+    const base = activity();
+    mocked(invoke).mockResolvedValue(
+      activity({
+        ocr: {
+          ...base.ocr,
+          readingVideo: true,
+          current: { day: '2024-12-20', number: 1234, at: secondsAgo(0) },
+          videoDaysLeft: 212,
+        },
+      }),
+    );
+    render(<ActivityView />);
+
+    await waitFor(() =>
+      expect(screen.getByTestId('OCR-headline')).toHaveTextContent('Reading the 2024-12-20 video, frame 1,234'),
+    );
+    expect(screen.getByText('212 days left to read')).toBeInTheDocument();
+    expect(screen.queryByText(/in this pass/)).not.toBeInTheDocument();
   });
 
   it('flags a failing capture', async () => {

@@ -133,6 +133,12 @@ pub struct OcrStatus {
     /// When OCR next looks for new frames, while idle or on battery.
     pub next_check_at: Option<DateTime<Local>>,
     pub last_error: Option<Failure>,
+    /// Whether the current pass reads days that only exist as video. Their
+    /// `current.number` is a 1-based position in the day's videos.
+    pub reading_video: bool,
+    /// Days that only exist as video and still have frames to read, as of the
+    /// last pass over them. `None` until OCR first gets to them.
+    pub video_days_left: Option<usize>,
 }
 
 /// The shared report. Every method takes the lock briefly and never blocks on
@@ -244,6 +250,19 @@ impl Activity {
             s.ocr.state = State::Working;
             s.ocr.remaining = frames;
             s.ocr.next_check_at = None;
+            s.ocr.reading_video = false;
+        });
+    }
+
+    /// A pass over days that only exist as video starts, with `days_left`
+    /// of them still unread.
+    pub fn ocr_video_pass_started(&self, days_left: usize) {
+        self.update(|s| {
+            s.ocr.state = State::Working;
+            s.ocr.remaining = 0;
+            s.ocr.next_check_at = None;
+            s.ocr.reading_video = true;
+            s.ocr.video_days_left = Some(days_left);
         });
     }
 
@@ -295,6 +314,21 @@ mod tests {
         assert_eq!(reads, 1);
         assert_eq!(snapshot.on_ac_power, Some(true));
         assert!(snapshot.capture.running);
+    }
+
+    #[test]
+    fn tells_video_passes_from_screenshot_passes() {
+        let activity = Activity::default();
+        assert_eq!(activity.snapshot(false, || true).ocr.video_days_left, None);
+        activity.ocr_video_pass_started(12);
+        let ocr = activity.snapshot(false, || true).ocr;
+        assert!(ocr.reading_video);
+        assert_eq!(ocr.video_days_left, Some(12));
+        activity.ocr_pass_started(3);
+        let ocr = activity.snapshot(false, || true).ocr;
+        assert!(!ocr.reading_video);
+        // Still the last count, until the next video pass.
+        assert_eq!(ocr.video_days_left, Some(12));
     }
 
     #[test]

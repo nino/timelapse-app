@@ -192,6 +192,19 @@ impl ScreenshotDatabase {
             vacuum = true;
         }
 
+        // Migration 5: let OCR progress count positions in a day's videos, for
+        // days that only exist as video and so have no frame numbers.
+        if !Self::migration_applied(&tx, "ocr_video_positions")? {
+            tx.execute(
+                "ALTER TABLE ocr_progress ADD COLUMN by_position INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+            tx.execute(
+                "INSERT INTO migrations (migration_name, applied_at) VALUES (?1, ?2)",
+                rusqlite::params!["ocr_video_positions", Utc::now().to_rfc3339()],
+            )?;
+        }
+
         tx.commit()?;
 
         Ok(vacuum)
@@ -361,6 +374,29 @@ impl ScreenshotDatabase {
         frame_number: u32,
         result: Option<(&str, &[LineBox])>,
     ) -> Result<()> {
+        self.record(day, frame_number, result, false)
+    }
+
+    /// `record_ocr_frame` for a day that only exists as video, where frames
+    /// have no numbers: `position` is the frame's 1-based position in the
+    /// day's videos played back to back (one more than its frame-source
+    /// index), and the day's progress counts positions from then on.
+    pub fn record_video_ocr_frame(
+        &self,
+        day: &str,
+        position: u32,
+        result: Option<(&str, &[LineBox])>,
+    ) -> Result<()> {
+        self.record(day, position, result, true)
+    }
+
+    fn record(
+        &self,
+        day: &str,
+        frame_number: u32,
+        result: Option<(&str, &[LineBox])>,
+        by_position: bool,
+    ) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
 
         if let Some((text, boxes)) = result {
@@ -376,22 +412,43 @@ impl ScreenshotDatabase {
         }
 
         tx.execute(
-            "INSERT INTO ocr_progress (day, last_frame) VALUES (?1, ?2)
+            "INSERT INTO ocr_progress (day, last_frame, by_position) VALUES (?1, ?2, ?3)
              ON CONFLICT (day) DO UPDATE SET last_frame = max(last_frame, excluded.last_frame)",
-            rusqlite::params![day, frame_number],
+            rusqlite::params![day, frame_number, by_position],
         )?;
 
         tx.commit()
     }
 
     /// The highest frame of `day` that OCR has handled, with every frame below
-    /// it handled too. `None` if OCR has not started on that day.
+    /// it handled too. `None` if OCR has not started on that day's
+    /// screenshots, including when it is reading the day from video, so the
+    /// video converter never takes a video position for a frame number.
     pub fn ocr_done_through(&self, day: &str) -> Result<Option<u32>> {
         self.conn
             .query_row(
-                "SELECT last_frame FROM ocr_progress WHERE day = ?1",
+                "SELECT last_frame FROM ocr_progress WHERE day = ?1 AND NOT by_position",
                 [day],
                 |row| row.get(0),
+            )
+            .optional()
+    }
+
+    /// How far OCR has got through `day`, and whether it counts frame numbers
+    /// or video positions there.
+    pub fn ocr_progress(&self, day: &str) -> Result<Option<OcrProgress>> {
+        self.conn
+            .query_row(
+                "SELECT last_frame, by_position FROM ocr_progress WHERE day = ?1",
+                [day],
+                |row| {
+                    let last: u32 = row.get(0)?;
+                    Ok(if row.get(1)? {
+                        OcrProgress::VideoPosition(last)
+                    } else {
+                        OcrProgress::FrameNumber(last)
+                    })
+                },
             )
             .optional()
     }
@@ -459,8 +516,10 @@ impl ScreenshotDatabase {
 
         let mut statement = self.conn.prepare(
             "SELECT ocr_frames.day, ocr_frames.frame_number,
-                    snippet(ocr_fts, 0, '[', ']', '…', 12)
+                    snippet(ocr_fts, 0, '[', ']', '…', 12),
+                    coalesce(ocr_progress.by_position, 0)
              FROM ocr_fts JOIN ocr_frames ON ocr_frames.id = ocr_fts.rowid
+             LEFT JOIN ocr_progress ON ocr_progress.day = ocr_frames.day
              WHERE ocr_fts MATCH ?1
              ORDER BY ocr_frames.day DESC, ocr_frames.frame_number DESC
              LIMIT ?2",
@@ -472,6 +531,7 @@ impl ScreenshotDatabase {
                     day: row.get(0)?,
                     frame_number: row.get(1)?,
                     snippet: row.get(2)?,
+                    from_video: row.get(3)?,
                 })
             })?
             .collect();
@@ -644,8 +704,20 @@ pub struct OcrDayMatch {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct OcrHit {
     pub day: String,
+    /// The screenshot's `NNNNN`, or its 1-based position in the day's videos
+    /// when `from_video` is set.
     pub frame_number: u32,
     pub snippet: String,
+    /// The day was read from video because its screenshots were already gone.
+    pub from_video: bool,
+}
+
+/// A day's OCR progress mark; see `record_ocr_frame` and
+/// `record_video_ocr_frame`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OcrProgress {
+    FrameNumber(u32),
+    VideoPosition(u32),
 }
 
 /// Turn free text into an FTS5 query: each word becomes a quoted string, so
@@ -1017,6 +1089,33 @@ mod tests {
         assert_eq!(rows, 1);
 
         assert_eq!(db.ocr_done_through("2024-01-02").unwrap(), None);
+    }
+
+    #[test]
+    fn test_video_positions_are_not_frame_numbers() {
+        let temp_dir = TempDir::new().unwrap();
+        let db = ScreenshotDatabase::new(temp_dir.path().join("test.db")).unwrap();
+
+        db.record_ocr_frame("2024-01-01", 7, None).unwrap();
+        db.record_video_ocr_frame("2024-01-02", 1, Some(("old video text", &[])))
+            .unwrap();
+        db.record_video_ocr_frame("2024-01-02", 40, None).unwrap();
+
+        assert_eq!(
+            db.ocr_progress("2024-01-01").unwrap(),
+            Some(OcrProgress::FrameNumber(7))
+        );
+        assert_eq!(
+            db.ocr_progress("2024-01-02").unwrap(),
+            Some(OcrProgress::VideoPosition(40))
+        );
+        assert_eq!(db.ocr_progress("2024-01-03").unwrap(), None);
+        // The converter's check never counts video positions.
+        assert_eq!(db.ocr_done_through("2024-01-02").unwrap(), None);
+
+        let hits = db.search_ocr("video", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!((hits[0].frame_number, hits[0].from_video), (1, true));
     }
 
     fn hit(day: &str, frame_number: u32) -> (String, u32) {

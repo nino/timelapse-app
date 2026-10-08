@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use tauri::menu::{Menu, MenuItem, MenuItemKind, PredefinedMenuItem, WINDOW_SUBMENU_ID};
 use tauri::{AppHandle, Emitter, Manager, Runtime, State, WebviewUrl, WebviewWindowBuilder};
 use activity::{Activity, Snapshot};
-use database::{OcrHit, ScreenshotDatabase};
+use database::{OcrHit, OcrProgress, ScreenshotDatabase};
 use serde::Serialize;
 use settings::{Settings, SettingsStore};
 use timelapse::Photographer;
@@ -322,9 +322,21 @@ fn search_ocr_day_impl(
             }
         })
         .collect();
-    let indices = source
-        .indices_of_frames(date, &numbers)
-        .map_err(|e| e.to_string())?;
+    // A day OCR read from video (see `ocr::OcrWorker::run_video_pass`)
+    // recorded 1-based positions in the day, so a position is an index plus
+    // one. A position past the day's end means its videos changed since.
+    let by_position = matches!(db.ocr_progress(date), Ok(Some(OcrProgress::VideoPosition(_))));
+    let indices = if by_position {
+        let count = source.day(date).map_err(|e| e.to_string())?.frame_count;
+        numbers
+            .iter()
+            .map(|&position| (position as usize).checked_sub(1).filter(|&index| index < count))
+            .collect()
+    } else {
+        source
+            .indices_of_frames(date, &numbers)
+            .map_err(|e| e.to_string())?
+    };
 
     let mut matches: Vec<DayMatch> = found
         .iter()
@@ -708,6 +720,14 @@ pub fn run() {
                 None => eprintln!("Unable to find home directory"),
             }
 
+            // Scratch space for OCR's decoded video frames, per profile like
+            // the frame cache.
+            let ocr_dir = app
+                .path()
+                .app_cache_dir()
+                .ok()
+                .map(|dir| dir.join(paths::TIMELAPSE_DIR_NAME).join("ocr"));
+
             // Start timelapse automatically when app is ready
             let photographer_state = app.state::<PhotographerState>();
             let state_clone = Arc::clone(&photographer_state.inner());
@@ -749,7 +769,7 @@ pub fn run() {
                         .reporting_to(Arc::clone(&activity))
                         .start();
 
-                        if ocr::start_background_ocr(root, activity) {
+                        if ocr::start_background_ocr(root, ocr_dir, activity) {
                             println!("OCR started");
                         } else {
                             println!("OCR is not available on this platform");
@@ -1161,6 +1181,39 @@ mod tests {
         assert!(search_ocr_day_impl(library.path(), &source, "2026-10-04", "")
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn test_search_ocr_day_places_video_positions_on_the_scrubber() {
+        let library = TempDir::new().unwrap();
+        // A day that only exists as one of the old script's videos, 6 frames.
+        let made = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-f", "lavfi", "-i", "color=c=gray:s=32x32:r=15"])
+            .args(["-frames:v", "6", "-c:v", "libx264", "-pix_fmt", "yuv420p"])
+            .arg(library.path().join("2024-12-20--23-00-00.mov"))
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if !made {
+            eprintln!("skipping: ffmpeg with libx264 is not available");
+            return;
+        }
+        let db = ScreenshotDatabase::new(library.path().join("screenshots.db")).unwrap();
+        db.record_video_ocr_frame("2024-12-20", 1, Some(("cargo build", &[]))).unwrap();
+        db.record_video_ocr_frame("2024-12-20", 3, Some(("bun test", &[]))).unwrap();
+        db.record_video_ocr_frame("2024-12-20", 5, Some(("cargo test", &[]))).unwrap();
+        db.record_video_ocr_frame("2024-12-20", 6, None).unwrap();
+        let (_cache, source) = frame_source_in(library.path());
+
+        let matches = search_ocr_day_impl(library.path(), &source, "2024-12-20", "cargo").unwrap();
+        assert_eq!(
+            matches,
+            vec![
+                DayMatch { index: 0, end_index: 2, frame: 1 },
+                // Runs to the last frame OCR handled, the day's last.
+                DayMatch { index: 4, end_index: 6, frame: 5 },
+            ]
+        );
     }
 
     #[test]

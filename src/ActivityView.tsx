@@ -192,16 +192,23 @@ function Conversion({
 }
 
 function Ocr({ ocr, now }: { ocr: Activity["ocr"]; now: number }): React.ReactNode {
-  const { state, current, remaining, recognized, skipped, nextCheckAt, lastError } = ocr;
+  const { state, current, remaining, recognized, skipped, nextCheckAt, lastError, readingVideo, videoDaysLeft } =
+    ocr;
   const next = nextCheckAt ? until(nextCheckAt, now) : "soon";
   let tone: Tone = "quiet";
   let headline: string;
   switch (state) {
     case "working":
       tone = "active";
-      headline = current
-        ? `Reading ${current.day} #${String(current.number).padStart(5, "0")}`
-        : "Reading";
+      if (readingVideo) {
+        headline = current
+          ? `Reading the ${current.day} video, frame ${current.number.toLocaleString("en-US")}`
+          : "Reading old videos";
+      } else {
+        headline = current
+          ? `Reading ${current.day} #${String(current.number).padStart(5, "0")}`
+          : "Reading";
+      }
       break;
     case "idle":
     case "resting":
@@ -221,7 +228,10 @@ function Ocr({ ocr, now }: { ocr: Activity["ocr"]; now: number }): React.ReactNo
 
   return (
     <Section title="OCR" tone={tone} headline={headline}>
-      {state === "working" && <Row label="Left">{count(remaining, "frame")} in this pass</Row>}
+      {state === "working" && !readingVideo && <Row label="Left">{count(remaining, "frame")} in this pass</Row>}
+      {videoDaysLeft !== null && (
+        <Row label="Old videos">{videoDaysLeft === 0 ? "All read" : `${count(videoDaysLeft, "day")} left to read`}</Row>
+      )}
       <Row label="Since launch">
         {count(recognized, "frame")} read, {skipped.toLocaleString("en-US")} unchanged
       </Row>

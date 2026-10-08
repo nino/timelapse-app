@@ -38,6 +38,10 @@ export type Activity = {
     skipped: number;
     nextCheckAt: string | null;
     lastError: Failure | null;
+    /** The current pass reads days that only exist as video; `current.number` is then a position in the day's videos. */
+    readingVideo: boolean;
+    /** Video-only days still to read, as of the last pass over them; null until OCR first gets to them. */
+    videoDaysLeft: number | null;
   };
 };
 

@@ -8,15 +8,23 @@
 //! and the converter in turn only converts and deletes PNGs that the progress
 //! mark covers (`ocr_check`).
 //!
+//! Days that only exist as video (the old script's whole-day videos, whose
+//! screenshots were deleted before OCR existed) are read from the videos
+//! instead, a batch at a time whenever there are no new screenshots to read,
+//! newest day first. There, frames are counted by their position in the day
+//! (see `ScreenshotDatabase::record_video_ocr_frame`).
+//!
 //! Recognition itself is Apple's Vision framework, so the worker only runs on
 //! macOS; everything else here is platform-independent and tested with a fake
 //! recognizer.
 
 use crate::activity::{Activity, State};
 use crate::converter::{is_day_folder_name, on_ac_power, OcrCheck, HourBatch};
-use crate::database::ScreenshotDatabase;
-use image::imageops;
+use crate::database::{LineBox, OcrProgress, ScreenshotDatabase};
+use frame_source::{FrameSource, RawFrame};
+use image::{imageops, GrayImage};
 use serde::Serialize;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
@@ -30,6 +38,15 @@ const BATTERY_SLEEP: Duration = Duration::from_secs(5 * 60);
 /// How many frames to read between power-source checks. At ~130 ms per frame
 /// that is a check every few seconds of work.
 const FRAMES_PER_POWER_CHECK: usize = 30;
+
+/// Most video frames handled per pass when there are no new screenshots, so
+/// screenshots that arrive meanwhile wait at most a few minutes. Decoding
+/// restarts at the progress mark with each batch.
+const VIDEO_FRAMES_PER_PASS: usize = 1800;
+
+/// How much decoded video the OCR worker's frame source may cache. It decodes
+/// by streaming, which caches nothing, so this only bounds the folder.
+const VIDEO_CACHE_CAP_BYTES: u64 = 64 * 1024 * 1024;
 
 /// A frame younger than this may still be being written, or may be about to
 /// be deleted as all-black, so the worker leaves it for the next pass.
@@ -127,9 +144,27 @@ impl Thumbnail {
         let grey = image::open(image)
             .map_err(|e| format!("Failed to read {}: {}", image.display(), e))?
             .into_luma8();
+        Ok(Thumbnail::of_grey(&grey))
+    }
+
+    /// The thumbnail of a decoded video frame.
+    pub fn of_rgb(frame: &RawFrame) -> Result<Thumbnail, String> {
+        // The same luma weights as `into_luma8`, so video frames and
+        // screenshots are judged alike.
+        let luma = frame
+            .rgb
+            .chunks_exact(3)
+            .map(|p| ((2126 * p[0] as u32 + 7152 * p[1] as u32 + 722 * p[2] as u32) / 10000) as u8)
+            .collect();
+        let grey = GrayImage::from_raw(frame.width, frame.height, luma)
+            .ok_or("frame is smaller than its size says")?;
+        Ok(Thumbnail::of_grey(&grey))
+    }
+
+    fn of_grey(grey: &GrayImage) -> Thumbnail {
         // `thumbnail` averages each block of source pixels, like a box filter.
-        let small = imageops::thumbnail(&grey, THUMB_WIDTH as u32, THUMB_HEIGHT as u32);
-        Ok(Thumbnail(small.into_raw()))
+        let small = imageops::thumbnail(grey, THUMB_WIDTH as u32, THUMB_HEIGHT as u32);
+        Thumbnail(small.into_raw())
     }
 
     pub fn differs_from(&self, other: &Thumbnail) -> bool {
@@ -163,12 +198,35 @@ pub struct OcrWorker {
     root: PathBuf,
     db: ScreenshotDatabase,
     recognizer: Box<dyn TextRecognizer>,
-    /// Thumbnail of the last frame read in each day folder.
-    last_read: std::collections::HashMap<String, Thumbnail>,
-    /// Text of the last frame recorded in each day folder.
-    last_text: std::collections::HashMap<String, String>,
+    /// Thumbnail of the last frame read in each day.
+    last_read: HashMap<String, Thumbnail>,
+    /// Text of the last frame recorded in each day.
+    last_text: HashMap<String, String>,
     activity: Arc<Activity>,
+    videos: Option<VideoReader>,
 }
+/// What the worker needs to read days that only exist as video.
+pub struct VideoReader {
+    source: FrameSource,
+    /// Where a frame is written as a PNG for the recognizer, which reads
+    /// files.
+    scratch: PathBuf,
+    /// Videos ffmpeg failed on, passed over until the app restarts rather than
+    /// retried every pass.
+    failed: HashSet<PathBuf>,
+}
+
+impl VideoReader {
+    pub fn new(source: FrameSource, scratch: PathBuf) -> Self {
+        VideoReader {
+            source,
+            scratch,
+            failed: HashSet::new(),
+        }
+    }
+}
+
+
 
 impl OcrWorker {
     pub fn new(root: PathBuf, db: ScreenshotDatabase, recognizer: Box<dyn TextRecognizer>) -> Self {
@@ -179,7 +237,14 @@ impl OcrWorker {
             last_read: Default::default(),
             last_text: Default::default(),
             activity: Arc::default(),
+            videos: None,
         }
+    }
+
+    /// Also read days that only exist as video (`run_video_pass`).
+    pub fn with_videos(mut self, videos: VideoReader) -> Self {
+        self.videos = Some(videos);
+        self
     }
 
     /// Report progress to `activity`, for the Activity window.
@@ -256,19 +321,32 @@ impl OcrWorker {
     /// Read one frame if the screen changed. Returns whether it was read.
     fn handle_frame(&mut self, day: &str, frame_number: u32, path: &Path) -> Result<bool, String> {
         let thumbnail = Thumbnail::of(path)?;
+        self.read_if_changed(day, thumbnail, &|| Ok(path.to_path_buf()), &|db, result| {
+            db.record_ocr_frame(day, frame_number, result)
+        })
+    }
+
+    /// Run the image `image` gives through the recognizer if `thumbnail`
+    /// differs from the last frame read in `day`, and store the result with
+    /// `record`. Returns whether it was read.
+    fn read_if_changed(
+        &mut self,
+        day: &str,
+        thumbnail: Thumbnail,
+        image: &dyn Fn() -> Result<PathBuf, String>,
+        record: &dyn Fn(&ScreenshotDatabase, Option<(&str, &[LineBox])>) -> rusqlite::Result<()>,
+    ) -> Result<bool, String> {
         let changed = self
             .last_read
             .get(day)
             .map_or(true, |last| thumbnail.differs_from(last));
 
         if !changed {
-            self.db
-                .record_ocr_frame(day, frame_number, None)
-                .map_err(|e| e.to_string())?;
+            record(&self.db, None).map_err(|e| e.to_string())?;
             return Ok(false);
         }
 
-        let lines = self.recognizer.recognize(path)?;
+        let lines = self.recognizer.recognize(&image()?)?;
         // One line of text per box, so a line's own newlines go.
         let text = lines
             .iter()
@@ -284,18 +362,190 @@ impl OcrWorker {
         } else {
             Some(lines.iter().map(|l| [l.x, l.y, l.width, l.height]).collect::<Vec<_>>())
         };
-        self.db
-            .record_ocr_frame(day, frame_number, result.as_deref().map(|boxes| (text.as_str(), boxes)))
+        record(&self.db, result.as_deref().map(|boxes| (text.as_str(), boxes)))
             .map_err(|e| e.to_string())?;
         self.last_read.insert(day.to_string(), thumbnail);
         self.last_text.insert(day.to_string(), text);
         Ok(true)
     }
+
+    /// Handle up to `max_frames` frames of days that only exist as video,
+    /// newest day first, resuming each day at its progress mark and stopping
+    /// early when `keep_going` says so, as `run_pass` does. Days OCR has
+    /// started on from screenshots are left alone. Does nothing without
+    /// `with_videos`.
+    pub fn run_video_pass(
+        &mut self,
+        max_frames: usize,
+        keep_going: &mut dyn FnMut() -> bool,
+    ) -> Result<PassSummary, String> {
+        let Some(mut videos) = self.videos.take() else {
+            return Ok(PassSummary::default());
+        };
+        let result = self.video_pass(&mut videos, max_frames, keep_going);
+        self.videos = Some(videos);
+        result
+    }
+
+    fn video_pass(
+        &mut self,
+        videos: &mut VideoReader,
+        max_frames: usize,
+        keep_going: &mut dyn FnMut() -> bool,
+    ) -> Result<PassSummary, String> {
+        let mut summary = PassSummary::default();
+
+        // Listed up front, newest first, so the Activity window can say how
+        // many days are left. Probing a day's videos is cached after the
+        // first pass, so this is cheap from then on.
+        let mut pending = Vec::new();
+        let mut days = videos.source.days().map_err(|e| e.to_string())?;
+        days.reverse();
+        for day in days {
+            let done = match self.db.ocr_progress(&day).map_err(|e| e.to_string())? {
+                None => 0,
+                Some(OcrProgress::VideoPosition(last)) => last as usize,
+                Some(OcrProgress::FrameNumber(_)) => continue,
+            };
+            let Some(day_videos) = videos.source.video_only_day(&day).map_err(|e| e.to_string())?
+            else {
+                continue;
+            };
+            let unread: Vec<_> = day_videos
+                .into_iter()
+                .filter(|video| video.first_index + video.frame_count > done)
+                .filter(|video| !videos.failed.contains(&video.path))
+                .collect();
+            if !unread.is_empty() {
+                pending.push((day, done, unread));
+            }
+        }
+        self.activity.ocr_video_pass_started(pending.len());
+
+        for (day, done, day_videos) in pending {
+            for video in day_videos {
+                let end = video.first_index + video.frame_count;
+                let mut stopped = false;
+                let mut failure = None;
+                let scratch = videos.scratch.as_path();
+                let streamed = videos.source.stream_video(
+                    &video,
+                    done.saturating_sub(video.first_index),
+                    &mut |index, frame| {
+                        if summary.handled() >= max_frames
+                            || summary.handled() > 0
+                                && summary.handled() % FRAMES_PER_POWER_CHECK == 0
+                                && !keep_going()
+                        {
+                            stopped = true;
+                            return false;
+                        }
+                        let position = (video.first_index + index + 1) as u32;
+                        let recognized =
+                            match self.handle_video_frame(&day, position, &frame, scratch) {
+                                Ok(recognized) => recognized,
+                                Err(error) => {
+                                    // As for an unreadable screenshot: pass
+                                    // over it so the rest of the day is not
+                                    // held back.
+                                    eprintln!("OCR: skipping frame {} of {}: {}", position, day, error);
+                                    self.activity.ocr_failed(format!(
+                                        "Skipped {} video frame {}: {}",
+                                        day, position, error
+                                    ));
+                                    let recorded = self.db.record_video_ocr_frame(&day, position, None);
+                                    if let Err(error) = recorded {
+                                        failure = Some(error.to_string());
+                                        return false;
+                                    }
+                                    false
+                                }
+                            };
+                        if recognized {
+                            summary.recognized += 1;
+                        } else {
+                            summary.skipped += 1;
+                        }
+                        self.activity.ocr_frame_handled(&day, position, recognized);
+                        true
+                    },
+                );
+                if let Some(error) = failure {
+                    return Err(error);
+                }
+                if stopped {
+                    return Ok(summary);
+                }
+                match streamed {
+                    // The container can claim more frames than decode, so a
+                    // finished video counts as done up to its end; otherwise
+                    // the mark would stop short and the tail be decoded again
+                    // every pass.
+                    Ok(()) => self
+                        .db
+                        .record_video_ocr_frame(&day, end as u32, None)
+                        .map_err(|e| e.to_string())?,
+                    Err(error) => {
+                        eprintln!("OCR: cannot decode {}: {}", video.path.display(), error);
+                        self.activity
+                            .ocr_failed(format!("Cannot decode {}: {}", video.path.display(), error));
+                        videos.failed.insert(video.path.clone());
+                        // Later videos would move the mark past this one's
+                        // unread frames.
+                        break;
+                    }
+                }
+            }
+        }
+
+        Ok(summary)
+    }
+
+    fn handle_video_frame(
+        &mut self,
+        day: &str,
+        position: u32,
+        frame: &RawFrame,
+        scratch: &Path,
+    ) -> Result<bool, String> {
+        let thumbnail = Thumbnail::of_rgb(frame)?;
+        // Written only when it is going to be read.
+        let image = || {
+            let path = scratch.join("video-frame.png");
+            write_png(&path, frame)?;
+            Ok(path)
+        };
+        self.read_if_changed(day, thumbnail, &image, &|db, result| {
+            db.record_video_ocr_frame(day, position, result)
+        })
+    }
+}
+
+/// Write a decoded frame as a PNG, favouring speed over size: it is read once
+/// and overwritten by the next one.
+fn write_png(path: &Path, frame: &RawFrame) -> Result<(), String> {
+    use image::codecs::png::{CompressionType, FilterType, PngEncoder};
+    use image::ImageEncoder;
+
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    let file = std::fs::File::create(path).map_err(|e| e.to_string())?;
+    let writer = std::io::BufWriter::new(file);
+    PngEncoder::new_with_quality(writer, CompressionType::Fast, FilterType::Sub)
+        .write_image(frame.rgb, frame.width, frame.height, image::ExtendedColorType::Rgb8)
+        .map_err(|e| e.to_string())
 }
 
 /// Start reading `root` on a background thread that runs for the life of the
-/// app. Returns `false` on platforms without a text recognizer.
-pub fn start_background_ocr(root: PathBuf, activity: Arc<Activity>) -> bool {
+/// app. Returns `false` on platforms without a text recognizer. Days that
+/// only exist as video are read too when there is a `work_dir` (outside the
+/// library) for decoded frames.
+pub fn start_background_ocr(
+    root: PathBuf,
+    work_dir: Option<PathBuf>,
+    activity: Arc<Activity>,
+) -> bool {
     let Some(recognizer) = system_recognizer() else {
         activity.ocr_unavailable();
         return false;
@@ -315,7 +565,25 @@ pub fn start_background_ocr(root: PathBuf, activity: Arc<Activity>) -> bool {
                     return;
                 }
             };
+            let videos = work_dir.and_then(|dir| {
+                let source = FrameSource::new(
+                    root.clone(),
+                    dir.join("chunks"),
+                    VIDEO_CACHE_CAP_BYTES,
+                    frame_source::Tools::new(crate::paths::ffmpeg()),
+                );
+                match source {
+                    Ok(source) => Some(VideoReader::new(source, dir)),
+                    Err(error) => {
+                        eprintln!("OCR: cannot read videos: {}", error);
+                        None
+                    }
+                }
+            });
             let mut worker = OcrWorker::new(root, db, recognizer).reporting_to(activity);
+            if let Some(videos) = videos {
+                worker = worker.with_videos(videos);
+            }
             run_forever(&mut worker);
         })
         .is_ok()
@@ -344,10 +612,19 @@ fn run_forever(worker: &mut OcrWorker) {
             continue;
         }
 
-        match worker.run_pass(SystemTime::now(), usize::MAX, &mut on_ac_power) {
-            Ok(summary) if summary.handled() > 0 => println!(
-                "OCR: read {} frames, skipped {} unchanged",
-                summary.recognized, summary.skipped
+        // New screenshots first: the converter is waiting on them.
+        let screenshots = worker.run_pass(SystemTime::now(), usize::MAX, &mut on_ac_power);
+        let result = match screenshots {
+            Ok(summary) if summary.handled() == 0 => worker
+                .run_video_pass(VIDEO_FRAMES_PER_PASS, &mut on_ac_power)
+                .map(|summary| ("video frames", summary)),
+            Ok(summary) => Ok(("screenshots", summary)),
+            Err(error) => Err(error.to_string()),
+        };
+        match result {
+            Ok((kind, summary)) if summary.handled() > 0 => println!(
+                "OCR: read {} {}, skipped {} unchanged",
+                summary.recognized, kind, summary.skipped
             ),
             Ok(_) => sleep(State::Idle, IDLE_SLEEP),
             Err(error) => {
@@ -798,6 +1075,119 @@ mod tests {
         assert!(!check(&batch(&[2, 3])));
     }
 
+    /// Encode `blocks` (see `write_frame`) as a 15 fps video at `path`, or
+    /// return false when there is no ffmpeg to do it.
+    fn write_video(path: &Path, blocks: &[u32]) -> bool {
+        let frames = TempDir::new().unwrap();
+        for (i, &block) in blocks.iter().enumerate() {
+            write_frame(&frames.path().join(format!("{:05}.png", i + 1)), block, 100, 100);
+        }
+        std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-framerate", "15", "-i"])
+            .arg(frames.path().join("%05d.png"))
+            .args(["-c:v", "libx264", "-qp", "0", "-pix_fmt", "yuv420p"])
+            .arg(path)
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+
+    impl Library {
+        fn with_videos(mut self) -> Library {
+            let source = FrameSource::new(
+                self.root.clone(),
+                self.root.join(".ocr").join("chunks"),
+                VIDEO_CACHE_CAP_BYTES,
+                frame_source::Tools::new("ffmpeg"),
+            )
+            .unwrap();
+            let scratch = self.root.join(".ocr");
+            self.worker = self.worker.with_videos(VideoReader::new(source, scratch));
+            self
+        }
+
+        fn video_pass(&mut self, max_frames: usize) -> PassSummary {
+            self.worker.run_video_pass(max_frames, &mut || true).unwrap()
+        }
+
+        fn progress(&self, day: &str) -> Option<OcrProgress> {
+            self.worker.db.ocr_progress(day).unwrap()
+        }
+    }
+
+    #[test]
+    fn reads_days_that_only_exist_as_video() {
+        let mut library = Library::new().with_videos();
+        // Day 1 as two of the old script's videos, day 2 as one.
+        if !write_video(&library.root.join("2024-01-01--18-00-00.mov"), &[0, 0, 200])
+            || !write_video(&library.root.join("2024-01-01--23-00-00.mov"), &[200, 0])
+            || !write_video(&library.root.join("2024-01-02--20-00-00.mov"), &[0, 300])
+        {
+            eprintln!("skipping: ffmpeg with libx264 is not available");
+            return;
+        }
+
+        let summary = library.video_pass(usize::MAX);
+
+        // Newest day first; within a day, only frames that changed.
+        assert_eq!(summary, PassSummary { recognized: 5, skipped: 2 });
+        assert_eq!(library.seen().len(), 5);
+        assert_eq!(library.progress(DAY_1), Some(OcrProgress::VideoPosition(5)));
+        assert_eq!(library.progress(DAY_2), Some(OcrProgress::VideoPosition(2)));
+        let mut hits: Vec<_> = library
+            .worker
+            .db
+            .search_ocr("video", 10)
+            .unwrap()
+            .into_iter()
+            .map(|hit| (hit.day, hit.frame_number, hit.from_video))
+            .collect();
+        hits.sort();
+        // The fake reads the same text off every video frame, so each day
+        // keeps only its first row.
+        assert_eq!(
+            hits,
+            vec![(DAY_1.to_string(), 1, true), (DAY_2.to_string(), 1, true)]
+        );
+
+        // Done is done.
+        assert_eq!(library.video_pass(usize::MAX), PassSummary::default());
+    }
+
+    #[test]
+    fn video_passes_stop_and_resume() {
+        let mut library = Library::new().with_videos();
+        if !write_video(&library.root.join("2024-01-01--18-00-00.mov"), &[0, 200, 0, 200, 0]) {
+            eprintln!("skipping: ffmpeg with libx264 is not available");
+            return;
+        }
+
+        assert_eq!(library.video_pass(2).handled(), 2);
+        assert_eq!(library.progress(DAY_1), Some(OcrProgress::VideoPosition(2)));
+
+        assert_eq!(library.video_pass(usize::MAX).handled(), 3);
+        assert_eq!(library.progress(DAY_1), Some(OcrProgress::VideoPosition(5)));
+        // Every frame differs from the one before it, so all are read.
+        assert_eq!(library.seen().len(), 5);
+    }
+
+    #[test]
+    fn leaves_days_with_screenshots_to_the_screenshot_pass() {
+        let mut library = Library::new().with_videos();
+        // An hour converted to video, with OCR already done from its PNGs.
+        if !write_video(&library.root.join("2024-01-01--09-00-00--hourly.mov"), &[0, 200]) {
+            eprintln!("skipping: ffmpeg with libx264 is not available");
+            return;
+        }
+        library.worker.db.record_ocr_frame(DAY_1, 2, None).unwrap();
+        // And a day still in screenshots.
+        frame(&library.root, DAY_2, 1, 0, false);
+
+        assert_eq!(library.video_pass(usize::MAX), PassSummary::default());
+        assert_eq!(library.progress(DAY_1), Some(OcrProgress::FrameNumber(2)));
+        assert_eq!(library.progress(DAY_2), None);
+    }
+
     /// Runs the real Vision recognizer on a capture named by `OCR_TEST_IMAGE`:
     /// `OCR_TEST_IMAGE=~/Timelapse/2024-01-01/00001.png cargo test vision -- --ignored --nocapture`
     #[cfg(target_os = "macos")]
@@ -812,5 +1202,55 @@ mod tests {
             println!("{:.2} {}", line.confidence, line.text);
         }
         assert!(!lines.is_empty());
+    }
+    /// Runs a real video pass over a library named by `OCR_TEST_LIBRARY`,
+    /// reading at most `OCR_TEST_FRAMES` frames (default 900) of its newest
+    /// video-only day. The library is only read; the database and decoded
+    /// frames go to a temporary folder.
+    /// `OCR_TEST_LIBRARY=~/Timelapse cargo test vision_reads_real_videos -- --ignored --nocapture`
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore]
+    fn vision_reads_real_videos() {
+        let library = std::env::var("OCR_TEST_LIBRARY").expect("set OCR_TEST_LIBRARY");
+        let library = PathBuf::from(library);
+        let frames = std::env::var("OCR_TEST_FRAMES").map_or(900, |n| n.parse().unwrap());
+        let work = TempDir::new().unwrap();
+        let db = ScreenshotDatabase::new(work.path().join("screenshots.db")).unwrap();
+        let source = FrameSource::new(
+            library.clone(),
+            work.path().join("chunks"),
+            VIDEO_CACHE_CAP_BYTES,
+            frame_source::Tools::new("ffmpeg"),
+        )
+        .unwrap();
+        let mut worker = OcrWorker::new(library, db, system_recognizer().unwrap())
+            .with_videos(VideoReader::new(source, work.path().to_path_buf()));
+
+        let started = std::time::Instant::now();
+        let summary = worker.run_video_pass(frames, &mut || true).unwrap();
+        let elapsed = started.elapsed();
+        println!(
+            "{:?} in {:?}: {:.1} frames/s",
+            summary,
+            elapsed,
+            summary.handled() as f64 / elapsed.as_secs_f64()
+        );
+
+        let (day, frame, text): (String, u32, String) =
+            rusqlite::Connection::open(work.path().join("screenshots.db"))
+                .unwrap()
+                .query_row(
+                    "SELECT day, frame_number, text FROM ocr_frames
+                     ORDER BY length(text) DESC LIMIT 1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+        println!("Longest text, frame {} of {}:", frame, day);
+        for line in text.lines().take(15) {
+            println!("  {}", line);
+        }
+        assert!(summary.recognized > 0);
     }
 }

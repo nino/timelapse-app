@@ -30,7 +30,7 @@ use cache::ChunkCache;
 use library::{Shot, VideoFile, VideoKind};
 pub use library::filed_at;
 use read_ahead::ReadAhead;
-pub use video::Tools;
+pub use video::{RawFrame, Tools};
 use video::{Priority, VideoInfo};
 
 /// Frames decoded per ffmpeg run: 10 seconds of a 15 fps timelapse. Large
@@ -114,6 +114,16 @@ pub struct FrameTime {
     /// database's rows for that hour, or failing that, the video's start
     /// time plus one second per frame.
     pub exact: bool,
+}
+
+/// A video that makes up part of a day served only from video.
+#[derive(Debug, Clone)]
+pub struct DayVideo {
+    pub path: PathBuf,
+    /// Day-wide index of the video's first frame.
+    pub first_index: usize,
+    pub frame_count: usize,
+    info: VideoInfo,
 }
 
 #[derive(Clone, Copy)]
@@ -458,6 +468,42 @@ impl FrameSource {
                 }))
             }
         }
+    }
+
+    /// The videos `date` is made of, in order, when every one of its frames
+    /// comes from video; `None` when any hour of it is still screenshots.
+    /// For days whose screenshots were deleted before anything read them
+    /// (all of the old script's days), so their frames can be read from the
+    /// videos instead.
+    pub fn video_only_day(&self, date: &str) -> Result<Option<Vec<DayVideo>>, Error> {
+        let mut videos = Vec::new();
+        let mut first_index = 0;
+        for segment in self.plan(parse_date(date)?)? {
+            let Segment::Video { file, info } = segment else {
+                return Ok(None);
+            };
+            videos.push(DayVideo {
+                path: file.path,
+                first_index,
+                frame_count: info.frame_count,
+                info,
+            });
+            first_index += info.frame_count;
+        }
+        Ok(Some(videos))
+    }
+
+    /// Decode `video`'s frames from its frame `first` on, without the chunk
+    /// cache, for work that reads every frame once. `on_frame` gets each
+    /// frame's index within the video and stops the decode by returning
+    /// false. See `video::stream_frames`.
+    pub fn stream_video(
+        &self,
+        video: &DayVideo,
+        first: usize,
+        on_frame: &mut dyn FnMut(usize, RawFrame) -> bool,
+    ) -> Result<(), Error> {
+        video::stream_frames(&self.tools, &video.path, video.info, first, on_frame)
     }
 
     /// Where frames recorded by number (as OCR records them) sit in the day:
