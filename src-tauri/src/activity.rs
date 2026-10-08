@@ -22,6 +22,8 @@ pub struct Snapshot {
     pub on_ac_power: Option<bool>,
     /// The boost in progress, if any. Filled in by `get_activity`.
     pub boost: Option<BoostStatus>,
+    /// When low-power mode ends, while it is on. Filled in by `get_activity`.
+    pub low_power_until: Option<DateTime<Local>>,
     pub capture: CaptureStatus,
     pub conversion: ConversionStatus,
     pub ocr: OcrStatus,
@@ -72,6 +74,8 @@ pub enum State {
     Resting,
     /// Paused until the machine is on AC power.
     OnBattery,
+    /// Paused until low-power mode ends (`boost.rs`).
+    LowPower,
     /// Not available on this platform (OCR outside macOS).
     Unavailable,
 }
@@ -234,12 +238,13 @@ impl Activity {
         });
     }
 
-    /// The encode is paused until the machine is back on AC power.
-    pub fn encoding_paused(&self) {
+    /// The encode is paused, in `state`: until the machine is back on AC
+    /// power, or until low-power mode ends.
+    pub fn encoding_paused(&self, state: State) {
         self.update(|s| {
             if let Some(current) = s.conversion.current.as_mut() {
                 current.paused_since.get_or_insert_with(Local::now);
-                s.conversion.state = State::OnBattery;
+                s.conversion.state = state;
             }
         });
     }
@@ -401,7 +406,7 @@ mod tests {
         activity.encoding_progress(4);
         assert_eq!(activity.snapshot(false, || true).conversion.current.unwrap().frames_done, 4);
 
-        activity.encoding_paused();
+        activity.encoding_paused(State::OnBattery);
         let conversion = activity.snapshot(false, || false).conversion;
         assert_eq!(conversion.state, State::OnBattery);
         assert!(conversion.current.unwrap().paused_since.is_some());

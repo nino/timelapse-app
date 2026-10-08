@@ -4,7 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 export const ACTIVITY_WINDOW = "activity";
 
 /** What a background loop is doing. Mirrors `State` in `activity.rs`. */
-export type WorkState = "starting" | "working" | "idle" | "resting" | "onBattery" | "unavailable";
+export type WorkState = "starting" | "working" | "idle" | "resting" | "onBattery" | "lowPower" | "unavailable";
 
 /** Times are RFC 3339 with the local offset. */
 export type FrameRef = { day: string; number: number; at: string };
@@ -36,6 +36,8 @@ export type Boost = {
 export type Activity = {
   onAcPower: boolean | null;
   boost: Boost | null;
+  /** When low-power mode ends, while it is on. */
+  lowPowerUntil: string | null;
   capture: {
     running: boolean;
     lastFrame: FrameRef | null;
@@ -79,6 +81,15 @@ export function startBoost(minutes: number, allowBattery: boolean): Promise<Boos
 
 export function stopBoost(): Promise<void> {
   return invoke<void>("stop_boost");
+}
+
+/** Keep conversion and OCR off for `minutes`, even on AC power, replacing any boost in progress. */
+export function startLowPower(minutes: number): Promise<string | null> {
+  return invoke<string | null>("start_low_power", { minutes });
+}
+
+export function stopLowPower(): Promise<void> {
+  return invoke<void>("stop_low_power");
 }
 
 /** Let the boost in progress run on battery, or not. */

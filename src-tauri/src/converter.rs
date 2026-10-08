@@ -863,6 +863,9 @@ impl Converter {
             eprintln!("Failed to remove empty day folders: {}", e);
         }
 
+        if let Some(left) = boost.low_power_left() {
+            return (State::LowPower, left);
+        }
         if !boost.may_work(on_ac_power) {
             let poll = if boost.is_on() { boost::BOOSTED_POWER_POLL } else { ON_BATTERY_POLL };
             return (State::OnBattery, poll);
@@ -906,6 +909,7 @@ impl Converter {
         let progress = Arc::clone(activity);
         let pauses = Arc::clone(activity);
         let boost_owned = Arc::clone(boost);
+        let pause_reason = Arc::clone(boost);
         let result = tokio::task::spawn_blocking(move || {
             convert_batch(&root_owned, &batch, |frames_dir, output| {
                 encode_with_ffmpeg(
@@ -916,10 +920,11 @@ impl Converter {
                     move |frames| progress.encoding_progress(frames),
                     |paused| {
                         if paused {
-                            println!("Paused the encode: on battery");
-                            pauses.encoding_paused();
+                            let state = if pause_reason.is_low_power() { State::LowPower } else { State::OnBattery };
+                            println!("Paused the encode: {:?}", state);
+                            pauses.encoding_paused(state);
                         } else {
-                            println!("Resumed the encode: on AC power");
+                            println!("Resumed the encode");
                             pauses.encoding_resumed();
                         }
                     },
