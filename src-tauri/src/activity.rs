@@ -7,8 +7,8 @@
 
 use crate::boost::BoostStatus;
 use crate::diagnostics;
-use chrono::{DateTime, Local};
-use serde::Serialize;
+use chrono::{DateTime, FixedOffset, Local};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -419,6 +419,30 @@ impl Activity {
     }
 }
 
+/// Which "Last error" line of the Activity window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ErrorSource {
+    Capture,
+    Ocr,
+}
+
+impl Activity {
+    /// Clear the last error from `source`, if it is still the one that
+    /// happened `at`. A newer error is kept, since nobody has seen it yet.
+    pub fn dismiss_error(&self, source: ErrorSource, at: DateTime<FixedOffset>) {
+        self.update(|s| {
+            let error = match source {
+                ErrorSource::Capture => &mut s.capture.last_error,
+                ErrorSource::Ocr => &mut s.ocr.last_error,
+            };
+            if error.as_ref().is_some_and(|e| e.at == at) {
+                *error = None;
+            }
+        });
+    }
+}
+
 fn after(wait: Duration) -> DateTime<Local> {
     Local::now() + chrono::Duration::from_std(wait).unwrap_or_default()
 }
@@ -426,6 +450,24 @@ fn after(wait: Duration) -> DateTime<Local> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dismisses_an_error_but_not_a_newer_one() {
+        let activity = Activity::default();
+        activity.ocr_failed("first".into());
+        let seen = activity.snapshot(false, || true).ocr.last_error.unwrap().at.fixed_offset();
+        activity.capture_failed("capture".into());
+
+        activity.dismiss_error(ErrorSource::Ocr, seen);
+        let snapshot = activity.snapshot(false, || true);
+        assert!(snapshot.ocr.last_error.is_none());
+        assert!(snapshot.capture.last_error.is_some(), "only the named line is cleared");
+
+        activity.ocr_failed("second".into());
+        activity.dismiss_error(ErrorSource::Ocr, seen);
+        let ocr = activity.snapshot(false, || true).ocr;
+        assert_eq!(ocr.last_error.map(|e| e.message), Some("second".to_string()));
+    }
 
     #[test]
     fn reuses_a_recent_power_reading() {

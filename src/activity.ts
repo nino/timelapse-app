@@ -75,6 +75,14 @@ export function getActivity(): Promise<Activity> {
 }
 
 /** Run conversion and OCR at full speed for `minutes`, replacing any boost in progress. */
+/** Which "Last error" line. Mirrors `ErrorSource` in `activity.rs`. */
+export type ErrorSource = "capture" | "ocr";
+
+/** Clear the error from `source` reported at `at`; a newer one stays. */
+export function dismissError(source: ErrorSource, at: string): Promise<void> {
+  return invoke<void>("dismiss_error", { source, at });
+}
+
 export function startBoost(minutes: number, allowBattery: boolean): Promise<Boost | null> {
   return invoke<Boost | null>("start_boost", { minutes, allowBattery });
 }

@@ -189,6 +189,23 @@ describe('ActivityView', () => {
     expect(screen.getByText("Can't get active window")).toBeInTheDocument();
   });
 
+  it('dismisses a last error', async () => {
+    const base = activity();
+    const failure = { at: secondsAgo(30), message: 'Skipped frame 12' };
+    mocked(invoke).mockImplementation(<T,>(command: string): Promise<T> =>
+      Promise.resolve(
+        command === 'get_activity' ? activity({ ocr: { ...base.ocr, lastError: failure } }) : null,
+      ) as Promise<T>,
+    );
+    render(<ActivityView />);
+
+    await waitFor(() => expect(screen.getByText('Skipped frame 12')).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }));
+
+    expect(screen.queryByText('Skipped frame 12')).not.toBeInTheDocument();
+    expect(invoke).toHaveBeenCalledWith('dismiss_error', { source: 'ocr', at: failure.at });
+  });
+
   describe('boost', () => {
     /** Answers `get_activity` with `current()` and records the other commands. */
     function respond(current: () => Activity, answer?: (command: string) => Promise<unknown>): void {
