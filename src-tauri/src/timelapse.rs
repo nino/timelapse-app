@@ -432,6 +432,10 @@ static LAST_SCREEN_ID: AtomicU32 = AtomicU32::new(0);
 
 /// The screen to capture: the one holding the active window.
 ///
+/// Not the one under the mouse pointer, which is what capture used first:
+/// Cmd-Tab to a window on another screen moves the focus without moving the
+/// pointer, and the capture should follow what is being worked on.
+///
 /// The active window only chooses between screens, so not finding one is not a
 /// reason to skip a capture. It happens while one of our own modal dialogs is
 /// open, and for a moment when the focused window closes; the screen then is
