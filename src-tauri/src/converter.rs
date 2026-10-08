@@ -496,7 +496,10 @@ fn ffmpeg_command(frames_dir: &Path, output: &Path) -> Command {
         Command::new(crate::paths::ffmpeg())
     };
     command
-        .args(["-y", "-loglevel", "error", "-framerate", FRAMERATE, "-i"])
+        // `-progress pipe:1` reports `frame=N` on stdout, for the Activity
+        // window's percentage.
+        .args(["-y", "-loglevel", "error", "-nostats", "-progress", "pipe:1"])
+        .args(["-framerate", FRAMERATE, "-i"])
         .arg(frames_dir.join("%05d.png"))
         .args(["-c:v", "libx265", "-crf", "28", "-preset", "veryslow", "-vf"])
         .arg(
@@ -544,11 +547,22 @@ fn wait_or_kill(
     }
 }
 
+/// The frame count in a line of ffmpeg's `-progress` output (`frame=123`).
+fn progress_frame(line: &str) -> Option<usize> {
+    line.trim().strip_prefix("frame=")?.trim().parse().ok()
+}
+
 /// Encode with ffmpeg, giving up if power is unplugged or `running` clears.
-fn encode_with_ffmpeg(frames_dir: &Path, output: &Path, running: &AtomicBool) -> Result<(), ConvertError> {
-    let child = ffmpeg_command(frames_dir, output)
+/// `on_progress` is called with the number of frames encoded so far.
+fn encode_with_ffmpeg(
+    frames_dir: &Path,
+    output: &Path,
+    running: &AtomicBool,
+    on_progress: impl Fn(usize) + Send + 'static,
+) -> Result<(), ConvertError> {
+    let mut child = ffmpeg_command(frames_dir, output)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         // `-loglevel error` keeps stderr short enough that it cannot fill the
         // pipe while nothing reads it.
         .stderr(Stdio::piped())
@@ -559,6 +573,19 @@ fn encode_with_ffmpeg(frames_dir: &Path, output: &Path, running: &AtomicBool) ->
                 e
             ))
         })?;
+
+    // Read the progress reports as they come; the thread ends when ffmpeg
+    // exits and closes the pipe.
+    if let Some(stdout) = child.stdout.take() {
+        std::thread::spawn(move || {
+            use std::io::BufRead;
+            for line in std::io::BufReader::new(stdout).lines().map_while(Result::ok) {
+                if let Some(frames) = progress_frame(&line) {
+                    on_progress(frames);
+                }
+            }
+        });
+    }
 
     wait_or_kill(child, ENCODE_POWER_CHECK, || {
         !running.load(Ordering::SeqCst) || !on_ac_power()
@@ -630,7 +657,7 @@ impl Converter {
         root: &Path,
         running: &Arc<AtomicBool>,
         ocr_done: &OcrCheck,
-        activity: &Activity,
+        activity: &Arc<Activity>,
     ) -> (State, Duration) {
         let now = Local::now();
 
@@ -698,12 +725,16 @@ impl Converter {
             hour: batch.hour,
             frames: batch.frames.len(),
             started_at: Local::now(),
+            frames_done: 0,
         });
         let root_owned = root.to_path_buf();
         let running_owned = Arc::clone(running);
+        let progress = Arc::clone(activity);
         let result = tokio::task::spawn_blocking(move || {
             convert_batch(&root_owned, &batch, |frames_dir, output| {
-                encode_with_ffmpeg(frames_dir, output, &running_owned)
+                encode_with_ffmpeg(frames_dir, output, &running_owned, move |frames| {
+                    progress.encoding_progress(frames)
+                })
             })
         })
         .await
@@ -1260,6 +1291,14 @@ mod tests {
     }
 
     #[test]
+    fn reads_the_frame_count_from_progress_lines() {
+        assert_eq!(progress_frame("frame=123"), Some(123));
+        assert_eq!(progress_frame("frame=  7\n"), Some(7));
+        assert_eq!(progress_frame("fps=2.5"), None);
+        assert_eq!(progress_frame("progress=continue"), None);
+    }
+
+    #[test]
     fn wait_or_kill_stops_a_running_process() {
         let child = Command::new("sleep").arg("30").spawn().unwrap();
         let started = Instant::now();
@@ -1317,7 +1356,20 @@ mod tests {
         let batch = find_ready_batches(root, at("2026-10-02", 0, 0)).unwrap().remove(0);
 
         let running = AtomicBool::new(true);
-        let name = convert_batch(root, &batch, |dir, out| encode_with_ffmpeg(dir, out, &running)).unwrap();
+        let progress = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let reported = Arc::clone(&progress);
+        let name = convert_batch(root, &batch, |dir, out| {
+            encode_with_ffmpeg(dir, out, &running, move |frames| reported.lock().unwrap().push(frames))
+        })
+        .unwrap();
+        // The reader thread may still be draining the pipe for a moment.
+        for _ in 0..50 {
+            if progress.lock().unwrap().last() == Some(&5) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(progress.lock().unwrap().last(), Some(&5), "progress reaches every frame");
 
         // Only ffmpeg is bundled, so inspect the result with it rather than
         // ffprobe: framecrc prints one line per packet without decoding, and

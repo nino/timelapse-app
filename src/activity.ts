@@ -10,6 +10,17 @@ export type WorkState = "starting" | "working" | "idle" | "resting" | "onBattery
 export type FrameRef = { day: string; number: number; at: string };
 export type Failure = { at: string; message: string };
 
+/** A batch being encoded. Mirrors `Encoding` in `activity.rs`. */
+export type Encoding = {
+  video: string;
+  day: string;
+  hour: number;
+  frames: number;
+  startedAt: string;
+  /** Frames ffmpeg has encoded so far. */
+  framesDone: number;
+};
+
 /** Mirrors `Snapshot` in `activity.rs`. */
 export type Activity = {
   onAcPower: boolean | null;
@@ -22,7 +33,7 @@ export type Activity = {
   };
   conversion: {
     state: WorkState;
-    current: { video: string; day: string; hour: number; frames: number; startedAt: string } | null;
+    current: Encoding | null;
     nextCheckAt: string | null;
     ready: number;
     waitingForOcr: number;
@@ -67,6 +78,22 @@ export function ago(time: string, now: number): string {
 export function until(time: string, now: number): string {
   const seconds = (Date.parse(time) - now) / 1000;
   return seconds < 1 ? "any moment now" : `in ${formatDuration(seconds)}`;
+}
+
+/**
+ * How far along an encode is, as a whole percentage, and an estimate of the
+ * seconds left at the rate so far (null until there is a rate to go by).
+ */
+export function encodeProgress(
+  encoding: Encoding,
+  now: number,
+): { percent: number; secondsLeft: number | null } {
+  const { frames, framesDone } = encoding;
+  const percent = frames > 0 ? Math.floor((framesDone / frames) * 100) : 0;
+  const elapsed = (now - Date.parse(encoding.startedAt)) / 1000;
+  const secondsLeft =
+    framesDone > 0 && elapsed >= 10 ? ((frames - framesDone) * elapsed) / framesDone : null;
+  return { percent, secondsLeft };
 }
 
 /** "3 frames", "1 frame". */

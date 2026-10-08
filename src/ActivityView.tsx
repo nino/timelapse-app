@@ -1,7 +1,7 @@
 import React from "react";
 
 import "./App.css";
-import { ago, count, formatDuration, until, type Activity, type Failure } from "./activity";
+import { ago, count, encodeProgress, formatDuration, until, type Activity, type Encoding, type Failure } from "./activity";
 import { useActivity } from "./hooks/useActivity";
 
 /** The Activity window (Window → Activity): what capture, video conversion and OCR are doing. */
@@ -166,6 +166,7 @@ function Conversion({
 
   return (
     <Section title="Video conversion" tone={tone} headline={headline}>
+      {current && <EncodeProgress encoding={current} now={now} />}
       {current && <Row label="Running for">{formatDuration((now - Date.parse(current.startedAt)) / 1000)}</Row>}
       <Row label="Waiting">
         {count(ready, "hour")} ready, {waitingForOcr} waiting for OCR
@@ -188,6 +189,32 @@ function Conversion({
         {count(videosMade, "video")} made, {count(framesDeleted, "screenshot")} deleted
       </Row>
     </Section>
+  );
+}
+
+function EncodeProgress({ encoding, now }: { encoding: Encoding; now: number }): React.ReactNode {
+  const { percent, secondsLeft } = encodeProgress(encoding, now);
+  return (
+    <Row label="Progress">
+      <span className="flex items-center gap-2">
+        <span
+          role="progressbar"
+          aria-label="Encoding progress"
+          aria-valuemin={0}
+          aria-valuemax={100}
+          aria-valuenow={percent}
+          className="h-1.5 w-24 shrink-0 overflow-hidden rounded-full bg-track"
+        >
+          <span className="block h-full bg-primary" style={{ width: `${percent}%` }} />
+        </span>
+        <span>
+          {percent}%
+          {secondsLeft !== null && (
+            <span className="text-muted-fg">, about {formatDuration(secondsLeft)} left</span>
+          )}
+        </span>
+      </span>
+    </Row>
   );
 }
 
