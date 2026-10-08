@@ -298,12 +298,15 @@ struct Capture<'a> {
     /// Whether each pixel is blue, green, red, alpha (Core Graphics' order)
     /// rather than red, green, blue, alpha.
     bgra: bool,
+    /// Captured pixels per point of screen: 2 on a Retina display, 1 on a
+    /// monitor at its native resolution.
+    pixels_per_point: f64,
 }
 
 impl Capture<'_> {
     /// Decode a PNG, as the `screenshots` crate returns captures off macOS.
     #[cfg(any(not(target_os = "macos"), test))]
-    fn from_png(data: &[u8]) -> Result<Capture<'static>, Error> {
+    fn from_png(data: &[u8], pixels_per_point: f64) -> Result<Capture<'static>, Error> {
         let image = image::load_from_memory_with_format(data, ImageFormat::Png)
             .map_err(|e| Error::UnableToCreateScreenshot {
                 reason: format!("Failed to read image: {}", e),
@@ -316,6 +319,7 @@ impl Capture<'_> {
             bytes_per_row: width as usize * 4,
             pixels: Cow::Owned(image.into_raw()),
             bgra: false,
+            pixels_per_point,
         })
     }
 }
@@ -350,6 +354,7 @@ fn with_capture<R>(
         reason: format!("Screen {} could not be captured", screen.display_info.id),
     })?;
     let (width, height) = (image.width(), image.height());
+    let pixels_per_point = width as f64 / screen.display_info.width.max(1) as f64;
 
     if is_bgra(&image) {
         let data = image.data();
@@ -359,6 +364,7 @@ fn with_capture<R>(
             bytes_per_row: image.bytes_per_row(),
             pixels: Cow::Borrowed(data.bytes()),
             bgra: true,
+            pixels_per_point,
         });
     }
 
@@ -385,6 +391,7 @@ fn with_capture<R>(
         bytes_per_row: width * 4,
         pixels: Cow::Owned(pixels),
         bgra: true,
+        pixels_per_point,
     })
 }
 
@@ -423,7 +430,7 @@ fn with_capture<R>(
     let image = screen.capture().map_err(|err| Error::UnableToCreateScreenshot {
         reason: err.to_string(),
     })?;
-    use_capture(&Capture::from_png(image.buffer())?)
+    use_capture(&Capture::from_png(image.buffer(), screen.display_info.scale_factor as f64)?)
 }
 
 /// The display the last capture used, so a capture that can't find the active
@@ -502,9 +509,38 @@ fn window_overlaps_screen(window: (i32, i32, i32, i32), screen: (i32, i32, u32, 
         && window_center_y < sy + sh as i32
 }
 
-/// Size of every stored frame. Screens of other shapes are letterboxed into it.
+/// Size of a frame from an ordinary screen. Screens of other shapes are
+/// letterboxed into it.
 const FRAME_WIDTH: u32 = 1800;
 const FRAME_HEIGHT: u32 = 1124;
+
+/// A screen that would get fewer stored pixels per point than this (a big
+/// monitor: 2560×1440 points gets 0.7) gets a bigger frame. On such a screen
+/// OCR read about a quarter of the words, against three quarters on a laptop,
+/// which gets 1.14.
+const MIN_PIXELS_PER_POINT: f64 = 1.0;
+
+/// How many pixels per point a big screen's frame gets, or as many as the
+/// capture has if fewer. At 1.4, with OCR reading in strips, a 2560×1440-point
+/// screen read about 68% of words; twice as many pixels read no more.
+const BIG_SCREEN_PIXELS_PER_POINT: f64 = 1.4;
+
+/// The size of the frame `capture` is stored in: `FRAME_WIDTH`×`FRAME_HEIGHT`,
+/// or for a big screen that shape scaled up to `BIG_SCREEN_PIXELS_PER_POINT`.
+/// Keeping the shape means the converter, which scales every frame down to
+/// 1800×1124, letterboxes them all alike.
+fn frame_size(capture: &Capture) -> (u32, u32) {
+    let fit = (FRAME_WIDTH as f64 / capture.width as f64).min(FRAME_HEIGHT as f64 / capture.height as f64);
+    let stored = fit * capture.pixels_per_point;
+    if !(stored < MIN_PIXELS_PER_POINT) {
+        // Also an unknown pixels-per-point (NaN): an ordinary frame.
+        return (FRAME_WIDTH, FRAME_HEIGHT);
+    }
+    let factor = BIG_SCREEN_PIXELS_PER_POINT.min(capture.pixels_per_point) / stored;
+    // Even, as the video encoder's 4:2:0 chroma wants.
+    let even = |length: u32| ((length as f64 * factor / 2.0).round() as u32) * 2;
+    (even(FRAME_WIDTH), even(FRAME_HEIGHT))
+}
 
 /// Fit a capture into a frame and write it to `file_path` as a PNG, unless the
 /// frame is all black. Returns whether it was black (and so not written).
@@ -550,8 +586,8 @@ thread_local! {
     static RESIZER: std::cell::RefCell<Resizer> = std::cell::RefCell::new(Resizer::new());
 }
 
-/// Scale a capture to fit `FRAME_WIDTH`×`FRAME_HEIGHT` keeping its aspect
-/// ratio, and centre it on a black canvas of exactly that size.
+/// Scale a capture to fit its `frame_size` keeping its aspect ratio, and
+/// centre it on a black canvas of exactly that size.
 fn fit_to_frame(capture: &Capture, file_path: &str) -> Result<RgbImage, Error> {
     let resize_error = |reason: String| Error::UnableToResizeScreenshot {
         path: file_path.to_string(),
@@ -587,11 +623,12 @@ fn fit_to_frame(capture: &Capture, file_path: &str) -> Result<RgbImage, Error> {
     let source = ImageRef::new((bytes_per_row / 4) as u32, orig_height, &padded, PixelType::U8x4)
         .map_err(|e| resize_error(format!("Failed to read image: {}", e)))?;
 
-    let scale = (FRAME_WIDTH as f64 / orig_width as f64).min(FRAME_HEIGHT as f64 / orig_height as f64);
-    let new_width = ((orig_width as f64 * scale) as u32).clamp(1, FRAME_WIDTH);
-    let new_height = ((orig_height as f64 * scale) as u32).clamp(1, FRAME_HEIGHT);
-    let x_offset = (FRAME_WIDTH - new_width) / 2;
-    let y_offset = (FRAME_HEIGHT - new_height) / 2;
+    let (frame_width, frame_height) = frame_size(capture);
+    let scale = (frame_width as f64 / orig_width as f64).min(frame_height as f64 / orig_height as f64);
+    let new_width = ((orig_width as f64 * scale) as u32).clamp(1, frame_width);
+    let new_height = ((orig_height as f64 * scale) as u32).clamp(1, frame_height);
+    let x_offset = (frame_width - new_width) / 2;
+    let y_offset = (frame_height - new_height) / 2;
 
     // Resize straight into the centre of an opaque black canvas. Box filter, as
     // the ImageMagick version used: each output pixel is the average of the
@@ -599,7 +636,7 @@ fn fit_to_frame(capture: &Capture, file_path: &str) -> Result<RgbImage, Error> {
     // the row padding out: `crop` bounds where output pixels are taken from,
     // but a wider filter (Lanczos3, say) would still reach into the padding
     // for the rightmost column.
-    let mut canvas = image::RgbaImage::from_pixel(FRAME_WIDTH, FRAME_HEIGHT, image::Rgba([0, 0, 0, 255]));
+    let mut canvas = image::RgbaImage::from_pixel(frame_width, frame_height, image::Rgba([0, 0, 0, 255]));
     let mut target = CroppedImageMut::new(&mut canvas, x_offset, y_offset, new_width, new_height)
         .map_err(|e| resize_error(format!("Failed to place image: {}", e)))?;
     let options = ResizeOptions::new()
@@ -915,6 +952,7 @@ mod tests {
             bytes_per_row: image.width() as usize * 4,
             pixels: Cow::Owned(rgba.into_raw()),
             bgra: false,
+            pixels_per_point: 2.0,
         }
     }
 
@@ -957,7 +995,7 @@ mod tests {
                 pixel.copy_from_slice(&[30, 200, 10, 255]);
             }
         }
-        let capture = Capture { width: width as u32, height: height as u32, bytes_per_row, pixels: Cow::Owned(pixels), bgra: true };
+        let capture = Capture { width: width as u32, height: height as u32, bytes_per_row, pixels: Cow::Owned(pixels), bgra: true, pixels_per_point: 2.0 };
 
         let frame = fit_to_frame(&capture, "test.png").unwrap();
 
@@ -982,7 +1020,7 @@ mod tests {
     #[test]
     fn test_fit_to_frame_keeps_row_padding_out_of_a_downscaled_frame() {
         let (bytes_per_row, pixels) = padded_retina_capture();
-        let capture = Capture { width: 3024, height: 1964, bytes_per_row, pixels: Cow::Owned(pixels), bgra: true };
+        let capture = Capture { width: 3024, height: 1964, bytes_per_row, pixels: Cow::Owned(pixels), bgra: true, pixels_per_point: 2.0 };
 
         let frame = fit_to_frame(&capture, "test.png").unwrap();
 
@@ -997,7 +1035,7 @@ mod tests {
     fn test_fit_to_frame_accepts_a_last_row_without_padding() {
         let (bytes_per_row, mut pixels) = padded_retina_capture();
         pixels.truncate(pixels.len() - 16 * 4);
-        let capture = Capture { width: 3024, height: 1964, bytes_per_row, pixels: Cow::Owned(pixels), bgra: true };
+        let capture = Capture { width: 3024, height: 1964, bytes_per_row, pixels: Cow::Owned(pixels), bgra: true, pixels_per_point: 2.0 };
 
         let frame = fit_to_frame(&capture, "test.png").unwrap();
 
@@ -1007,7 +1045,7 @@ mod tests {
     #[test]
     fn test_fit_to_frame_rejects_rows_too_short_for_the_width() {
         for bytes_per_row in [399, 402] {
-            let capture = Capture { width: 100, height: 100, bytes_per_row, pixels: Cow::Owned(vec![0; 402 * 100]), bgra: true };
+            let capture = Capture { width: 100, height: 100, bytes_per_row, pixels: Cow::Owned(vec![0; 402 * 100]), bgra: true, pixels_per_point: 2.0 };
             let result = fit_to_frame(&capture, "/test/path");
             assert!(matches!(result, Err(Error::UnableToResizeScreenshot { .. })), "{} bytes a row", bytes_per_row);
         }
@@ -1015,7 +1053,7 @@ mod tests {
 
     #[test]
     fn test_fit_to_frame_rejects_a_short_buffer() {
-        let capture = Capture { width: 100, height: 100, bytes_per_row: 400, pixels: Cow::Owned(vec![0; 399 * 100]), bgra: true };
+        let capture = Capture { width: 100, height: 100, bytes_per_row: 400, pixels: Cow::Owned(vec![0; 399 * 100]), bgra: true, pixels_per_point: 2.0 };
         let result = fit_to_frame(&capture, "/test/path");
         assert!(matches!(result, Err(Error::UnableToResizeScreenshot { .. })));
     }
@@ -1045,18 +1083,55 @@ mod tests {
         println!("all black: {}", is_image_all_black(&frame));
     }
 
+    fn blank_capture(width: u32, height: u32, pixels_per_point: f64) -> Capture<'static> {
+        Capture {
+            width,
+            height,
+            bytes_per_row: width as usize * 4,
+            pixels: Cow::Owned(vec![200; width as usize * height as usize * 4]),
+            bgra: true,
+            pixels_per_point,
+        }
+    }
+
+    #[test]
+    fn test_frame_size_grows_only_for_big_screens() {
+        // A 14" MacBook (1512×982 points) keeps the ordinary frame: 1.14 px a point.
+        assert_eq!(frame_size(&blank_capture(3024, 1964, 2.0)), (1800, 1124));
+        // A 2560×1440-point screen at 2x would get 0.7 px a point; it gets 1.4.
+        assert_eq!(frame_size(&blank_capture(5120, 2880, 2.0)), (3584, 2238));
+        // The same screen at 1x has only 1 px a point, so it is kept at that.
+        assert_eq!(frame_size(&blank_capture(2560, 1440, 1.0)), (2560, 1598));
+        // A 4K screen at "looks like 1920×1080" would get 0.94.
+        assert_eq!(frame_size(&blank_capture(3840, 2160, 2.0)), (2688, 1678));
+        // Unknown density: the ordinary frame.
+        assert_eq!(frame_size(&blank_capture(5120, 2880, f64::NAN)), (1800, 1124));
+    }
+
+    #[test]
+    fn test_fit_to_frame_keeps_a_1x_monitor_at_full_resolution() {
+        let frame = fit_to_frame(&blank_capture(2560, 1440, 1.0), "test.png").unwrap();
+
+        // 2560×1440 fills the width of 2560×1598 unscaled, with 79px bars.
+        assert_eq!(frame.dimensions(), (2560, 1598));
+        assert_eq!(frame.get_pixel(1280, 78).0, [0, 0, 0]);
+        assert_eq!(frame.get_pixel(1280, 79).0, [200, 200, 200]);
+        assert_eq!(frame.get_pixel(1280, 1518).0, [200, 200, 200]);
+        assert_eq!(frame.get_pixel(1280, 1519).0, [0, 0, 0]);
+    }
+
     #[test]
     fn test_capture_from_png() {
         let image = RgbImage::from_pixel(3, 2, image::Rgb([1, 2, 3]));
         let mut png = std::io::Cursor::new(Vec::new());
         image.write_to(&mut png, ImageFormat::Png).unwrap();
 
-        let capture = Capture::from_png(png.get_ref()).unwrap();
+        let capture = Capture::from_png(png.get_ref(), 2.0).unwrap();
 
         assert_eq!((capture.width, capture.height, capture.bytes_per_row), (3, 2, 12));
         assert_eq!(&capture.pixels[..4], &[1, 2, 3, 255]);
         assert!(!capture.bgra);
-        assert!(Capture::from_png(b"not a png").is_err());
+        assert!(Capture::from_png(b"not a png", 2.0).is_err());
     }
 
     #[test]
