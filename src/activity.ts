@@ -44,6 +44,10 @@ export type Activity = {
     framesSaved: number;
     lastBlackAt: string | null;
     lastError: Failure | null;
+    /** Failed captures since the last one that worked. */
+    failuresInARow: number;
+    /** From this many failures in a row on, capture retries once a minute. */
+    failuresBeforeBackoff: number;
   };
   conversion: {
     state: WorkState;

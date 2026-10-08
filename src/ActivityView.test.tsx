@@ -23,6 +23,8 @@ function activity(overrides: Partial<Activity> = {}): Activity {
       framesSaved: 4000,
       lastBlackAt: null,
       lastError: null,
+      failuresInARow: 0,
+      failuresBeforeBackoff: 3,
     },
     conversion: {
       state: 'resting',
@@ -176,17 +178,53 @@ describe('ActivityView', () => {
     expect(screen.queryByText(/in this pass/)).not.toBeInTheDocument();
   });
 
-  it('flags a failing capture', async () => {
+  it('treats a single failed capture as a retry, not a failure', async () => {
     const base = activity();
     mocked(invoke).mockResolvedValue(
       activity({
-        capture: { ...base.capture, lastError: { at: secondsAgo(1), message: "Can't get active window" } },
+        capture: {
+          ...base.capture,
+          lastError: { at: secondsAgo(1), message: "Can't get active window" },
+          failuresInARow: 1,
+        },
       }),
     );
     render(<ActivityView />);
 
-    await waitFor(() => expect(screen.getByTestId('Capture-headline')).toHaveTextContent(/Capture failed/));
+    await waitFor(() =>
+      expect(screen.getByTestId('Capture-headline')).toHaveTextContent('Capture failed; trying again in a second'),
+    );
     expect(screen.getByText("Can't get active window")).toBeInTheDocument();
+  });
+
+  it('flags a capture that keeps failing', async () => {
+    const base = activity();
+    mocked(invoke).mockResolvedValue(
+      activity({
+        capture: {
+          ...base.capture,
+          lastError: { at: secondsAgo(1), message: "Can't get active window" },
+          failuresInARow: 3,
+        },
+      }),
+    );
+    render(<ActivityView />);
+
+    await waitFor(() =>
+      expect(screen.getByTestId('Capture-headline')).toHaveTextContent(
+        'Capture failed 3 times in a row; trying again every minute',
+      ),
+    );
+  });
+
+  it('goes back to capturing once a capture works after a failure', async () => {
+    const base = activity();
+    mocked(invoke).mockResolvedValue(
+      activity({ capture: { ...base.capture, lastError: { at: secondsAgo(5), message: "Can't get active window" } } }),
+    );
+    render(<ActivityView />);
+
+    await waitFor(() => expect(screen.getByTestId('Capture-headline')).toHaveTextContent('Capturing every second'));
   });
 
   it('dismisses a last error', async () => {

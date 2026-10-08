@@ -8,12 +8,12 @@ use serde::{Deserialize, Serialize};
 use std::{
     borrow::Cow,
     path::PathBuf,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicU32, Ordering},
     sync::{Arc, Mutex},
 };
 use thiserror::Error;
 use tokio::time::{sleep, Duration};
-use crate::activity::Activity;
+use crate::activity::{Activity, FAILURES_BEFORE_BACKOFF};
 use crate::database::ScreenshotDatabase;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,6 +100,7 @@ impl Photographer {
 
         tokio::spawn(async move {
             println!("Starting timelapse background task...");
+            let mut failures_in_a_row = 0;
             crate::diagnostics::info("capture", "Started").record();
             let mut tally = crate::diagnostics::Tally::new("capture");
 
@@ -109,6 +110,7 @@ impl Photographer {
                 tally.time("capture", started.elapsed());
                 match captured {
                     Ok(Captured::Saved { day, number }) => {
+                        failures_in_a_row = 0;
                         tally.count("saved", 1);
                         activity.frame_saved(&day, number);
                         tally.report_if_due();
@@ -116,6 +118,7 @@ impl Photographer {
                     }
                     Ok(Captured::Black) => {
                         // The screen was off or locked: wait 10 seconds.
+                        failures_in_a_row = 0;
                         tally.count("black", 1);
                         activity.black_frame_dropped();
                         tally.report_if_due();
@@ -123,6 +126,7 @@ impl Photographer {
                     }
                     Err(error) => {
                         eprintln!("Screenshot error: {}", error);
+                        failures_in_a_row += 1;
                         tally.count("failed", 1);
                         activity.capture_failed(error.to_string());
 
@@ -140,7 +144,7 @@ impl Photographer {
                         }
 
                         tally.report_if_due();
-                        sleep(Duration::from_secs(60)).await;
+                        sleep(retry_delay(failures_in_a_row)).await;
                     }
                 }
             }
@@ -244,6 +248,17 @@ enum Captured {
     Saved { day: String, number: u32 },
     /// The frame was all black, so nothing was written.
     Black,
+}
+
+/// How long to wait after `failures_in_a_row` failed captures. A one-off
+/// failure, such as the focused window closing mid-capture, is retried on the
+/// next second; only `FAILURES_BEFORE_BACKOFF` in a row back off for a minute.
+fn retry_delay(failures_in_a_row: u32) -> Duration {
+    if failures_in_a_row >= FAILURES_BEFORE_BACKOFF {
+        Duration::from_secs(60)
+    } else {
+        Duration::from_secs(1)
+    }
 }
 
 fn next_filename(day_dir: &PathBuf) -> Result<String, Error> {
@@ -411,43 +426,62 @@ fn with_capture<R>(
     use_capture(&Capture::from_png(image.buffer())?)
 }
 
-async fn get_focused_screen() -> Result<Screen, Error> {
-    // Get the active window to determine which screen is focused
-    let active_window = get_active_window().map_err(|_| Error::UnableToCreateScreenshot {
-        reason: "Can't get active window".to_owned(),
-    })?;
+/// The display the last capture used, so a capture that can't find the active
+/// window stays on the same screen. 0 until the first capture.
+static LAST_SCREEN_ID: AtomicU32 = AtomicU32::new(0);
 
-    // Get all available screens
+/// The screen to capture: the one holding the active window.
+///
+/// The active window only chooses between screens, so not finding one is not a
+/// reason to skip a capture. It happens while one of our own modal dialogs is
+/// open, and for a moment when the focused window closes; the screen then is
+/// the one the last capture used, or the main one.
+async fn get_focused_screen() -> Result<Screen, Error> {
     let screens = Screen::all().map_err(|err| Error::UnableToCreateScreenshot {
         reason: err.to_string(),
     })?;
+    let window = get_active_window().ok().map(|window| {
+        (
+            window.position.x as i32,
+            window.position.y as i32,
+            window.position.width as i32,
+            window.position.height as i32,
+        )
+    });
+    let rects: Vec<(u32, (i32, i32, u32, u32))> = screens
+        .iter()
+        .map(|screen| {
+            let info = &screen.display_info;
+            (info.id, (info.x, info.y, info.width, info.height))
+        })
+        .collect();
+    let last = LAST_SCREEN_ID.load(Ordering::Relaxed);
+    let chosen = choose_screen(window, &rects, (last != 0).then_some(last));
 
-    // Find the screen that contains the active window
-    for screen in screens {
-        let screen_rect = (
-            screen.display_info.x,
-            screen.display_info.y,
-            screen.display_info.width,
-            screen.display_info.height,
-        );
-        // Convert window position from f64 to i32
-        let window_rect = (
-            active_window.position.x as i32,
-            active_window.position.y as i32,
-            active_window.position.width as i32,
-            active_window.position.height as i32,
-        );
+    let screen = match chosen.and_then(|id| screens.into_iter().find(|s| s.display_info.id == id)) {
+        Some(screen) => screen,
+        None => Screen::from_point(0, 0).map_err(|err| Error::UnableToCreateScreenshot {
+            reason: err.to_string(),
+        })?,
+    };
+    LAST_SCREEN_ID.store(screen.display_info.id, Ordering::Relaxed);
+    Ok(screen)
+}
 
-        // Check if the window is primarily on this screen
-        if window_overlaps_screen(window_rect, screen_rect) {
-            return Ok(screen);
-        }
-    }
-
-    // Fallback to primary screen if no overlap found
-    Screen::from_point(0, 0).map_err(|err| Error::UnableToCreateScreenshot {
-        reason: err.to_string(),
-    })
+/// Which of `screens` (id, rect) to capture: the one under the centre of the
+/// active `window`, else the `last` one if it is still connected. `None`
+/// means the main screen.
+fn choose_screen(
+    window: Option<(i32, i32, i32, i32)>,
+    screens: &[(u32, (i32, i32, u32, u32))],
+    last: Option<u32>,
+) -> Option<u32> {
+    let under_window = window.and_then(|window| {
+        screens.iter().find(|(_, rect)| window_overlaps_screen(window, *rect))
+    });
+    under_window
+        .or_else(|| screens.iter().find(|(id, _)| Some(*id) == last))
+        .map(|(id, _)| *id)
 }
 
 fn window_overlaps_screen(window: (i32, i32, i32, i32), screen: (i32, i32, u32, u32)) -> bool {
@@ -812,6 +846,26 @@ mod tests {
 
         assert!(!window_overlaps_screen(window, screen1));
         assert!(window_overlaps_screen(window, screen2));
+    }
+
+    #[test]
+    fn captures_the_last_screen_when_there_is_no_active_window() {
+        let screens = [(1, (0, 0, 1000, 800)), (2, (1000, 0, 1000, 800))];
+        // The active window's centre picks the screen.
+        assert_eq!(choose_screen(Some((1200, 100, 400, 300)), &screens, Some(1)), Some(2));
+        // No active window (one of our dialogs is open): stay where we were.
+        assert_eq!(choose_screen(None, &screens, Some(2)), Some(2));
+        // A screen that has since been unplugged, or no capture yet: the main one.
+        assert_eq!(choose_screen(None, &screens, Some(3)), None);
+        assert_eq!(choose_screen(None, &screens, None), None);
+    }
+
+    #[test]
+    fn backs_off_only_after_three_failures_in_a_row() {
+        assert_eq!(retry_delay(1), Duration::from_secs(1));
+        assert_eq!(retry_delay(2), Duration::from_secs(1));
+        assert_eq!(retry_delay(3), Duration::from_secs(60));
+        assert_eq!(retry_delay(10), Duration::from_secs(60));
     }
 
     #[test]
