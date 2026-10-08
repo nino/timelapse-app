@@ -562,7 +562,7 @@ fn show_settings_window<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
         window.show()?;
         return window.set_focus();
     }
-    // It opens hidden, and `fit_settings_window` shows it once it is sized to
+    // It opens hidden, and `grow_settings_window` shows it once it is sized to
     // its content, so it never visibly jumps. Shown anyway after a second in
     // case the page never gets that far.
     let window =
@@ -584,13 +584,21 @@ fn show_settings_window<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
 /// Width of the Settings window, in logical pixels.
 const SETTINGS_WIDTH: f64 = 440.0;
 
-/// Sizes the Settings window to the height of its content and shows it.
+/// Makes the Settings window `by` logical pixels taller (shorter when
+/// negative) and shows it. The page asks for the difference between its
+/// content and its viewport rather than for a height, because what
+/// `set_size` sets on macOS is not the viewport's height (on Nino's Mac a
+/// 170pt window showed about 138pt of page), so only a change is reliable.
 #[tauri::command]
-fn fit_settings_window(height: f64, window: tauri::WebviewWindow) -> Result<(), String> {
-    window
-        .set_size(tauri::LogicalSize::new(SETTINGS_WIDTH, height.ceil()))
-        .and_then(|_| window.show())
-        .map_err(|e| e.to_string())
+fn grow_settings_window(by: f64, window: tauri::WebviewWindow) -> Result<(), String> {
+    let resize = || -> tauri::Result<()> {
+        if by.abs() >= 0.5 {
+            let size = window.inner_size()?.to_logical::<f64>(window.scale_factor()?);
+            window.set_size(tauri::LogicalSize::new(size.width, (size.height + by).round()))?;
+        }
+        window.show()
+    };
+    resize().map_err(|e| e.to_string())
 }
 
 /// Bring the Activity window to the front, opening it if it isn't open. It
@@ -775,7 +783,7 @@ pub fn run() {
             get_activity,
             get_settings,
             set_update_automatically,
-            fit_settings_window
+            grow_settings_window
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

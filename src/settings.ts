@@ -17,7 +17,7 @@ export function setUpdateAutomatically(enabled: boolean): Promise<Settings> {
   return invoke<Settings>("set_update_automatically", { enabled });
 }
 
-/** Sizes the Settings window to `height` logical pixels of content and shows it. */
-export function fitSettingsWindow(height: number): Promise<void> {
-  return invoke<void>("fit_settings_window", { height });
+/** Makes the Settings window `by` logical pixels taller (shorter when negative) and shows it. */
+export function growSettingsWindow(by: number): Promise<void> {
+  return invoke<void>("grow_settings_window", { by });
 }
