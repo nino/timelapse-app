@@ -157,15 +157,36 @@ impl std::fmt::Display for ConvertError {
 /// have no battery check and always report `true`.
 pub fn on_ac_power() -> bool {
     if cfg!(target_os = "macos") {
-        Command::new("pmset")
+        let reading = Command::new("pmset")
             .args(["-g", "ps"])
             .output()
             .ok()
             .filter(|output| output.status.success())
-            .and_then(|output| parse_pmset_power_source(&String::from_utf8_lossy(&output.stdout)))
-            .unwrap_or(false)
+            .and_then(|output| parse_pmset_power_source(&String::from_utf8_lossy(&output.stdout)));
+        log_power_change(reading);
+        reading.unwrap_or(false)
     } else {
         true
+    }
+}
+
+/// Log a change in the power source, or in whether it could be read at all.
+/// Several loops ask, so the last reading is shared.
+fn log_power_change(reading: Option<bool>) {
+    use std::sync::atomic::AtomicU8;
+    // 0: not read yet, 1: unreadable, 2: battery, 3: AC.
+    static LAST: AtomicU8 = AtomicU8::new(0);
+    let code = match reading {
+        None => 1,
+        Some(false) => 2,
+        Some(true) => 3,
+    };
+    if LAST.swap(code, Ordering::Relaxed) != code {
+        match reading {
+            None => crate::diagnostics::warn("power", "Could not read the power source").record(),
+            Some(false) => crate::diagnostics::info("power", "On battery").record(),
+            Some(true) => crate::diagnostics::info("power", "On AC power").record(),
+        }
     }
 }
 
@@ -304,7 +325,11 @@ pub fn delete_frames(parts: &[HourBatch]) -> usize {
     for frame in parts.iter().flat_map(|batch| &batch.frames) {
         match std::fs::remove_file(&frame.path) {
             Ok(()) => deleted += 1,
-            Err(e) => eprintln!("Could not delete converted frame {:?}: {}", frame.path, e),
+            Err(e) => {
+                eprintln!("Could not delete converted frame {:?}: {}", frame.path, e);
+                crate::diagnostics::warn("converter", format!("Could not delete converted frame {:?}: {}", frame.path, e))
+                    .record();
+            }
         }
     }
     deleted
@@ -487,6 +512,7 @@ pub fn convert_batch(
         // hour's PNGs are only deleted once the record has been written.
         if let Err(e) = record_frames(root, std::slice::from_ref(batch), false) {
             eprintln!("Could not record the frames of {}; will retry before deleting them: {}", video_name, e);
+            crate::diagnostics::warn("converter", format!("Could not record the frames of {}: {}", video_name, e)).record();
         }
         std::fs::rename(&staged_video, &published)
             .map_err(|e| failed("Failed to publish video", e))?;
@@ -562,7 +588,9 @@ fn set_background(pid: u32, background: bool) {
         // SAFETY: only changes the scheduling of `pid`, our own unreaped
         // child, so it cannot belong to another process.
         if unsafe { libc::setpriority(libc::PRIO_DARWIN_PROCESS, pid as libc::id_t, priority) } != 0 {
-            eprintln!("Could not change ffmpeg's priority: {}", std::io::Error::last_os_error());
+            let error = std::io::Error::last_os_error();
+            eprintln!("Could not change ffmpeg's priority: {}", error);
+            crate::diagnostics::warn("converter", format!("Could not change ffmpeg's priority: {}", error)).record();
         }
     }
     #[cfg(not(target_os = "macos"))]
@@ -797,6 +825,7 @@ impl Converter {
             println!("Starting video conversion background task...");
             if let Err(e) = clear_stale_staging(&root) {
                 eprintln!("Failed to clear stale conversion folders: {}", e);
+                crate::diagnostics::warn("converter", format!("Failed to clear stale conversion folders: {}", e)).record();
             }
 
             let mut boost_changes = boost.subscribe();
@@ -839,28 +868,38 @@ impl Converter {
                     // record here, while the PNGs still say what is in them.
                     if let Err(e) = record_frames(root, &parts, true) {
                         eprintln!("Kept the frames of {} {:02}:00: could not record them: {}", parts[0].day, parts[0].hour, e);
+                        crate::diagnostics::warn("converter", format!("Kept the frames of {} {:02}:00: could not record them: {}", parts[0].day, parts[0].hour, e)).record();
                         continue;
                     }
                     match matches_record(root, &parts) {
                         Ok(true) => {}
                         Ok(false) => {
                             eprintln!("Kept the frames of {} {:02}:00: some are not in its video", parts[0].day, parts[0].hour);
+                        crate::diagnostics::warn("converter", format!("Kept the frames of {} {:02}:00: some are not in its video", parts[0].day, parts[0].hour)).record();
                             continue;
                         }
                         Err(e) => {
                             eprintln!("Kept the frames of {} {:02}:00: could not check its video: {}", parts[0].day, parts[0].hour, e);
+                        crate::diagnostics::warn("converter", format!("Kept the frames of {} {:02}:00: could not check its video: {}", parts[0].day, parts[0].hour, e)).record();
                             continue;
                         }
                     }
                     let deleted = delete_frames(&parts);
                     activity.frames_deleted(deleted);
+                    crate::diagnostics::info("converter", "Deleted converted frames")
+                        .data(serde_json::json!({ "day": parts[0].day, "hour": parts[0].hour, "frames": deleted }))
+                        .record();
                     println!("Deleted {} converted frames from {} {:02}:00", deleted, parts[0].day, parts[0].hour);
                 }
             }
-            Err(e) => eprintln!("Failed to scan for converted screenshots: {}", e),
+            Err(e) => {
+                eprintln!("Failed to scan for converted screenshots: {}", e);
+                crate::diagnostics::error("converter", format!("Failed to scan for converted screenshots: {}", e)).record();
+            }
         }
         if let Err(e) = remove_empty_day_folders(root, now) {
             eprintln!("Failed to remove empty day folders: {}", e);
+            crate::diagnostics::warn("converter", format!("Failed to remove empty day folders: {}", e)).record();
         }
 
         if let Some(left) = boost.low_power_left() {
@@ -882,6 +921,7 @@ impl Converter {
             }
             Err(e) => {
                 eprintln!("Failed to scan for screenshots to convert: {}", e);
+                crate::diagnostics::error("converter", format!("Failed to scan for screenshots to convert: {}", e)).record();
                 return (State::Idle, idle_poll);
             }
         };

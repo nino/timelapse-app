@@ -100,20 +100,30 @@ impl Photographer {
 
         tokio::spawn(async move {
             println!("Starting timelapse background task...");
+            crate::diagnostics::info("capture", "Started").record();
+            let mut tally = crate::diagnostics::Tally::new("capture");
 
             while running_clone.load(Ordering::SeqCst) {
-                match Self::do_screenshot(&timelapse_root_path, &db_clone).await {
+                let started = std::time::Instant::now();
+                let captured = Self::do_screenshot(&timelapse_root_path, &db_clone).await;
+                tally.time("capture", started.elapsed());
+                match captured {
                     Ok(Captured::Saved { day, number }) => {
+                        tally.count("saved", 1);
                         activity.frame_saved(&day, number);
+                        tally.report_if_due();
                         sleep(Duration::from_secs(1)).await;
                     }
                     Ok(Captured::Black) => {
                         // The screen was off or locked: wait 10 seconds.
+                        tally.count("black", 1);
                         activity.black_frame_dropped();
+                        tally.report_if_due();
                         sleep(Duration::from_secs(10)).await;
                     }
                     Err(error) => {
                         eprintln!("Screenshot error: {}", error);
+                        tally.count("failed", 1);
                         activity.capture_failed(error.to_string());
 
                         // Log the error
@@ -129,12 +139,14 @@ impl Photographer {
                             }
                         }
 
+                        tally.report_if_due();
                         sleep(Duration::from_secs(60)).await;
                     }
                 }
             }
 
             println!("Timelapse background task stopped.");
+            crate::diagnostics::info("capture", "Stopped").record();
         });
 
         running
