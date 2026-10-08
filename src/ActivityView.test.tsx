@@ -250,12 +250,16 @@ describe('ActivityView', () => {
       render(<ActivityView />);
 
       await waitFor(() => expect(screen.getByTestId('Power-headline')).toHaveTextContent(/wait until the Mac is plugged in/));
+      expect(screen.getByTestId('Boost-headline')).toHaveTextContent(
+        'Waiting for AC power (10m 00s left); tick “Also on battery” to start now',
+      );
       boost = { until: secondsAhead(600), allowBattery: true };
       fireEvent.click(screen.getByRole('checkbox', { name: 'Also on battery' }));
 
       expect(invoke).toHaveBeenCalledWith('set_boost_allow_battery', { allowBattery: true });
       await waitFor(() => expect(screen.getByTestId('Power-headline')).toHaveTextContent('On battery: boosting anyway'));
       expect(screen.getByRole('checkbox', { name: 'Also on battery' })).toBeChecked();
+      expect(screen.getByTestId('Boost-headline')).toHaveTextContent('Running at full speed for another 10m 00s');
     });
 
     it('shows why a boost could not start', async () => {

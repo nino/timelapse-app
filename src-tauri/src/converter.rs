@@ -864,7 +864,8 @@ impl Converter {
         }
 
         if !boost.may_work(on_ac_power) {
-            return (State::OnBattery, ON_BATTERY_POLL);
+            let poll = if boost.is_on() { boost::BOOSTED_POWER_POLL } else { ON_BATTERY_POLL };
+            return (State::OnBattery, poll);
         }
         let idle_poll = if boost.is_on() { BOOSTED_IDLE_POLL } else { IDLE_POLL };
 

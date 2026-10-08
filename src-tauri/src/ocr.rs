@@ -630,7 +630,8 @@ fn run_forever(worker: &mut OcrWorker, boost: &Boost) {
     };
     loop {
         if !keep_going() {
-            sleep(State::OnBattery, BATTERY_SLEEP);
+            let wait = if boost.is_on() { crate::boost::BOOSTED_POWER_POLL } else { BATTERY_SLEEP };
+            sleep(State::OnBattery, wait);
             continue;
         }
 
