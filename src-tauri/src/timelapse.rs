@@ -12,7 +12,7 @@ use std::{
 };
 use thiserror::Error;
 use tokio::time::{sleep, Duration};
-use crate::activity::Activity;
+use crate::activity::{Activity, FAILURES_BEFORE_BACKOFF};
 use crate::database::ScreenshotDatabase;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -99,20 +99,24 @@ impl Photographer {
 
         tokio::spawn(async move {
             println!("Starting timelapse background task...");
+            let mut failures_in_a_row = 0;
 
             while running_clone.load(Ordering::SeqCst) {
                 match Self::do_screenshot(&timelapse_root_path, &db_clone).await {
                     Ok(Captured::Saved { day, number }) => {
+                        failures_in_a_row = 0;
                         activity.frame_saved(&day, number);
                         sleep(Duration::from_secs(1)).await;
                     }
                     Ok(Captured::Black) => {
                         // The screen was off or locked: wait 10 seconds.
+                        failures_in_a_row = 0;
                         activity.black_frame_dropped();
                         sleep(Duration::from_secs(10)).await;
                     }
                     Err(error) => {
                         eprintln!("Screenshot error: {}", error);
+                        failures_in_a_row += 1;
                         activity.capture_failed(error.to_string());
 
                         // Log the error
@@ -128,7 +132,7 @@ impl Photographer {
                             }
                         }
 
-                        sleep(Duration::from_secs(60)).await;
+                        sleep(retry_delay(failures_in_a_row)).await;
                     }
                 }
             }
@@ -228,6 +232,17 @@ enum Captured {
     Saved { day: String, number: u32 },
     /// The frame was all black, so nothing was written.
     Black,
+}
+
+/// How long to wait after `failures_in_a_row` failed captures. A one-off
+/// failure, such as the focused window closing mid-capture, is retried on the
+/// next second; only `FAILURES_BEFORE_BACKOFF` in a row back off for a minute.
+fn retry_delay(failures_in_a_row: u32) -> Duration {
+    if failures_in_a_row >= FAILURES_BEFORE_BACKOFF {
+        Duration::from_secs(60)
+    } else {
+        Duration::from_secs(1)
+    }
 }
 
 fn next_filename(day_dir: &PathBuf) -> Result<String, Error> {
@@ -650,6 +665,14 @@ mod tests {
 
         assert!(!window_overlaps_screen(window, screen1));
         assert!(window_overlaps_screen(window, screen2));
+    }
+
+    #[test]
+    fn backs_off_only_after_three_failures_in_a_row() {
+        assert_eq!(retry_delay(1), Duration::from_secs(1));
+        assert_eq!(retry_delay(2), Duration::from_secs(1));
+        assert_eq!(retry_delay(3), Duration::from_secs(60));
+        assert_eq!(retry_delay(10), Duration::from_secs(60));
     }
 
     #[test]

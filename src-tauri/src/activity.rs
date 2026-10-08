@@ -10,6 +10,10 @@ use serde::Serialize;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+/// Failed captures in a row after which capture waits a minute between tries
+/// instead of a second.
+pub const FAILURES_BEFORE_BACKOFF: u32 = 3;
+
 /// How long a power-source reading is reused. Reading it runs `pmset`.
 const POWER_READING_TTL: Duration = Duration::from_secs(10);
 
@@ -24,7 +28,7 @@ pub struct Snapshot {
     pub ocr: OcrStatus,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CaptureStatus {
     /// Whether the photographer is running.
@@ -37,6 +41,26 @@ pub struct CaptureStatus {
     /// locked); capture then waits 10 s.
     pub last_black_at: Option<DateTime<Local>>,
     pub last_error: Option<Failure>,
+    /// Captures that have failed since the last one that worked (saved or
+    /// black). From `FAILURES_BEFORE_BACKOFF` on, capture retries once a
+    /// minute.
+    pub failures_in_a_row: u32,
+    /// `FAILURES_BEFORE_BACKOFF`, so the window needn't repeat it.
+    pub failures_before_backoff: u32,
+}
+
+impl Default for CaptureStatus {
+    fn default() -> Self {
+        CaptureStatus {
+            running: false,
+            last_frame: None,
+            frames_saved: 0,
+            last_black_at: None,
+            last_error: None,
+            failures_in_a_row: 0,
+            failures_before_backoff: FAILURES_BEFORE_BACKOFF,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -176,16 +200,23 @@ impl Activity {
     pub fn frame_saved(&self, day: &str, number: u32) {
         self.update(|s| {
             s.capture.frames_saved += 1;
+            s.capture.failures_in_a_row = 0;
             s.capture.last_frame = Some(FrameRef { day: day.to_string(), number, at: Local::now() });
         });
     }
 
     pub fn black_frame_dropped(&self) {
-        self.update(|s| s.capture.last_black_at = Some(Local::now()));
+        self.update(|s| {
+            s.capture.last_black_at = Some(Local::now());
+            s.capture.failures_in_a_row = 0;
+        });
     }
 
     pub fn capture_failed(&self, message: String) {
-        self.update(|s| s.capture.last_error = Some(Failure { at: Local::now(), message }));
+        self.update(|s| {
+            s.capture.last_error = Some(Failure { at: Local::now(), message });
+            s.capture.failures_in_a_row += 1;
+        });
     }
 
     // Conversion.
@@ -295,6 +326,23 @@ mod tests {
         assert_eq!(reads, 1);
         assert_eq!(snapshot.on_ac_power, Some(true));
         assert!(snapshot.capture.running);
+    }
+
+    #[test]
+    fn counts_capture_failures_until_one_works() {
+        let activity = Activity::default();
+        activity.capture_failed("one".into());
+        activity.capture_failed("two".into());
+        assert_eq!(activity.snapshot(true, || true).capture.failures_in_a_row, 2);
+
+        activity.black_frame_dropped();
+        assert_eq!(activity.snapshot(true, || true).capture.failures_in_a_row, 0);
+
+        activity.capture_failed("three".into());
+        activity.frame_saved("2024-01-01", 1);
+        let capture = activity.snapshot(true, || true).capture;
+        assert_eq!(capture.failures_in_a_row, 0);
+        assert_eq!(capture.last_error.unwrap().message, "three");
     }
 
     #[test]

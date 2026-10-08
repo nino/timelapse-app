@@ -92,16 +92,20 @@ function Power({ onAcPower }: { onAcPower: boolean | null }): React.ReactNode {
 }
 
 function Capture({ capture, now }: { capture: Activity["capture"]; now: number }): React.ReactNode {
-  const { running, lastFrame, framesSaved, lastBlackAt, lastError } = capture;
+  const { running, lastFrame, framesSaved, lastBlackAt, lastError, failuresInARow, failuresBeforeBackoff } = capture;
   const lastSaved = lastFrame ? Date.parse(lastFrame.at) : 0;
   let tone: Tone = "active";
   let headline = "Capturing every second";
   if (!running) {
     tone = "quiet";
     headline = "Stopped";
-  } else if (lastError && Date.parse(lastError.at) > lastSaved) {
+  } else if (failuresInARow >= failuresBeforeBackoff) {
     tone = "failing";
-    headline = "Capture failed; trying again a minute after each failure";
+    headline = `Capture failed ${failuresInARow} times in a row; trying again every minute`;
+  } else if (failuresInARow > 0) {
+    // A one-off failure, such as the focused window closing mid-capture.
+    tone = "paused";
+    headline = "Capture failed; trying again in a second";
   } else if (lastBlackAt && Date.parse(lastBlackAt) > lastSaved) {
     tone = "paused";
     headline = "The screen is dark; checking again every 10s";
