@@ -9,7 +9,9 @@ import {
   formatDuration,
   setBoostAllowBattery,
   startBoost,
+  startLowPower,
   stopBoost,
+  stopLowPower,
   until,
   type Activity,
   type Encoding,
@@ -32,7 +34,13 @@ export function ActivityView(): React.ReactNode {
       {activity ? (
         <>
           <Power onAcPower={activity.onAcPower} boost={activity.boost} />
-          <Boost boost={activity.boost} onAcPower={activity.onAcPower} now={now} onChange={refresh} />
+          <Speed
+            boost={activity.boost}
+            lowPowerUntil={activity.lowPowerUntil}
+            onAcPower={activity.onAcPower}
+            now={now}
+            onChange={refresh}
+          />
           <Capture capture={activity.capture} now={now} />
           <Conversion conversion={activity.conversion} now={now} />
           <Ocr ocr={activity.ocr} now={now} />
@@ -110,7 +118,7 @@ function Power({ onAcPower, boost }: { onAcPower: boolean | null; boost: Activit
   return <Section title="Power" tone={onAcPower || boost?.allowBattery ? "active" : "paused"} headline={headline} />;
 }
 
-/** Boost lengths on offer, in minutes. */
+/** Boost and low-power lengths on offer, in minutes. */
 export const BOOST_MINUTES = [10, 20, 30, 60, 120];
 const DEFAULT_BOOST_MINUTES = 20;
 
@@ -122,17 +130,20 @@ const primaryButton = `rounded-xl bg-primary px-3 py-1 font-medium text-primary-
 const plainButton = `rounded-xl border border-border bg-card px-3 py-1 font-medium transition-colors hover:bg-muted disabled:opacity-50 ${focusRing}`;
 
 /**
- * Lets conversion and OCR run at full speed for a while, and on battery too if
- * asked. Normally both run at background priority, a batch at most every ten
+ * Boost lets conversion and OCR run at full speed for a while, and on battery
+ * too if asked; low-power mode keeps them off for a while, even on AC power.
+ * Normally both run at background priority, a batch at most every ten
  * minutes, on AC power only.
  */
-function Boost({
+function Speed({
   boost,
+  lowPowerUntil,
   onAcPower,
   now,
   onChange,
 }: {
   boost: Activity["boost"];
+  lowPowerUntil: string | null;
   onAcPower: boolean | null;
   now: number;
   onChange: () => void;
@@ -144,6 +155,7 @@ function Boost({
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
   const on = boost !== null && Date.parse(boost.until) > now;
+  const lowPower = lowPowerUntil !== null && Date.parse(lowPowerUntil) > now;
 
   const run = (action: () => Promise<unknown>): void => {
     setBusy(true);
@@ -163,23 +175,27 @@ function Boost({
 
   const batteryChecked = on ? boost.allowBattery : allowBattery;
   const waitingForPower = on && onAcPower === false && !boost.allowBattery;
-  let headline = "Off: conversion and OCR go easy on the CPU";
+  let headline = "Normal: conversion and OCR go easy on the CPU";
   if (on) {
     const left = formatDuration((Date.parse(boost.until) - now) / 1000);
     headline = waitingForPower
-      ? `Waiting for AC power (${left} left); tick “Also on battery” to start now`
-      : `Running at full speed for another ${left}`;
+      ? `Boost waiting for AC power (${left} left); tick “Also on battery” to start now`
+      : `Boosting: full speed for another ${left}`;
+  } else if (lowPower) {
+    headline = `Low-power mode: conversion and OCR are off for another ${formatDuration(
+      (Date.parse(lowPowerUntil) - now) / 1000,
+    )}`;
   }
 
   return (
     <Section
-      title="Boost"
-      tone={waitingForPower ? "paused" : on ? "active" : "quiet"}
+      title="Speed"
+      tone={waitingForPower || lowPower ? "paused" : on ? "active" : "quiet"}
       headline={headline}
       footer={
         <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-2">
-          {!on && (
-            <div role="group" aria-label="Boost length" className="flex h-7.5 rounded-xl border border-border bg-card">
+          {!on && !lowPower && (
+            <div role="group" aria-label="Length" className="flex h-7.5 rounded-xl border border-border bg-card">
               {BOOST_MINUTES.map((m, i) => (
                 <button
                   key={m}
@@ -195,16 +211,27 @@ function Boost({
               ))}
             </div>
           )}
-          {on ? (
+          {on && (
             <button type="button" disabled={busy} onClick={() => run(stopBoost)} className={plainButton}>
               Stop boost
             </button>
-          ) : (
-            <button type="button" disabled={busy} onClick={() => run(() => startBoost(minutes, allowBattery))} className={primaryButton}>
-              Boost!
+          )}
+          {lowPower && (
+            <button type="button" disabled={busy} onClick={() => run(stopLowPower)} className={plainButton}>
+              End low-power mode
             </button>
           )}
-          <label className="flex items-center gap-2">
+          {!on && !lowPower && (
+            <>
+              <button type="button" disabled={busy} onClick={() => run(() => startBoost(minutes, allowBattery))} className={primaryButton}>
+                Boost!
+              </button>
+              <button type="button" disabled={busy} onClick={() => run(() => startLowPower(minutes))} className={plainButton}>
+                Low power
+              </button>
+            </>
+          )}
+          {!lowPower && <label className="flex items-center gap-2">
             <input
               type="checkbox"
               className={`size-4 shrink-0 rounded accent-primary ${focusRing}`}
@@ -213,7 +240,7 @@ function Boost({
               onChange={(e) => toggleBattery(e.currentTarget.checked)}
             />
             Also on battery
-          </label>
+          </label>}
           {error && (
             <p role="alert" className="basis-full text-danger">
               {error}
@@ -291,6 +318,12 @@ function Conversion({
       headline = current
         ? `Encoding ${hourLabel(current.day, current.hour)} paused on battery`
         : `Paused on battery; next check ${next}`;
+      break;
+    case "lowPower":
+      tone = "paused";
+      headline = current
+        ? `Encoding ${hourLabel(current.day, current.hour)} paused for low-power mode`
+        : `Off for low-power mode; resumes ${next}`;
       break;
     case "unavailable":
       headline = "Not available";
@@ -380,6 +413,10 @@ function Ocr({ ocr, now }: { ocr: Activity["ocr"]; now: number }): React.ReactNo
     case "onBattery":
       tone = "paused";
       headline = `Paused on battery; next check ${next}`;
+      break;
+    case "lowPower":
+      tone = "paused";
+      headline = `Off for low-power mode; resumes ${next}`;
       break;
     case "unavailable":
       headline = "Not available on this platform";

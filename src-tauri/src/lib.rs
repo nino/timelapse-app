@@ -525,10 +525,12 @@ async fn get_activity(
 ) -> Result<Snapshot, String> {
     let capturing = is_timelapse_running_impl(photographer.inner())?;
     let activity = Arc::clone(activity.inner());
+    let low_power_until = boost.low_power_until();
     let boost = boost.status();
     run_blocking(move || {
         let mut snapshot = activity.snapshot(capturing, converter::on_ac_power);
         snapshot.boost = boost;
+        snapshot.low_power_until = low_power_until;
         Ok(snapshot)
     })
     .await
@@ -553,6 +555,26 @@ fn start_boost(
 #[tauri::command]
 fn stop_boost(boost: State<'_, BoostState>) {
     boost.stop();
+}
+
+/// Keep conversion and OCR off for `minutes`, even on AC power, replacing
+/// any boost in progress. Returns when low-power mode ends.
+#[tauri::command]
+fn start_low_power(
+    boost: State<'_, BoostState>,
+    minutes: u64,
+) -> Result<Option<chrono::DateTime<chrono::Local>>, String> {
+    if minutes == 0 {
+        return Err("Low-power mode needs a length".to_string());
+    }
+    boost.start_low_power(std::time::Duration::from_secs(minutes.saturating_mul(60)));
+    Ok(boost.low_power_until())
+}
+
+/// End low-power mode, if it is on.
+#[tauri::command]
+fn stop_low_power(boost: State<'_, BoostState>) {
+    boost.stop_low_power();
 }
 
 /// Let the boost in progress run on battery, or not. Returns the boost.
@@ -1048,6 +1070,8 @@ pub fn run() {
             get_activity,
             start_boost,
             stop_boost,
+            start_low_power,
+            stop_low_power,
             set_boost_allow_battery,
             get_settings,
             set_update_automatically,

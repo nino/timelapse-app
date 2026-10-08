@@ -6,10 +6,15 @@
 //! OCR run at normal priority, batches follow each other straight away, and,
 //! if the boost allows it, they also run on battery.
 //!
-//! A boost lasts until its end time or until it is stopped, and is forgotten
-//! when the app quits. The workers ask `is_on`/`may_work` as they go, so an
-//! expired boost takes effect at their next check; starting or stopping one
-//! also wakes any worker sleeping in `sleep`/`wait`.
+//! Low-power mode is the opposite: for a while, conversion and OCR don't run
+//! at all, even on AC power, and a running encode is paused as it is on
+//! battery. Starting either ends the other.
+//!
+//! Both last until their end time or until they are stopped, and are
+//! forgotten when the app quits. The workers ask `is_on`/`may_work` as they
+//! go, so an expired boost or low-power mode takes effect at their next
+//! check; starting or stopping one also wakes any worker sleeping in
+//! `sleep`/`wait`.
 
 use chrono::{DateTime, Local};
 use serde::Serialize;
@@ -33,10 +38,26 @@ pub struct BoostStatus {
     pub allow_battery: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Boost { allow_battery: bool },
+    LowPower,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct Active {
     ends: Instant,
-    allow_battery: bool,
+    kind: Kind,
+}
+
+impl Active {
+    fn left(&self) -> Duration {
+        self.ends.saturating_duration_since(Instant::now())
+    }
+
+    fn until(&self) -> DateTime<Local> {
+        Local::now() + chrono::Duration::from_std(self.left()).unwrap_or_default()
+    }
 }
 
 #[derive(Default)]
@@ -78,22 +99,42 @@ impl Boost {
         self.changes.send_replace(generation);
     }
 
-    /// Boost for `duration` from now (at most `MAX_BOOST`), replacing any
-    /// boost in progress.
-    pub fn start(&self, duration: Duration, allow_battery: bool) {
+    fn start_kind(&self, duration: Duration, kind: Kind) {
         let ends = Instant::now() + duration.min(MAX_BOOST);
-        self.set(Some(Active { ends, allow_battery }));
+        self.set(Some(Active { ends, kind }));
     }
 
+    /// Boost for `duration` from now (at most `MAX_BOOST`), replacing any
+    /// boost or low-power mode in progress.
+    pub fn start(&self, duration: Duration, allow_battery: bool) {
+        self.start_kind(duration, Kind::Boost { allow_battery });
+    }
+
+    /// Keep conversion and OCR off for `duration` from now (at most
+    /// `MAX_BOOST`), replacing any boost or low-power mode in progress.
+    pub fn start_low_power(&self, duration: Duration) {
+        self.start_kind(duration, Kind::LowPower);
+    }
+
+    /// End the boost in progress. A low-power mode is left alone.
     pub fn stop(&self) {
-        self.set(None);
+        if self.boost().is_some() {
+            self.set(None);
+        }
+    }
+
+    /// End the low-power mode in progress. A boost is left alone.
+    pub fn stop_low_power(&self) {
+        if self.is_low_power() {
+            self.set(None);
+        }
     }
 
     /// Let the boost in progress run on battery, or not. Does nothing when
     /// no boost is on.
     pub fn set_allow_battery(&self, allow_battery: bool) {
-        if let Some(active) = self.active() {
-            self.set(Some(Active { allow_battery, ..active }));
+        if let Some(active) = self.boost() {
+            self.set(Some(Active { kind: Kind::Boost { allow_battery }, ..active }));
         }
     }
 
@@ -101,30 +142,50 @@ impl Boost {
         self.lock().active.filter(|active| active.ends > Instant::now())
     }
 
+    fn boost(&self) -> Option<Active> {
+        self.active().filter(|active| matches!(active.kind, Kind::Boost { .. }))
+    }
+
     /// Whether a boost is on right now.
     pub fn is_on(&self) -> bool {
-        self.active().is_some()
+        self.boost().is_some()
     }
 
     /// The boost in progress, if any.
     pub fn status(&self) -> Option<BoostStatus> {
-        self.active().map(|active| {
-            let left = active.ends.saturating_duration_since(Instant::now());
-            BoostStatus {
-                until: Local::now() + chrono::Duration::from_std(left).unwrap_or_default(),
-                allow_battery: active.allow_battery,
-            }
+        self.active().and_then(|active| match active.kind {
+            Kind::Boost { allow_battery } => Some(BoostStatus { until: active.until(), allow_battery }),
+            Kind::LowPower => None,
         })
     }
 
-    /// Whether conversion and OCR may run now: on AC power, as
-    /// `on_ac_power` says, or during a boost that allows battery (which
-    /// doesn't ask `on_ac_power` at all).
-    pub fn may_work(&self, on_ac_power: impl FnOnce() -> bool) -> bool {
-        self.active().is_some_and(|active| active.allow_battery) || on_ac_power()
+    /// Whether low-power mode is on right now.
+    pub fn is_low_power(&self) -> bool {
+        self.low_power_left().is_some()
     }
 
-    /// Sleep for `wait`, or until a boost starts or stops.
+    /// How long the low-power mode in progress has left, if one is on.
+    pub fn low_power_left(&self) -> Option<Duration> {
+        self.active().filter(|active| active.kind == Kind::LowPower).map(|active| active.left())
+    }
+
+    /// When the low-power mode in progress ends, if one is on.
+    pub fn low_power_until(&self) -> Option<DateTime<Local>> {
+        self.active().filter(|active| active.kind == Kind::LowPower).map(|active| active.until())
+    }
+
+    /// Whether conversion and OCR may run now: never in low-power mode;
+    /// otherwise on AC power, as `on_ac_power` says, or during a boost that
+    /// allows battery. Only asks `on_ac_power` when that decides it.
+    pub fn may_work(&self, on_ac_power: impl FnOnce() -> bool) -> bool {
+        match self.active().map(|active| active.kind) {
+            Some(Kind::LowPower) => false,
+            Some(Kind::Boost { allow_battery: true }) => true,
+            _ => on_ac_power(),
+        }
+    }
+
+    /// Sleep for `wait`, or until a boost or low-power mode starts or stops.
     pub fn sleep(&self, wait: Duration) {
         let inner = self.lock();
         let seen = inner.generation;
@@ -177,6 +238,46 @@ mod tests {
 
         boost.start(Duration::ZERO, true);
         assert!(!boost.is_on(), "an expired boost is off");
+    }
+
+    #[test]
+    fn low_power_stops_all_work_until_it_ends_or_stops() {
+        let boost = Boost::default();
+        boost.start_low_power(Duration::from_secs(10 * 60));
+        assert!(boost.is_low_power());
+        assert!(!boost.is_on());
+        assert_eq!(boost.status(), None);
+        assert!(!boost.may_work(|| panic!("no need to read the power source")));
+        let left = boost.low_power_left().unwrap().as_secs();
+        assert!((10 * 60 - 5..=10 * 60).contains(&left), "{left}s left");
+        assert!(boost.low_power_until().is_some());
+
+        boost.stop();
+        assert!(boost.is_low_power(), "stopping a boost leaves low power alone");
+        boost.set_allow_battery(true);
+        assert!(!boost.may_work(|| true));
+
+        boost.stop_low_power();
+        assert!(!boost.is_low_power());
+        assert_eq!(boost.low_power_until(), None);
+        assert!(boost.may_work(|| true));
+    }
+
+    #[test]
+    fn boost_and_low_power_replace_each_other() {
+        let boost = Boost::default();
+        boost.start(Duration::from_secs(60), true);
+        boost.start_low_power(Duration::from_secs(60));
+        assert!(!boost.is_on());
+        assert!(boost.is_low_power());
+
+        boost.stop_low_power();
+        boost.start_low_power(Duration::from_secs(60));
+        boost.start(Duration::from_secs(60), false);
+        assert!(boost.is_on());
+        assert!(!boost.is_low_power());
+        boost.stop_low_power();
+        assert!(boost.is_on(), "ending low power leaves a boost alone");
     }
 
     #[test]
@@ -243,7 +344,7 @@ mod tests {
     async fn a_change_while_busy_cuts_the_next_wait_short() {
         let boost = Boost::default();
         let mut changes = boost.subscribe();
-        boost.stop();
+        boost.start_low_power(Duration::from_secs(60));
         let started = Instant::now();
         wait(&mut changes, Duration::from_secs(60)).await;
         assert!(started.elapsed() < Duration::from_secs(10));
