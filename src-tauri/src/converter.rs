@@ -6,7 +6,8 @@
 //! all of it, and one batch runs at a time, starting at most once every ten
 //! minutes, so a backlog (say, after a stretch on battery) is worked off
 //! quickly once OCR has caught up. Nothing is encoded unless the machine is on
-//! AC power, and an encode in progress is killed if the power is unplugged.
+//! AC power, and an encode in progress is paused while the power is unplugged.
+//! A boost (see `boost.rs`) lifts these limits for a while.
 //!
 //! An hour whose video exists counts as converted. Its PNGs are then deleted,
 //! as the scripts did, once `OcrCheck` still agrees that OCR has read them.
@@ -26,6 +27,7 @@
 //! run clears.
 
 use crate::activity::{Activity, Encoding, State};
+use crate::boost::{self, Boost};
 use crate::database::ScreenshotDatabase;
 use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, TimeZone, Timelike};
 use frame_source::filed_at;
@@ -60,8 +62,16 @@ const IDLE_POLL: Duration = Duration::from_secs(5 * 60);
 /// How long to wait before re-checking the power source while on battery.
 const ON_BATTERY_POLL: Duration = Duration::from_secs(60);
 
-/// How often a running encode re-checks the power source and the stop flag.
+/// How long to wait before looking again when there is nothing to convert
+/// during a boost, when OCR may finish an hour at any moment.
+const BOOSTED_IDLE_POLL: Duration = Duration::from_secs(30);
+
+/// How often a running encode re-checks the power source.
 const ENCODE_POWER_CHECK: Duration = Duration::from_secs(30);
+
+/// How often a running encode checks the stop flag and whether a boost
+/// started or ended.
+const ENCODE_CHECK: Duration = Duration::from_secs(1);
 
 /// The ffmpeg process of the encode in progress, if any. ffmpeg is a separate
 /// process, so quitting the app would leave it running, encoding into a
@@ -492,7 +502,8 @@ pub fn convert_batch(
 fn ffmpeg_command(frames_dir: &Path, output: &Path) -> Command {
     // On macOS, run ffmpeg under the background QoS policy: the scheduler
     // throttles it and, on Apple Silicon, keeps it on the efficiency cores,
-    // which is most of what keeps the machine cool while it encodes.
+    // which is most of what keeps the machine cool while it encodes. A boost
+    // lifts that while it lasts (`set_background`).
     let mut command = if cfg!(target_os = "macos") {
         let mut command = Command::new("taskpolicy");
         command.arg("-b").arg(crate::paths::ffmpeg());
@@ -539,6 +550,23 @@ enum Control {
     Pause,
     /// Kill ffmpeg (the converter is stopping).
     Stop,
+}
+
+/// Put the process `pid` under the background policy `taskpolicy -b` starts
+/// ffmpeg with, or take it out of it. Only macOS has that policy; elsewhere
+/// this does nothing.
+fn set_background(pid: u32, background: bool) {
+    #[cfg(target_os = "macos")]
+    {
+        let priority = if background { libc::PRIO_DARWIN_BG } else { 0 };
+        // SAFETY: only changes the scheduling of `pid`, our own unreaped
+        // child, so it cannot belong to another process.
+        if unsafe { libc::setpriority(libc::PRIO_DARWIN_PROCESS, pid as libc::id_t, priority) } != 0 {
+            eprintln!("Could not change ffmpeg's priority: {}", std::io::Error::last_os_error());
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = (pid, background);
 }
 
 /// Freeze (`SIGSTOP`) or thaw (`SIGCONT`) `child`. Returns whether that
@@ -643,14 +671,16 @@ fn progress_frame(line: &str) -> Option<usize> {
     line.trim().strip_prefix("frame=")?.trim().parse().ok()
 }
 
-/// Encode with ffmpeg, pausing while the power is unplugged and giving up if
-/// `running` clears. `on_progress` is called with the number of frames
-/// encoded so far, and `on_pause` with `true` when the encode pauses and
-/// `false` when it carries on.
+/// Encode with ffmpeg, pausing while the power is unplugged (unless `boost`
+/// allows battery) and giving up if `running` clears. ffmpeg runs at
+/// background priority except during a boost. `on_progress` is called with
+/// the number of frames encoded so far, and `on_pause` with `true` when the
+/// encode pauses and `false` when it carries on.
 fn encode_with_ffmpeg(
     frames_dir: &Path,
     output: &Path,
     running: &AtomicBool,
+    boost: &Boost,
     on_progress: impl Fn(usize) + Send + 'static,
     on_pause: impl FnMut(bool),
 ) -> Result<(), ConvertError> {
@@ -681,14 +711,36 @@ fn encode_with_ffmpeg(
         });
     }
 
+    // The child is reaped only once it has exited, after which `check` is no
+    // longer called, so its pid stays its own while `check` uses it.
+    let pid = child.id();
+    let mut boosted = false;
+    let mut power: Option<(Instant, bool)> = None;
     wait_or_kill(
         &RUNNING_ENCODE,
         child,
-        ENCODE_POWER_CHECK,
+        ENCODE_CHECK,
         || {
             if !running.load(Ordering::SeqCst) {
-                Control::Stop
-            } else if on_ac_power() {
+                return Control::Stop;
+            }
+            let boosted_now = boost.is_on();
+            if boosted_now != boosted {
+                boosted = boosted_now;
+                set_background(pid, !boosted);
+                // Look at the power again: the boost may allow battery, or
+                // its end may forbid it.
+                power = None;
+            }
+            let may_work = boost.may_work(|| match power {
+                Some((at, on_ac)) if at.elapsed() < ENCODE_POWER_CHECK => on_ac,
+                _ => {
+                    let on_ac = on_ac_power();
+                    power = Some((Instant::now(), on_ac));
+                    on_ac
+                }
+            });
+            if may_work {
                 Control::Run
             } else {
                 Control::Pause
@@ -704,6 +756,7 @@ pub struct Converter {
     running: Arc<AtomicBool>,
     ocr_done: OcrCheck,
     activity: Arc<Activity>,
+    boost: Arc<Boost>,
 }
 
 impl Converter {
@@ -713,7 +766,14 @@ impl Converter {
             running: Arc::new(AtomicBool::new(false)),
             ocr_done,
             activity: Arc::default(),
+            boost: Arc::default(),
         }
+    }
+
+    /// Follow `boost`: while one is on, run at full speed.
+    pub fn boosted_by(mut self, boost: Arc<Boost>) -> Self {
+        self.boost = boost;
+        self
     }
 
     /// Report progress to `activity`, for the Activity window.
@@ -731,6 +791,7 @@ impl Converter {
         let running = Arc::clone(&self.running);
         let ocr_done = Arc::clone(&self.ocr_done);
         let activity = Arc::clone(&self.activity);
+        let boost = Arc::clone(&self.boost);
 
         tokio::spawn(async move {
             println!("Starting video conversion background task...");
@@ -738,10 +799,12 @@ impl Converter {
                 eprintln!("Failed to clear stale conversion folders: {}", e);
             }
 
+            let mut boost_changes = boost.subscribe();
             while running.load(Ordering::SeqCst) {
-                let (state, wait) = Self::run_once(&root, &running, &ocr_done, &activity).await;
+                let (state, wait) = Self::run_once(&root, &running, &ocr_done, &activity, &boost).await;
                 activity.converter_sleeps(state, wait);
-                tokio::time::sleep(wait).await;
+                // A boost starting or stopping ends the wait early.
+                boost::wait(&mut boost_changes, wait).await;
             }
 
             println!("Video conversion background task stopped.");
@@ -764,6 +827,7 @@ impl Converter {
         running: &Arc<AtomicBool>,
         ocr_done: &OcrCheck,
         activity: &Arc<Activity>,
+        boost: &Arc<Boost>,
     ) -> (State, Duration) {
         let now = Local::now();
 
@@ -799,21 +863,22 @@ impl Converter {
             eprintln!("Failed to remove empty day folders: {}", e);
         }
 
-        if !on_ac_power() {
+        if !boost.may_work(on_ac_power) {
             return (State::OnBattery, ON_BATTERY_POLL);
         }
+        let idle_poll = if boost.is_on() { BOOSTED_IDLE_POLL } else { IDLE_POLL };
 
         let batch = match read_batches(root, now, ocr_done) {
             Ok((read, waiting_for_ocr)) => {
                 activity.conversion_backlog(read.len().saturating_sub(1), waiting_for_ocr);
                 match read.into_iter().next() {
                     Some(batch) => batch,
-                    None => return (State::Idle, IDLE_POLL),
+                    None => return (State::Idle, idle_poll),
                 }
             }
             Err(e) => {
                 eprintln!("Failed to scan for screenshots to convert: {}", e);
-                return (State::Idle, IDLE_POLL);
+                return (State::Idle, idle_poll);
             }
         };
 
@@ -839,12 +904,14 @@ impl Converter {
         let running_owned = Arc::clone(running);
         let progress = Arc::clone(activity);
         let pauses = Arc::clone(activity);
+        let boost_owned = Arc::clone(boost);
         let result = tokio::task::spawn_blocking(move || {
             convert_batch(&root_owned, &batch, |frames_dir, output| {
                 encode_with_ffmpeg(
                     frames_dir,
                     output,
                     &running_owned,
+                    &boost_owned,
                     move |frames| progress.encoding_progress(frames),
                     |paused| {
                         if paused {
@@ -866,7 +933,7 @@ impl Converter {
             Ok(video_name) => {
                 println!("Published {} after {}s", video_name, took.as_secs());
                 activity.encoding_finished(video_name, took, None);
-                (State::Resting, rest_after(took))
+                (State::Resting, rest_after(took, boost.is_on()))
             }
             Err(ConvertError::Interrupted) => {
                 println!("Video conversion stopped; the frames were kept");
@@ -876,16 +943,21 @@ impl Converter {
             Err(e) => {
                 eprintln!("Video conversion failed, frames kept: {}", e);
                 activity.encoding_finished(video_name, took, Some(e.to_string()));
-                (State::Resting, rest_after(took))
+                (State::Resting, rest_after(took, boost.is_on()))
             }
         }
     }
 }
 
 /// How long to wait after a batch that took `took`, so that the next one
-/// starts `BATCH_INTERVAL` after this one started.
-fn rest_after(took: Duration) -> Duration {
-    BATCH_INTERVAL.saturating_sub(took)
+/// starts `BATCH_INTERVAL` after this one started. During a boost the next
+/// one starts straight away.
+fn rest_after(took: Duration, boosted: bool) -> Duration {
+    if boosted {
+        Duration::ZERO
+    } else {
+        BATCH_INTERVAL.saturating_sub(took)
+    }
 }
 
 #[cfg(test)]
@@ -1378,10 +1450,15 @@ mod tests {
     #[test]
     fn batches_start_every_ten_minutes_while_behind() {
         let minutes = |m: u64| Duration::from_secs(m * 60);
-        assert_eq!(rest_after(minutes(4)), minutes(6));
-        assert_eq!(rest_after(Duration::ZERO), minutes(10));
-        assert_eq!(rest_after(minutes(10)), Duration::ZERO);
-        assert_eq!(rest_after(minutes(25)), Duration::ZERO);
+        assert_eq!(rest_after(minutes(4), false), minutes(6));
+        assert_eq!(rest_after(Duration::ZERO, false), minutes(10));
+        assert_eq!(rest_after(minutes(10), false), Duration::ZERO);
+        assert_eq!(rest_after(minutes(25), false), Duration::ZERO);
+    }
+
+    #[test]
+    fn batches_follow_each_other_during_a_boost() {
+        assert_eq!(rest_after(Duration::from_secs(60), true), Duration::ZERO);
     }
 
     #[test]
@@ -1567,7 +1644,7 @@ mod tests {
         let progress = Arc::new(std::sync::Mutex::new(Vec::new()));
         let reported = Arc::clone(&progress);
         let name = convert_batch(root, &batch, |dir, out| {
-            encode_with_ffmpeg(dir, out, &running, move |frames| reported.lock().unwrap().push(frames), |_| {})
+            encode_with_ffmpeg(dir, out, &running, &Boost::default(), move |frames| reported.lock().unwrap().push(frames), |_| {})
         })
         .unwrap();
         // The reader thread may still be draining the pipe for a moment.

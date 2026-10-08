@@ -7,16 +7,20 @@ import {
   encodeProgress,
   encodeSeconds,
   formatDuration,
+  setBoostAllowBattery,
+  startBoost,
+  stopBoost,
   until,
   type Activity,
   type Encoding,
   type Failure,
 } from "./activity";
 import { useActivity } from "./hooks/useActivity";
+import { focusRing, segmentButton } from "./ui";
 
 /** The Activity window (Window → Activity): what capture, video conversion and OCR are doing. */
 export function ActivityView(): React.ReactNode {
-  const { activity, now, error } = useActivity();
+  const { activity, now, error, refresh } = useActivity();
 
   return (
     <main className="min-h-screen bg-page p-4 text-sm flex flex-col gap-3">
@@ -27,7 +31,8 @@ export function ActivityView(): React.ReactNode {
       )}
       {activity ? (
         <>
-          <Power onAcPower={activity.onAcPower} />
+          <Power onAcPower={activity.onAcPower} boost={activity.boost} />
+          <Boost boost={activity.boost} now={now} onChange={refresh} />
           <Capture capture={activity.capture} now={now} />
           <Conversion conversion={activity.conversion} now={now} />
           <Ocr ocr={activity.ocr} now={now} />
@@ -53,11 +58,14 @@ function Section({
   tone,
   headline,
   children,
+  footer,
 }: {
   title: string;
   tone: Tone;
   headline: string;
   children?: React.ReactNode;
+  /** Shown below the rows. */
+  footer?: React.ReactNode;
 }): React.ReactNode {
   return (
     <section aria-label={title} className="rounded-xl border border-border bg-card px-4 py-3">
@@ -67,6 +75,7 @@ function Section({
         <span data-testid={`${title}-headline`}>{headline}</span>
       </p>
       {children && <dl className="mt-2 grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 tabular-nums">{children}</dl>}
+      {footer}
     </section>
   );
 }
@@ -90,13 +99,121 @@ function ErrorRow({ failure, now }: { failure: Failure | null; now: number }): R
   );
 }
 
-function Power({ onAcPower }: { onAcPower: boolean | null }): React.ReactNode {
+function Power({ onAcPower, boost }: { onAcPower: boolean | null; boost: Activity["boost"] }): React.ReactNode {
   if (onAcPower === null) return null;
+  let headline = "On AC power";
+  if (!onAcPower) {
+    headline = boost?.allowBattery
+      ? "On battery: boosting anyway"
+      : "On battery: conversion and OCR wait until the Mac is plugged in";
+  }
+  return <Section title="Power" tone={onAcPower || boost?.allowBattery ? "active" : "paused"} headline={headline} />;
+}
+
+/** Boost lengths on offer, in minutes. */
+export const BOOST_MINUTES = [10, 20, 30, 60, 120];
+const DEFAULT_BOOST_MINUTES = 20;
+
+function boostLabel(minutes: number): string {
+  return minutes < 60 ? `${minutes}m` : `${minutes / 60}h`;
+}
+
+const primaryButton = `rounded-xl bg-primary px-3 py-1 font-medium text-primary-fg transition-colors hover:bg-primary/90 disabled:opacity-50 ${focusRing}`;
+const plainButton = `rounded-xl border border-border bg-card px-3 py-1 font-medium transition-colors hover:bg-muted disabled:opacity-50 ${focusRing}`;
+
+/**
+ * Lets conversion and OCR run at full speed for a while, and on battery too if
+ * asked. Normally both run at background priority, a batch at most every ten
+ * minutes, on AC power only.
+ */
+function Boost({
+  boost,
+  now,
+  onChange,
+}: {
+  boost: Activity["boost"];
+  now: number;
+  onChange: () => void;
+}): React.ReactNode {
+  const [minutes, setMinutes] = React.useState(DEFAULT_BOOST_MINUTES);
+  // Before a boost starts, the checkbox is the window's own choice; during
+  // one it shows (and changes) the boost's.
+  const [allowBattery, setAllowBattery] = React.useState(false);
+  const [busy, setBusy] = React.useState(false);
+  const [error, setError] = React.useState<string | null>(null);
+  const on = boost !== null && Date.parse(boost.until) > now;
+
+  const run = (action: () => Promise<unknown>): void => {
+    setBusy(true);
+    setError(null);
+    action()
+      .catch((e: unknown) => setError(String(e)))
+      .finally(() => {
+        setBusy(false);
+        onChange();
+      });
+  };
+
+  const toggleBattery = (allow: boolean): void => {
+    setAllowBattery(allow);
+    if (on) run(() => setBoostAllowBattery(allow));
+  };
+
+  const batteryChecked = on ? boost.allowBattery : allowBattery;
+  const headline = on
+    ? `Running at full speed for another ${formatDuration((Date.parse(boost.until) - now) / 1000)}`
+    : "Off: conversion and OCR go easy on the CPU";
+
   return (
     <Section
-      title="Power"
-      tone={onAcPower ? "active" : "paused"}
-      headline={onAcPower ? "On AC power" : "On battery: conversion and OCR wait until the Mac is plugged in"}
+      title="Boost"
+      tone={on ? "active" : "quiet"}
+      headline={headline}
+      footer={
+        <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-2">
+          {!on && (
+            <div role="group" aria-label="Boost length" className="flex h-7.5 rounded-xl border border-border bg-card">
+              {BOOST_MINUTES.map((m, i) => (
+                <button
+                  key={m}
+                  type="button"
+                  aria-pressed={m === minutes}
+                  onClick={() => setMinutes(m)}
+                  className={`${segmentButton} w-10 tabular-nums ${i === 0 ? "rounded-l-[11px]" : "border-l border-border"} ${
+                    i === BOOST_MINUTES.length - 1 ? "rounded-r-[11px]" : ""
+                  } ${m === minutes ? "bg-muted font-semibold" : "text-muted-fg"}`}
+                >
+                  {boostLabel(m)}
+                </button>
+              ))}
+            </div>
+          )}
+          {on ? (
+            <button type="button" disabled={busy} onClick={() => run(stopBoost)} className={plainButton}>
+              Stop boost
+            </button>
+          ) : (
+            <button type="button" disabled={busy} onClick={() => run(() => startBoost(minutes, allowBattery))} className={primaryButton}>
+              Boost!
+            </button>
+          )}
+          <label className="flex items-center gap-2">
+            <input
+              type="checkbox"
+              className={`size-4 shrink-0 rounded accent-primary ${focusRing}`}
+              checked={batteryChecked}
+              disabled={busy}
+              onChange={(e) => toggleBattery(e.currentTarget.checked)}
+            />
+            Also on battery
+          </label>
+          {error && (
+            <p role="alert" className="basis-full text-danger">
+              {error}
+            </p>
+          )}
+        </div>
+      }
     />
   );
 }
