@@ -8,29 +8,43 @@ import { App } from "./App";
 import { SETTINGS_WINDOW } from "./settings";
 import { SettingsView } from "./SettingsView";
 import { initTimelapseRoot } from "./timelapseRoot";
+import { getViewerPosition, type ViewerPosition } from "./viewerPosition";
 
 // The header doubles as the macOS title bar and leaves room for the traffic lights.
 if (navigator.userAgent.includes("Macintosh")) {
   document.documentElement.dataset.platform = "macos";
 }
 
-function view(label: string): React.ReactNode {
+const label = getCurrentWindow().label;
+
+function view(position: ViewerPosition | undefined): React.ReactNode {
   if (label === ACTIVITY_WINDOW) return <ActivityView />;
   if (label === SETTINGS_WINDOW) return <SettingsView />;
-  return <App />;
+  return <App initialPosition={position} />;
+}
+
+// What the viewer showed when the app last quit. Asked for before the first
+// render, so the viewer opens there instead of starting on the newest day and
+// jumping. Without it the viewer opens the newest day.
+function restoredPosition(): Promise<ViewerPosition | undefined> {
+  if (label === ACTIVITY_WINDOW || label === SETTINGS_WINDOW) return Promise.resolve(undefined);
+  return getViewerPosition().catch((error: unknown) => {
+    console.error("Could not read the saved viewer position:", error);
+    return undefined;
+  });
 }
 
 // Resolve the library root from Rust before the first render — every path the
 // UI builds depends on it, and guessing would risk a dev build reading the real
 // library.
-initTimelapseRoot().then(
-  () => {
+Promise.all([initTimelapseRoot(), restoredPosition()]).then(
+  ([, position]) => {
     ReactDOM.createRoot(
       document.getElementById("root") as HTMLElement,
     ).render(
       <React.StrictMode>
         {/* Window → Activity and Settings… open this same page in windows of their own. */}
-        {view(getCurrentWindow().label)}
+        {view(position)}
       </React.StrictMode>,
     );
   },
