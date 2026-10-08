@@ -19,6 +19,10 @@ mock.module('@tauri-apps/api/core', () => ({
   invoke: mock(),
 }));
 
+mock.module('@tauri-apps/api/app', () => ({
+  getVersion: mock(() => Promise.resolve('0.0.0')),
+}));
+
 mock.module('@tauri-apps/api/event', () => ({
   listen: mock(() => Promise.resolve((): void => {})),
 }));
