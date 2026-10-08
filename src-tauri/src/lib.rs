@@ -805,8 +805,13 @@ pub fn run() {
             set_update_automatically,
             grow_settings_window
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|_, event| {
+            if let tauri::RunEvent::Exit = event {
+                converter::kill_running_encode();
+            }
+        });
 }
 
 #[cfg(test)]
