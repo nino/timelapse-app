@@ -32,7 +32,7 @@ export function ActivityView(): React.ReactNode {
       {activity ? (
         <>
           <Power onAcPower={activity.onAcPower} boost={activity.boost} />
-          <Boost boost={activity.boost} now={now} onChange={refresh} />
+          <Boost boost={activity.boost} onAcPower={activity.onAcPower} now={now} onChange={refresh} />
           <Capture capture={activity.capture} now={now} />
           <Conversion conversion={activity.conversion} now={now} />
           <Ocr ocr={activity.ocr} now={now} />
@@ -128,10 +128,12 @@ const plainButton = `rounded-xl border border-border bg-card px-3 py-1 font-medi
  */
 function Boost({
   boost,
+  onAcPower,
   now,
   onChange,
 }: {
   boost: Activity["boost"];
+  onAcPower: boolean | null;
   now: number;
   onChange: () => void;
 }): React.ReactNode {
@@ -160,14 +162,19 @@ function Boost({
   };
 
   const batteryChecked = on ? boost.allowBattery : allowBattery;
-  const headline = on
-    ? `Running at full speed for another ${formatDuration((Date.parse(boost.until) - now) / 1000)}`
-    : "Off: conversion and OCR go easy on the CPU";
+  const waitingForPower = on && onAcPower === false && !boost.allowBattery;
+  let headline = "Off: conversion and OCR go easy on the CPU";
+  if (on) {
+    const left = formatDuration((Date.parse(boost.until) - now) / 1000);
+    headline = waitingForPower
+      ? `Waiting for AC power (${left} left); tick “Also on battery” to start now`
+      : `Running at full speed for another ${left}`;
+  }
 
   return (
     <Section
       title="Boost"
-      tone={on ? "active" : "quiet"}
+      tone={waitingForPower ? "paused" : on ? "active" : "quiet"}
       headline={headline}
       footer={
         <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-2">

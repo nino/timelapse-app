@@ -20,6 +20,10 @@ use tokio::sync::watch;
 /// Longest boost the app accepts.
 pub const MAX_BOOST: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// How often the workers re-check the power source during a boost that
+/// doesn't allow battery, so plugging in starts the work within seconds.
+pub const BOOSTED_POWER_POLL: Duration = Duration::from_secs(10);
+
 /// A boost in progress, as the Activity window shows it.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
