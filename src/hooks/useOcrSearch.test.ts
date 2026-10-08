@@ -86,6 +86,31 @@ describe('useMatchCounts', () => {
     await waitFor(() => expect(result.current).toEqual(counts));
     expect(invoke).toHaveBeenCalledWith('count_ocr_matches', { query: 'cargo' });
   });
+
+  it('keeps the previous days while a changed query loads', async () => {
+    const counts = [{ day: '2026-10-04', count: 2 }];
+    mocked(invoke).mockResolvedValueOnce(counts);
+    const { result, rerender } = renderHook(({ query }) => useMatchCounts(query, '1'), {
+      initialProps: { query: 'cargo' },
+    });
+    await waitFor(() => expect(result.current).toEqual(counts));
+
+    let finish: (value: unknown) => void = () => {};
+    mocked(invoke).mockReturnValueOnce(new Promise((resolve) => (finish = resolve)));
+    rerender({ query: 'cargo t' });
+    expect(result.current).toEqual(counts);
+
+    // A search that finds nothing hides them.
+    await act(async () => finish([]));
+    expect(result.current).toEqual([]);
+
+    // A blank query hides them at once.
+    mocked(invoke).mockResolvedValueOnce(counts);
+    rerender({ query: 'cargo' });
+    await waitFor(() => expect(result.current).toEqual(counts));
+    rerender({ query: '' });
+    expect(result.current).toEqual([]);
+  });
 });
 
 describe('useOcrVersion', () => {
