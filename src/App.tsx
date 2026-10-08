@@ -14,13 +14,22 @@ import { usePendingFrames } from "./hooks/usePendingFrames";
 import { PendingStretches } from "./PendingStretches";
 import { nextStop, previousStop, rangeAt, toStops, type DayMatch, type Stop } from "./search";
 import { fieldFrame, focusRing, segmentButton } from "./ui";
+import { setViewerPosition, type ViewerPosition } from "./viewerPosition";
 
 // How many other days the find bar names before folding the rest away.
 const OTHER_DAYS_SHOWN = 4;
 // Frames are captured at this size; used until the first one has loaded.
 const DEFAULT_FRAME_SIZE = { width: 1800, height: 1124 };
+// How long the viewer must stay on a frame before it is remembered for the
+// next launch, so a scrub doesn't save every frame it passes.
+const SAVE_POSITION_DELAY_MS = 500;
 
-export function App(): React.ReactNode {
+export function App({
+  initialPosition,
+}: {
+  /** What the viewer showed when the app last quit. */
+  initialPosition?: ViewerPosition;
+}): React.ReactNode {
   const { days, daysError } = useDays();
   const [selectedDay, setSelectedDay] = React.useState<string | null>(null);
   const { day, dayError } = useDay(selectedDay);
@@ -33,7 +42,7 @@ export function App(): React.ReactNode {
   const [position, setPosition] = React.useState<{
     day: string | null;
     index: number | null;
-  }>({ day: null, index: null });
+  }>({ day: initialPosition?.day ?? null, index: initialPosition?.index ?? null });
   const followsLiveEdge = position.day !== selectedDay || position.index === null;
   const currentIndex = followsLiveEdge
     ? Math.max(frameCount - 1, 0)
@@ -69,12 +78,35 @@ export function App(): React.ReactNode {
   );
   const newestDay = days.length > 0 ? days[days.length - 1] : null;
 
-  // Open the newest day (today, while capturing) when nothing is selected.
+  // Open the day the app showed when it last quit, or the newest day (today,
+  // while capturing) if that day is gone or there was none.
+  const restoredDay = React.useRef(initialPosition?.day ?? null);
   React.useEffect(() => {
     if (!selectedDay && newestDay) {
-      setSelectedDay(newestDay);
+      const restored = restoredDay.current;
+      restoredDay.current = null;
+      setSelectedDay(restored !== null && days.includes(restored) ? restored : newestDay);
     }
-  }, [selectedDay, newestDay]);
+  }, [selectedDay, newestDay, days]);
+
+  // Remember what is on screen for the next launch, once the viewer has
+  // stayed put for a moment. Following the newest day's live edge is saved as
+  // such, so the next launch follows whatever day is newest by then.
+  const savedDay = selectedDay !== null && !(followsLiveEdge && selectedDay === newestDay)
+    ? selectedDay
+    : null;
+  const savedIndex = followsLiveEdge ? null : currentIndex;
+  // Until the selected day has loaded, `currentIndex` is a placeholder 0.
+  const positionKnown = selectedDay !== null && frameCount > 0;
+  React.useEffect(() => {
+    if (!positionKnown) return;
+    const timer = setTimeout(() => {
+      setViewerPosition({ day: savedDay, index: savedIndex }).catch((error: unknown) => {
+        console.error("Could not save the viewer position:", error);
+      });
+    }, SAVE_POSITION_DELAY_MS);
+    return (): void => clearTimeout(timer);
+  }, [positionKnown, savedDay, savedIndex]);
 
   // Roll over to the new day at midnight, but only for someone who was
   // watching the live edge of the previous newest day.
