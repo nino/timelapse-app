@@ -79,6 +79,7 @@ pub fn spawn(app: AppHandle) {
         while window_is_focused(&app) {
             tokio::time::sleep(RELAUNCH_POLL).await;
         }
+        crate::converter::kill_running_encode();
         app.restart();
     });
 }
@@ -249,6 +250,7 @@ pub fn check_from_menu(app: AppHandle) {
         match install(&update).await {
             Ok(()) => {
                 *installed = Some(version);
+                crate::converter::kill_running_encode();
                 app.restart();
             }
             Err(e) if cancelled(&e) => {}
@@ -271,6 +273,7 @@ fn offer_relaunch(app: &AppHandle, version: &str) {
         ))
         .blocking_show();
     if relaunch {
+        crate::converter::kill_running_encode();
         app.restart();
     }
 }
