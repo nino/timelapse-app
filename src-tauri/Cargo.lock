@@ -4699,6 +4699,7 @@ version = "0.1.0"
 dependencies = [
  "active-win-pos-rs",
  "chrono",
+ "core-graphics 0.22.3",
  "dirs 5.0.1",
  "fast_image_resize",
  "flate2",
