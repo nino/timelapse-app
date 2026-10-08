@@ -1,7 +1,17 @@
 import React from "react";
 
 import "./App.css";
-import { ago, count, encodeProgress, formatDuration, until, type Activity, type Encoding, type Failure } from "./activity";
+import {
+  ago,
+  count,
+  encodeProgress,
+  encodeSeconds,
+  formatDuration,
+  until,
+  type Activity,
+  type Encoding,
+  type Failure,
+} from "./activity";
 import { useActivity } from "./hooks/useActivity";
 
 /** The Activity window (Window → Activity): what capture, video conversion and OCR are doing. */
@@ -154,7 +164,9 @@ function Conversion({
       break;
     case "onBattery":
       tone = "paused";
-      headline = `Paused on battery; next check ${next}`;
+      headline = current
+        ? `Encoding ${hourLabel(current.day, current.hour)} paused on battery`
+        : `Paused on battery; next check ${next}`;
       break;
     case "unavailable":
       headline = "Not available";
@@ -167,7 +179,7 @@ function Conversion({
   return (
     <Section title="Video conversion" tone={tone} headline={headline}>
       {current && <EncodeProgress encoding={current} now={now} />}
-      {current && <Row label="Running for">{formatDuration((now - Date.parse(current.startedAt)) / 1000)}</Row>}
+      {current && <Row label="Running for">{formatDuration(encodeSeconds(current, now))}</Row>}
       <Row label="Waiting">
         {count(ready, "hour")} ready, {waitingForOcr} waiting for OCR
       </Row>
