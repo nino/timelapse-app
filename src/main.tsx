@@ -1,7 +1,10 @@
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import React from "react";
 import ReactDOM from "react-dom/client";
+import { changelog } from "virtual:changelog";
 
+import { ABOUT_WINDOW } from "./about";
+import { AboutView } from "./AboutView";
 import { ACTIVITY_WINDOW } from "./activity";
 import { ActivityView } from "./ActivityView";
 import { App } from "./App";
@@ -23,6 +26,7 @@ const label = getCurrentWindow().label;
 function view(position: ViewerPosition | undefined): React.ReactNode {
   if (label === ACTIVITY_WINDOW) return <ActivityView />;
   if (label === SETTINGS_WINDOW) return <SettingsView />;
+  if (label === ABOUT_WINDOW) return <AboutView changelog={changelog} />;
   return <App initialPosition={position} />;
 }
 
@@ -30,7 +34,7 @@ function view(position: ViewerPosition | undefined): React.ReactNode {
 // render, so the viewer opens there instead of starting on the newest day and
 // jumping. Without it the viewer opens the newest day.
 function restoredPosition(): Promise<ViewerPosition | undefined> {
-  if (label === ACTIVITY_WINDOW || label === SETTINGS_WINDOW) return Promise.resolve(undefined);
+  if (label === ACTIVITY_WINDOW || label === SETTINGS_WINDOW || label === ABOUT_WINDOW) return Promise.resolve(undefined);
   return getViewerPosition().catch((error: unknown) => {
     console.error("Could not read the saved viewer position:", error);
     return undefined;
@@ -46,7 +50,7 @@ Promise.all([initTimelapseRoot(), restoredPosition()]).then(
       document.getElementById("root") as HTMLElement,
     ).render(
       <React.StrictMode>
-        {/* Window → Activity and Settings… open this same page in windows of their own. */}
+        {/* About, Window → Activity and Settings… open this same page in windows of their own. */}
         {view(position)}
       </React.StrictMode>,
     );

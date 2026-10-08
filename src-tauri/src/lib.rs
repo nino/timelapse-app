@@ -44,6 +44,8 @@ const MAIN_WINDOW: &str = "main";
 const ACTIVITY_WINDOW: &str = "activity";
 /// Label of the Settings window, and id of the menu item that opens it.
 const SETTINGS_WINDOW: &str = "settings";
+/// Label of the About window, and id of the menu item that opens it.
+const ABOUT_WINDOW: &str = "about";
 /// Id of the "Check for Updates…" menu item.
 const CHECK_FOR_UPDATES: &str = "check-for-updates";
 
@@ -702,7 +704,7 @@ fn remember_place<R: Runtime>(window: &tauri::Window<R>) {
 
 /// Keeps track of where the app's windows are and which are open.
 fn on_window_event<R: Runtime>(window: &tauri::Window<R>, event: &tauri::WindowEvent) {
-    if ![MAIN_WINDOW, ACTIVITY_WINDOW, SETTINGS_WINDOW].contains(&window.label()) {
+    if ![MAIN_WINDOW, ACTIVITY_WINDOW, SETTINGS_WINDOW, ABOUT_WINDOW].contains(&window.label()) {
         return;
     }
     match event {
@@ -782,11 +784,16 @@ pub(crate) fn before_quit<R: Runtime>(app: &AppHandle<R>) {
 
 /// The standard menu bar, with "Check for Updates…" and "Settings…" (⌘,)
 /// under About in the app menu, and "Activity" added to the Window menu.
+/// About opens the app's own About window, which has the change log, instead
+/// of the standard About panel.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn app_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     let menu = Menu::default(app)?;
     // On macOS the first submenu is the app menu, which starts with About.
     if let Some(MenuItemKind::Submenu(app_submenu)) = menu.items()?.first() {
+        app_submenu.remove_at(0)?;
+        let about = format!("About {}", app.package_info().name);
+        app_submenu.insert(&MenuItem::with_id(app, ABOUT_WINDOW, about, true, None::<&str>)?, 0)?;
         app_submenu.insert(
             &MenuItem::with_id(
                 app,
@@ -906,6 +913,32 @@ fn show_activity_window<R: Runtime>(app: &AppHandle<R>, opening: Opening) -> tau
     Ok(())
 }
 
+/// Bring the About window to the front, opening it if it isn't open. It opens
+/// where it was last, but unlike the Activity and Settings windows it isn't
+/// reopened at launch.
+fn show_about_window<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
+    if let Some(window) = app.get_webview_window(ABOUT_WINDOW) {
+        window.unminimize()?;
+        window.show()?;
+        return window.set_focus();
+    }
+    let mut builder =
+        WebviewWindowBuilder::new(app, ABOUT_WINDOW, WebviewUrl::App("index.html".into()))
+            .title(format!("About {}", app.package_info().name))
+            .inner_size(420.0, 560.0)
+            .min_inner_size(320.0, 320.0)
+            .minimizable(false)
+            .maximizable(false);
+    if let Some(place) = saved_place(app, ABOUT_WINDOW) {
+        builder = builder
+            .position(place.x, place.y)
+            .inner_size(place.width, place.height);
+    }
+    let window = builder.build()?;
+    remember_place(&window.as_ref().window());
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let photographer_state: PhotographerState = Arc::new(Mutex::new(None));
@@ -929,6 +962,7 @@ pub fn run() {
             let opened = match event.id().as_ref() {
                 ACTIVITY_WINDOW => show_activity_window(app, Opening::Asked),
                 SETTINGS_WINDOW => show_settings_window(app, Opening::Asked),
+                ABOUT_WINDOW => show_about_window(app),
                 CHECK_FOR_UPDATES => {
                     updater::check_from_menu(app.clone());
                     Ok(())
