@@ -32,7 +32,7 @@ describe('SettingsView', () => {
     render(<SettingsView />);
 
     await waitFor(() =>
-      expect(invoke).toHaveBeenCalledWith('fit_settings_window', { height: expect.any(Number) }),
+      expect(invoke).toHaveBeenCalledWith('grow_settings_window', { by: expect.any(Number) }),
     );
   });
 

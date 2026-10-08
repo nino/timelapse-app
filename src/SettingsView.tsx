@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from "react";
 
 import "./App.css";
-import { fitSettingsWindow, getSettings, setUpdateAutomatically, type Settings } from "./settings";
+import { growSettingsWindow, getSettings, setUpdateAutomatically, type Settings } from "./settings";
 import { focusRing } from "./ui";
 
 /**
@@ -19,19 +19,26 @@ export function SettingsView(): React.ReactNode {
   }, []);
 
   // The window is exactly as tall as its content, so the margin below the
-  // card matches the margin above it. Measured once the fonts are in, since
-  // they set how the description wraps.
+  // card matches the margin above it. Refitted whenever the content's height
+  // changes, which includes the fonts arriving and rewrapping the text.
   useEffect(() => {
-    if (!loaded) return;
-    // happy-dom, in tests, has no FontFaceSet.
-    void (document.fonts?.ready ?? Promise.resolve()).then(() => {
-      if (main.current) {
-        fitSettingsWindow(main.current.getBoundingClientRect().height).catch((e: unknown) =>
-          console.error("Could not size the Settings window:", e),
-        );
-      }
-    });
-  }, [loaded, error]);
+    const content = main.current;
+    if (!loaded || !content) return;
+    const fit = (): void => {
+      const by = Math.ceil(content.getBoundingClientRect().height) - window.innerHeight;
+      growSettingsWindow(by).catch((e: unknown) => console.error("Could not size the Settings window:", e));
+    };
+    fit();
+    // Again if the viewport turns out different once the window is shown.
+    window.addEventListener("resize", fit);
+    // happy-dom, in tests, has no ResizeObserver.
+    const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(fit);
+    observer?.observe(content);
+    return (): void => {
+      window.removeEventListener("resize", fit);
+      observer?.disconnect();
+    };
+  }, [loaded]);
 
   const toggleUpdates = (enabled: boolean): void => {
     const previous = settings;
