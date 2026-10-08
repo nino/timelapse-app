@@ -4,6 +4,7 @@ mod boost;
 mod converter;
 mod timelapse;
 mod database;
+mod diagnostics;
 mod ocr;
 mod paths;
 mod settings;
@@ -548,6 +549,9 @@ fn start_boost(
         return Err("A boost needs a length".to_string());
     }
     boost.start(std::time::Duration::from_secs(minutes.saturating_mul(60)), allow_battery);
+    diagnostics::info("boost", "Boost started")
+        .data(serde_json::json!({ "minutes": minutes, "allowBattery": allow_battery }))
+        .record();
     Ok(boost.status())
 }
 
@@ -555,6 +559,7 @@ fn start_boost(
 #[tauri::command]
 fn stop_boost(boost: State<'_, BoostState>) {
     boost.stop();
+    diagnostics::info("boost", "Boost stopped").record();
 }
 
 /// Keep conversion and OCR off for `minutes`, even on AC power, replacing
@@ -568,6 +573,9 @@ fn start_low_power(
         return Err("Low-power mode needs a length".to_string());
     }
     boost.start_low_power(std::time::Duration::from_secs(minutes.saturating_mul(60)));
+    diagnostics::info("boost", "Low-power mode started")
+        .data(serde_json::json!({ "minutes": minutes }))
+        .record();
     Ok(boost.low_power_until())
 }
 
@@ -575,13 +583,26 @@ fn start_low_power(
 #[tauri::command]
 fn stop_low_power(boost: State<'_, BoostState>) {
     boost.stop_low_power();
+    diagnostics::info("boost", "Low-power mode stopped").record();
 }
 
 /// Let the boost in progress run on battery, or not. Returns the boost.
 #[tauri::command]
 fn set_boost_allow_battery(boost: State<'_, BoostState>, allow_battery: bool) -> Option<boost::BoostStatus> {
     boost.set_allow_battery(allow_battery);
+    diagnostics::info("boost", "Boost on battery changed")
+        .data(serde_json::json!({ "allowBattery": allow_battery }))
+        .record();
     boost.status()
+}
+
+/// Records an error the page caught (an uncaught exception or a rejected
+/// promise) in the diagnostics log.
+#[tauri::command]
+fn log_frontend_error(window: tauri::Window, message: String, detail: Option<String>) {
+    diagnostics::error("frontend", message)
+        .data(serde_json::json!({ "window": window.label(), "detail": detail }))
+        .record();
 }
 
 /// The app's settings. Changes apply at once and are saved straight away.
@@ -755,6 +776,8 @@ pub(crate) fn before_quit<R: Runtime>(app: &AppHandle<R>) {
     if let Some(state) = app.try_state::<AppStateStore>() {
         state.save_now();
     }
+    diagnostics::info("app", "Quit").record();
+    diagnostics::flush(std::time::Duration::from_secs(1));
 }
 
 /// The standard menu bar, with "Check for Updates…" and "Settings…" (⌘,)
@@ -953,6 +976,20 @@ pub fn run() {
                     if let Err(e) = std::fs::create_dir_all(&root) {
                         eprintln!("Failed to create {:?}: {}", root, e);
                     }
+                    match diagnostics::init(&root) {
+                        Ok(()) => {
+                            diagnostics::record_panics();
+                            diagnostics::info("app", "Started")
+                                .data(serde_json::json!({
+                                    "version": app.package_info().version.to_string(),
+                                    "debug": cfg!(debug_assertions),
+                                    "os": std::env::consts::OS,
+                                    "arch": std::env::consts::ARCH,
+                                }))
+                                .record();
+                        }
+                        Err(e) => eprintln!("Could not open the diagnostics log: {}", e),
+                    }
                     // Per-profile, like the library, so a dev build never
                     // serves frames cached from the real one. A failure here
                     // only breaks viewing; capture below still starts.
@@ -979,7 +1016,10 @@ pub fn run() {
                         Ok(source) => {
                             app.manage::<FrameSourceState>(Arc::new(source));
                         }
-                        Err(e) => eprintln!("Failed to set up the frame source: {}", e),
+                        Err(e) => {
+                            eprintln!("Failed to set up the frame source: {}", e);
+                            diagnostics::error("app", format!("Failed to set up the frame source: {}", e)).record();
+                        }
                     }
                 }
                 None => eprintln!("Unable to find home directory"),
@@ -1018,6 +1058,7 @@ pub fn run() {
                     }
                     Err(e) => {
                         eprintln!("Failed to start timelapse automatically: {}", e);
+                        diagnostics::error("capture", format!("Failed to start: {}", e)).record();
                     }
                 }
 
@@ -1073,6 +1114,7 @@ pub fn run() {
             start_low_power,
             stop_low_power,
             set_boost_allow_battery,
+            log_frontend_error,
             get_settings,
             set_update_automatically,
             get_viewer_position,

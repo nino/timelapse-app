@@ -6,8 +6,10 @@
 //! workers scanning the library or the database on its behalf.
 
 use crate::boost::BoostStatus;
+use crate::diagnostics;
 use chrono::{DateTime, Local};
 use serde::Serialize;
+use serde_json::json;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -156,10 +158,26 @@ pub struct OcrStatus {
 
 /// The shared report. Every method takes the lock briefly and never blocks on
 /// anything else.
+///
+/// Changes worth keeping (errors, finished encodes, a stretch of black
+/// screens, a loop going to sleep for a different reason than last time) also
+/// go to the diagnostics log.
 #[derive(Default)]
 pub struct Activity {
     snapshot: Mutex<Snapshot>,
     power_read_at: Mutex<Option<Instant>>,
+    log: Mutex<Logged>,
+}
+
+/// What the diagnostics log was last told, so it hears of changes only. A
+/// loop's state is the reason it last went to sleep, so a busy loop doesn't
+/// log a change each time it runs out of work.
+#[derive(Default)]
+struct Logged {
+    black_since: Option<Instant>,
+    black_frames: u64,
+    converter: Option<State>,
+    ocr: Option<State>,
 }
 
 impl Activity {
@@ -167,6 +185,25 @@ impl Activity {
         if let Ok(mut snapshot) = self.snapshot.lock() {
             f(&mut snapshot);
         }
+    }
+
+    fn logged(&self, f: impl FnOnce(&mut Logged)) {
+        if let Ok(mut logged) = self.log.lock() {
+            f(&mut logged);
+        }
+    }
+
+    /// Log the end of a stretch of black screens, if one was going on.
+    fn black_stretch_ended(&self) {
+        self.logged(|l| {
+            if let Some(since) = l.black_since.take() {
+                diagnostics::info("capture", "Screen back after black frames")
+                    .took(since.elapsed())
+                    .data(json!({ "blackFrames": l.black_frames }))
+                    .record();
+                l.black_frames = 0;
+            }
+        });
     }
 
     /// The current report, with the power source read through `read_power`
@@ -193,6 +230,7 @@ impl Activity {
     // Capture.
 
     pub fn frame_saved(&self, day: &str, number: u32) {
+        self.black_stretch_ended();
         self.update(|s| {
             s.capture.frames_saved += 1;
             s.capture.last_frame = Some(FrameRef { day: day.to_string(), number, at: Local::now() });
@@ -200,10 +238,18 @@ impl Activity {
     }
 
     pub fn black_frame_dropped(&self) {
+        self.logged(|l| {
+            if l.black_since.is_none() {
+                l.black_since = Some(Instant::now());
+                diagnostics::info("capture", "Screen black (off or locked)").record();
+            }
+            l.black_frames += 1;
+        });
         self.update(|s| s.capture.last_black_at = Some(Local::now()));
     }
 
     pub fn capture_failed(&self, message: String) {
+        diagnostics::error("capture", message.clone()).record();
         self.update(|s| s.capture.last_error = Some(Failure { at: Local::now(), message }));
     }
 
@@ -222,6 +268,9 @@ impl Activity {
     }
 
     pub fn encoding_started(&self, encoding: Encoding) {
+        diagnostics::info("converter", "Encode started")
+            .data(json!({ "video": encoding.video, "day": encoding.day, "hour": encoding.hour, "frames": encoding.frames }))
+            .record();
         self.update(|s| {
             s.conversion.state = State::Working;
             s.conversion.current = Some(encoding);
@@ -241,6 +290,7 @@ impl Activity {
     /// The encode is paused, in `state`: until the machine is back on AC
     /// power, or until low-power mode ends.
     pub fn encoding_paused(&self, state: State) {
+        diagnostics::info("converter", format!("Encode paused: {:?}", state)).record();
         self.update(|s| {
             if let Some(current) = s.conversion.current.as_mut() {
                 current.paused_since.get_or_insert_with(Local::now);
@@ -251,6 +301,7 @@ impl Activity {
 
     /// The paused encode carries on.
     pub fn encoding_resumed(&self) {
+        diagnostics::info("converter", "Encode resumed").record();
         self.update(|s| {
             if let Some(current) = s.conversion.current.as_mut() {
                 if let Some(since) = current.paused_since.take() {
@@ -263,7 +314,22 @@ impl Activity {
 
     pub fn encoding_finished(&self, video: String, took: Duration, error: Option<String>) {
         self.update(|s| {
-            s.conversion.current = None;
+            let current = s.conversion.current.take();
+            let (frames, frames_done, paused_secs) = current
+                .map(|c| {
+                    let paused = c.paused_secs
+                        + c.paused_since.map_or(0, |since| (Local::now() - since).num_seconds().max(0) as u64);
+                    (c.frames, c.frames_done, paused)
+                })
+                .unwrap_or_default();
+            let event = match &error {
+                None => diagnostics::info("converter", "Encode finished"),
+                Some(e) => diagnostics::error("converter", format!("Encode failed: {}", e)),
+            };
+            event
+                .took(took)
+                .data(json!({ "video": video, "frames": frames, "framesDone": frames_done, "pausedSecs": paused_secs }))
+                .record();
             if error.is_none() {
                 s.conversion.videos_made += 1;
             }
@@ -278,6 +344,14 @@ impl Activity {
 
     /// The converter goes to sleep for `wait`, in `state`.
     pub fn converter_sleeps(&self, state: State, wait: Duration) {
+        self.logged(|l| {
+            // Resting follows every encode, which is logged already.
+            if state != State::Resting && l.converter.replace(state) != Some(state) {
+                diagnostics::info("converter", format!("Now {:?}", state))
+                    .data(json!({ "nextCheckSecs": wait.as_secs() }))
+                    .record();
+            }
+        });
         self.update(|s| {
             s.conversion.state = state;
             s.conversion.next_check_at = Some(after(wait));
@@ -287,6 +361,7 @@ impl Activity {
     // OCR.
 
     pub fn ocr_unavailable(&self) {
+        diagnostics::info("ocr", "Unavailable on this platform").record();
         self.update(|s| s.ocr.state = State::Unavailable);
     }
 
@@ -324,11 +399,19 @@ impl Activity {
     }
 
     pub fn ocr_failed(&self, message: String) {
+        diagnostics::error("ocr", message.clone()).record();
         self.update(|s| s.ocr.last_error = Some(Failure { at: Local::now(), message }));
     }
 
     /// OCR goes to sleep for `wait`, in `state`.
     pub fn ocr_sleeps(&self, state: State, wait: Duration) {
+        self.logged(|l| {
+            if l.ocr.replace(state) != Some(state) {
+                diagnostics::info("ocr", format!("Now {:?}", state))
+                    .data(json!({ "nextCheckSecs": wait.as_secs() }))
+                    .record();
+            }
+        });
         self.update(|s| {
             s.ocr.state = state;
             s.ocr.next_check_at = Some(after(wait));

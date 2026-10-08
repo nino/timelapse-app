@@ -28,10 +28,13 @@ use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 /// How long to wait before looking again when there is nothing to read.
 const IDLE_SLEEP: Duration = Duration::from_secs(60);
+
+/// A pass at least this long is logged on its own (`log_pass`).
+const LONG_PASS: Duration = Duration::from_secs(60);
 
 /// How long to wait before re-checking the power source while on battery.
 const BATTERY_SLEEP: Duration = Duration::from_secs(5 * 60);
@@ -119,6 +122,7 @@ pub fn ocr_check(root: &Path) -> OcrCheck {
         Ok(db) => Mutex::new(db),
         Err(error) => {
             eprintln!("OCR: cannot open database for the delete check: {}", error);
+            crate::diagnostics::error("ocr", format!("Cannot open database for the delete check: {}", error)).record();
             return Arc::new(|_| false);
         }
     };
@@ -564,6 +568,7 @@ pub fn start_background_ocr(
                 Ok(db) => db,
                 Err(error) => {
                     eprintln!("OCR: cannot open database: {}", error);
+                    crate::diagnostics::error("ocr", format!("Cannot open database: {}", error)).record();
                     return;
                 }
             };
@@ -578,6 +583,7 @@ pub fn start_background_ocr(
                     Ok(source) => Some(VideoReader::new(source, dir)),
                     Err(error) => {
                         eprintln!("OCR: cannot read videos: {}", error);
+                        crate::diagnostics::error("ocr", format!("Cannot read videos: {}", error)).record();
                         None
                     }
                 }
@@ -619,6 +625,7 @@ fn run_forever(worker: &mut OcrWorker, boost: &Boost) {
         boost.sleep(wait);
     };
     let mut boosted = false;
+    let mut tally = crate::diagnostics::Tally::new("ocr");
     // Asked before each pass and every `FRAMES_PER_POWER_CHECK` frames, so a
     // boost's start and end reach a pass in progress within seconds.
     let mut keep_going = || {
@@ -640,6 +647,7 @@ fn run_forever(worker: &mut OcrWorker, boost: &Boost) {
         }
 
         // New screenshots first: the converter is waiting on them.
+        let started = Instant::now();
         let screenshots = worker.run_pass(SystemTime::now(), usize::MAX, &mut keep_going);
         let result = match screenshots {
             Ok(summary) if summary.handled() == 0 => worker
@@ -648,12 +656,19 @@ fn run_forever(worker: &mut OcrWorker, boost: &Boost) {
             Ok(summary) => Ok(("screenshots", summary)),
             Err(error) => Err(error.to_string()),
         };
+        let took = started.elapsed();
         match result {
-            Ok((kind, summary)) if summary.handled() > 0 => println!(
-                "OCR: read {} {}, skipped {} unchanged",
-                summary.recognized, kind, summary.skipped
-            ),
-            Ok(_) => sleep(State::Idle, IDLE_SLEEP),
+            Ok((kind, summary)) if summary.handled() > 0 => {
+                println!(
+                    "OCR: read {} {}, skipped {} unchanged",
+                    summary.recognized, kind, summary.skipped
+                );
+                log_pass(&mut tally, kind, &summary, took, boost.is_on());
+            }
+            Ok(_) => {
+                tally.report_if_due();
+                sleep(State::Idle, IDLE_SLEEP)
+            }
             Err(error) => {
                 eprintln!("OCR pass failed: {}", error);
                 activity.ocr_failed(format!("Pass failed: {}", error));
@@ -661,6 +676,28 @@ fn run_forever(worker: &mut OcrWorker, boost: &Boost) {
             }
         }
     }
+}
+
+/// Passes that keep up with new screenshots go into the hourly summary; a
+/// pass long enough to be a backlog, and every pass over video, is logged on
+/// its own.
+fn log_pass(tally: &mut crate::diagnostics::Tally, kind: &str, summary: &PassSummary, took: Duration, boosted: bool) {
+    let video = kind == "video frames";
+    if video || took >= LONG_PASS {
+        crate::diagnostics::info("ocr", format!("Read {}", kind))
+            .took(took)
+            .data(serde_json::json!({
+                "recognized": summary.recognized,
+                "skipped": summary.skipped,
+                "boosted": boosted,
+            }))
+            .record();
+    } else {
+        tally.count("recognized", summary.recognized as u64);
+        tally.count("skipped", summary.skipped as u64);
+        tally.time("pass", took);
+    }
+    tally.report_if_due();
 }
 
 /// Day folder names under `root`, oldest first.

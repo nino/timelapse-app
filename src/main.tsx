@@ -5,6 +5,7 @@ import ReactDOM from "react-dom/client";
 import { ACTIVITY_WINDOW } from "./activity";
 import { ActivityView } from "./ActivityView";
 import { App } from "./App";
+import { logUncaughtErrors } from "./diagnostics";
 import { SETTINGS_WINDOW } from "./settings";
 import { SettingsView } from "./SettingsView";
 import { initTimelapseRoot } from "./timelapseRoot";
@@ -14,6 +15,8 @@ import { getViewerPosition, type ViewerPosition } from "./viewerPosition";
 if (navigator.userAgent.includes("Macintosh")) {
   document.documentElement.dataset.platform = "macos";
 }
+
+logUncaughtErrors();
 
 const label = getCurrentWindow().label;
 
