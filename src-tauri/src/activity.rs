@@ -104,6 +104,8 @@ pub struct Encoding {
     pub hour: u32,
     pub frames: usize,
     pub started_at: DateTime<Local>,
+    /// Frames ffmpeg has encoded so far, from its `-progress` output.
+    pub frames_done: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -213,6 +215,15 @@ impl Activity {
             s.conversion.state = State::Working;
             s.conversion.current = Some(encoding);
             s.conversion.next_check_at = None;
+        });
+    }
+
+    /// ffmpeg has encoded `frames_done` frames of the current batch.
+    pub fn encoding_progress(&self, frames_done: usize) {
+        self.update(|s| {
+            if let Some(current) = s.conversion.current.as_mut() {
+                current.frames_done = frames_done.min(current.frames);
+            }
         });
     }
 
@@ -353,8 +364,11 @@ mod tests {
             hour: 9,
             frames: 10,
             started_at: Local::now(),
+            frames_done: 0,
         });
         assert_eq!(activity.snapshot(false, || true).conversion.state, State::Working);
+        activity.encoding_progress(4);
+        assert_eq!(activity.snapshot(false, || true).conversion.current.unwrap().frames_done, 4);
 
         activity.encoding_finished("v.mov".into(), Duration::from_secs(3), None);
         activity.converter_sleeps(State::Resting, Duration::from_secs(60));

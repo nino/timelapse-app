@@ -82,7 +82,14 @@ describe('ActivityView', () => {
         conversion: {
           ...base.conversion,
           state: 'working',
-          current: { video: 'v.mov', day: '2026-10-07', hour: 9, frames: 3412, startedAt: secondsAgo(133) },
+          current: {
+            video: 'v.mov',
+            day: '2026-10-07',
+            hour: 9,
+            frames: 3412,
+            startedAt: secondsAgo(133),
+            framesDone: 1706,
+          },
           nextCheckAt: null,
         },
       }),
@@ -93,6 +100,9 @@ describe('ActivityView', () => {
       expect(screen.getByTestId('Video conversion-headline')).toHaveTextContent('Encoding 2026-10-07 09:00 (3,412 frames)'),
     );
     expect(screen.getByText('2m 13s')).toBeInTheDocument();
+    // Half done after 2m 13s: about as long again to go.
+    expect(screen.getByRole('progressbar')).toHaveAttribute('aria-valuenow', '50');
+    expect(screen.getByText(/^50%/)).toHaveTextContent('50%, about 2m 13s left');
   });
 
   it('says when work waits for AC power', async () => {
