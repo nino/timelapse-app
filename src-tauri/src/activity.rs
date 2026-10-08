@@ -5,8 +5,11 @@
 //! only touches memory, so the window can ask as often as it likes without the
 //! workers scanning the library or the database on its behalf.
 
-use chrono::{DateTime, Local};
-use serde::Serialize;
+use crate::boost::BoostStatus;
+use crate::diagnostics;
+use chrono::{DateTime, FixedOffset, Local};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -23,6 +26,10 @@ pub struct Snapshot {
     /// Whether the machine is on AC power. Conversion and OCR run only then.
     /// `None` until first asked.
     pub on_ac_power: Option<bool>,
+    /// The boost in progress, if any. Filled in by `get_activity`.
+    pub boost: Option<BoostStatus>,
+    /// When low-power mode ends, while it is on. Filled in by `get_activity`.
+    pub low_power_until: Option<DateTime<Local>>,
     pub capture: CaptureStatus,
     pub conversion: ConversionStatus,
     pub ocr: OcrStatus,
@@ -93,6 +100,8 @@ pub enum State {
     Resting,
     /// Paused until the machine is on AC power.
     OnBattery,
+    /// Paused until low-power mode ends (`boost.rs`).
+    LowPower,
     /// Not available on this platform (OCR outside macOS).
     Unavailable,
 }
@@ -128,6 +137,12 @@ pub struct Encoding {
     pub hour: u32,
     pub frames: usize,
     pub started_at: DateTime<Local>,
+    /// Frames ffmpeg has encoded so far, from its `-progress` output.
+    pub frames_done: usize,
+    /// When the encode was paused (unplugged), while it is.
+    pub paused_since: Option<DateTime<Local>>,
+    /// Seconds spent paused before `paused_since`.
+    pub paused_secs: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -157,14 +172,36 @@ pub struct OcrStatus {
     /// When OCR next looks for new frames, while idle or on battery.
     pub next_check_at: Option<DateTime<Local>>,
     pub last_error: Option<Failure>,
+    /// Whether the current pass reads days that only exist as video. Their
+    /// `current.number` is a 1-based position in the day's videos.
+    pub reading_video: bool,
+    /// Days that only exist as video and still have frames to read, as of the
+    /// last pass over them. `None` until OCR first gets to them.
+    pub video_days_left: Option<usize>,
 }
 
 /// The shared report. Every method takes the lock briefly and never blocks on
 /// anything else.
+///
+/// Changes worth keeping (errors, finished encodes, a stretch of black
+/// screens, a loop going to sleep for a different reason than last time) also
+/// go to the diagnostics log.
 #[derive(Default)]
 pub struct Activity {
     snapshot: Mutex<Snapshot>,
     power_read_at: Mutex<Option<Instant>>,
+    log: Mutex<Logged>,
+}
+
+/// What the diagnostics log was last told, so it hears of changes only. A
+/// loop's state is the reason it last went to sleep, so a busy loop doesn't
+/// log a change each time it runs out of work.
+#[derive(Default)]
+struct Logged {
+    black_since: Option<Instant>,
+    black_frames: u64,
+    converter: Option<State>,
+    ocr: Option<State>,
 }
 
 impl Activity {
@@ -172,6 +209,25 @@ impl Activity {
         if let Ok(mut snapshot) = self.snapshot.lock() {
             f(&mut snapshot);
         }
+    }
+
+    fn logged(&self, f: impl FnOnce(&mut Logged)) {
+        if let Ok(mut logged) = self.log.lock() {
+            f(&mut logged);
+        }
+    }
+
+    /// Log the end of a stretch of black screens, if one was going on.
+    fn black_stretch_ended(&self) {
+        self.logged(|l| {
+            if let Some(since) = l.black_since.take() {
+                diagnostics::info("capture", "Screen back after black frames")
+                    .took(since.elapsed())
+                    .data(json!({ "blackFrames": l.black_frames }))
+                    .record();
+                l.black_frames = 0;
+            }
+        });
     }
 
     /// The current report, with the power source read through `read_power`
@@ -198,6 +254,7 @@ impl Activity {
     // Capture.
 
     pub fn frame_saved(&self, day: &str, number: u32) {
+        self.black_stretch_ended();
         self.update(|s| {
             s.capture.frames_saved += 1;
             s.capture.failures_in_a_row = 0;
@@ -206,6 +263,13 @@ impl Activity {
     }
 
     pub fn black_frame_dropped(&self) {
+        self.logged(|l| {
+            if l.black_since.is_none() {
+                l.black_since = Some(Instant::now());
+                diagnostics::info("capture", "Screen black (off or locked)").record();
+            }
+            l.black_frames += 1;
+        });
         self.update(|s| {
             s.capture.last_black_at = Some(Local::now());
             s.capture.failures_in_a_row = 0;
@@ -213,6 +277,7 @@ impl Activity {
     }
 
     pub fn capture_failed(&self, message: String) {
+        diagnostics::error("capture", message.clone()).record();
         self.update(|s| {
             s.capture.last_error = Some(Failure { at: Local::now(), message });
             s.capture.failures_in_a_row += 1;
@@ -234,6 +299,9 @@ impl Activity {
     }
 
     pub fn encoding_started(&self, encoding: Encoding) {
+        diagnostics::info("converter", "Encode started")
+            .data(json!({ "video": encoding.video, "day": encoding.day, "hour": encoding.hour, "frames": encoding.frames }))
+            .record();
         self.update(|s| {
             s.conversion.state = State::Working;
             s.conversion.current = Some(encoding);
@@ -241,9 +309,58 @@ impl Activity {
         });
     }
 
+    /// ffmpeg has encoded `frames_done` frames of the current batch.
+    pub fn encoding_progress(&self, frames_done: usize) {
+        self.update(|s| {
+            if let Some(current) = s.conversion.current.as_mut() {
+                current.frames_done = frames_done.min(current.frames);
+            }
+        });
+    }
+
+    /// The encode is paused, in `state`: until the machine is back on AC
+    /// power, or until low-power mode ends.
+    pub fn encoding_paused(&self, state: State) {
+        diagnostics::info("converter", format!("Encode paused: {:?}", state)).record();
+        self.update(|s| {
+            if let Some(current) = s.conversion.current.as_mut() {
+                current.paused_since.get_or_insert_with(Local::now);
+                s.conversion.state = state;
+            }
+        });
+    }
+
+    /// The paused encode carries on.
+    pub fn encoding_resumed(&self) {
+        diagnostics::info("converter", "Encode resumed").record();
+        self.update(|s| {
+            if let Some(current) = s.conversion.current.as_mut() {
+                if let Some(since) = current.paused_since.take() {
+                    current.paused_secs += (Local::now() - since).num_seconds().max(0) as u64;
+                }
+                s.conversion.state = State::Working;
+            }
+        });
+    }
+
     pub fn encoding_finished(&self, video: String, took: Duration, error: Option<String>) {
         self.update(|s| {
-            s.conversion.current = None;
+            let current = s.conversion.current.take();
+            let (frames, frames_done, paused_secs) = current
+                .map(|c| {
+                    let paused = c.paused_secs
+                        + c.paused_since.map_or(0, |since| (Local::now() - since).num_seconds().max(0) as u64);
+                    (c.frames, c.frames_done, paused)
+                })
+                .unwrap_or_default();
+            let event = match &error {
+                None => diagnostics::info("converter", "Encode finished"),
+                Some(e) => diagnostics::error("converter", format!("Encode failed: {}", e)),
+            };
+            event
+                .took(took)
+                .data(json!({ "video": video, "frames": frames, "framesDone": frames_done, "pausedSecs": paused_secs }))
+                .record();
             if error.is_none() {
                 s.conversion.videos_made += 1;
             }
@@ -258,6 +375,14 @@ impl Activity {
 
     /// The converter goes to sleep for `wait`, in `state`.
     pub fn converter_sleeps(&self, state: State, wait: Duration) {
+        self.logged(|l| {
+            // Resting follows every encode, which is logged already.
+            if state != State::Resting && l.converter.replace(state) != Some(state) {
+                diagnostics::info("converter", format!("Now {:?}", state))
+                    .data(json!({ "nextCheckSecs": wait.as_secs() }))
+                    .record();
+            }
+        });
         self.update(|s| {
             s.conversion.state = state;
             s.conversion.next_check_at = Some(after(wait));
@@ -267,6 +392,7 @@ impl Activity {
     // OCR.
 
     pub fn ocr_unavailable(&self) {
+        diagnostics::info("ocr", "Unavailable on this platform").record();
         self.update(|s| s.ocr.state = State::Unavailable);
     }
 
@@ -275,6 +401,19 @@ impl Activity {
             s.ocr.state = State::Working;
             s.ocr.remaining = frames;
             s.ocr.next_check_at = None;
+            s.ocr.reading_video = false;
+        });
+    }
+
+    /// A pass over days that only exist as video starts, with `days_left`
+    /// of them still unread.
+    pub fn ocr_video_pass_started(&self, days_left: usize) {
+        self.update(|s| {
+            s.ocr.state = State::Working;
+            s.ocr.remaining = 0;
+            s.ocr.next_check_at = None;
+            s.ocr.reading_video = true;
+            s.ocr.video_days_left = Some(days_left);
         });
     }
 
@@ -291,14 +430,46 @@ impl Activity {
     }
 
     pub fn ocr_failed(&self, message: String) {
+        diagnostics::error("ocr", message.clone()).record();
         self.update(|s| s.ocr.last_error = Some(Failure { at: Local::now(), message }));
     }
 
     /// OCR goes to sleep for `wait`, in `state`.
     pub fn ocr_sleeps(&self, state: State, wait: Duration) {
+        self.logged(|l| {
+            if l.ocr.replace(state) != Some(state) {
+                diagnostics::info("ocr", format!("Now {:?}", state))
+                    .data(json!({ "nextCheckSecs": wait.as_secs() }))
+                    .record();
+            }
+        });
         self.update(|s| {
             s.ocr.state = state;
             s.ocr.next_check_at = Some(after(wait));
+        });
+    }
+}
+
+/// Which "Last error" line of the Activity window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ErrorSource {
+    Capture,
+    Ocr,
+}
+
+impl Activity {
+    /// Clear the last error from `source`, if it is still the one that
+    /// happened `at`. A newer error is kept, since nobody has seen it yet.
+    pub fn dismiss_error(&self, source: ErrorSource, at: DateTime<FixedOffset>) {
+        self.update(|s| {
+            let error = match source {
+                ErrorSource::Capture => &mut s.capture.last_error,
+                ErrorSource::Ocr => &mut s.ocr.last_error,
+            };
+            if error.as_ref().is_some_and(|e| e.at == at) {
+                *error = None;
+            }
         });
     }
 }
@@ -310,6 +481,24 @@ fn after(wait: Duration) -> DateTime<Local> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dismisses_an_error_but_not_a_newer_one() {
+        let activity = Activity::default();
+        activity.ocr_failed("first".into());
+        let seen = activity.snapshot(false, || true).ocr.last_error.unwrap().at.fixed_offset();
+        activity.capture_failed("capture".into());
+
+        activity.dismiss_error(ErrorSource::Ocr, seen);
+        let snapshot = activity.snapshot(false, || true);
+        assert!(snapshot.ocr.last_error.is_none());
+        assert!(snapshot.capture.last_error.is_some(), "only the named line is cleared");
+
+        activity.ocr_failed("second".into());
+        activity.dismiss_error(ErrorSource::Ocr, seen);
+        let ocr = activity.snapshot(false, || true).ocr;
+        assert_eq!(ocr.last_error.map(|e| e.message), Some("second".to_string()));
+    }
 
     #[test]
     fn reuses_a_recent_power_reading() {
@@ -346,6 +535,21 @@ mod tests {
     }
 
     #[test]
+    fn tells_video_passes_from_screenshot_passes() {
+        let activity = Activity::default();
+        assert_eq!(activity.snapshot(false, || true).ocr.video_days_left, None);
+        activity.ocr_video_pass_started(12);
+        let ocr = activity.snapshot(false, || true).ocr;
+        assert!(ocr.reading_video);
+        assert_eq!(ocr.video_days_left, Some(12));
+        activity.ocr_pass_started(3);
+        let ocr = activity.snapshot(false, || true).ocr;
+        assert!(!ocr.reading_video);
+        // Still the last count, until the next video pass.
+        assert_eq!(ocr.video_days_left, Some(12));
+    }
+
+    #[test]
     fn counts_ocr_progress_down() {
         let activity = Activity::default();
         activity.ocr_pass_started(3);
@@ -367,8 +571,22 @@ mod tests {
             hour: 9,
             frames: 10,
             started_at: Local::now(),
+            frames_done: 0,
+            paused_since: None,
+            paused_secs: 0,
         });
         assert_eq!(activity.snapshot(false, || true).conversion.state, State::Working);
+        activity.encoding_progress(4);
+        assert_eq!(activity.snapshot(false, || true).conversion.current.unwrap().frames_done, 4);
+
+        activity.encoding_paused(State::OnBattery);
+        let conversion = activity.snapshot(false, || false).conversion;
+        assert_eq!(conversion.state, State::OnBattery);
+        assert!(conversion.current.unwrap().paused_since.is_some());
+        activity.encoding_resumed();
+        let conversion = activity.snapshot(false, || true).conversion;
+        assert_eq!(conversion.state, State::Working);
+        assert!(conversion.current.unwrap().paused_since.is_none());
 
         activity.encoding_finished("v.mov".into(), Duration::from_secs(3), None);
         activity.converter_sleeps(State::Resting, Duration::from_secs(60));

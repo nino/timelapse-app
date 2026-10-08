@@ -1,7 +1,10 @@
 mod activity;
+mod app_state;
+mod boost;
 mod converter;
 mod timelapse;
 mod database;
+mod diagnostics;
 mod ocr;
 mod paths;
 mod settings;
@@ -15,7 +18,8 @@ use std::sync::{Arc, Mutex};
 use tauri::menu::{Menu, MenuItem, MenuItemKind, PredefinedMenuItem, WINDOW_SUBMENU_ID};
 use tauri::{AppHandle, Emitter, Manager, Runtime, State, WebviewUrl, WebviewWindowBuilder};
 use activity::{Activity, Snapshot};
-use database::{OcrHit, ScreenshotDatabase};
+use app_state::{AppStateStore, Rect, ViewerPosition};
+use database::{OcrHit, OcrProgress, ScreenshotDatabase};
 use serde::Serialize;
 use settings::{Settings, SettingsStore};
 use timelapse::Photographer;
@@ -31,10 +35,17 @@ type FrameSourceState = Arc<FrameSource>;
 /// What capture, conversion and OCR are doing, for the Activity window.
 type ActivityState = Arc<Activity>;
 
+/// Whether conversion and OCR are boosted (`boost.rs`).
+type BoostState = Arc<boost::Boost>;
+
+/// Label of the main window, set in `tauri.conf.json`.
+const MAIN_WINDOW: &str = "main";
 /// Label of the Activity window, and id of the menu item that opens it.
 const ACTIVITY_WINDOW: &str = "activity";
 /// Label of the Settings window, and id of the menu item that opens it.
 const SETTINGS_WINDOW: &str = "settings";
+/// Label of the About window, and id of the menu item that opens it.
+const ABOUT_WINDOW: &str = "about";
 /// Id of the "Check for Updates…" menu item.
 const CHECK_FOR_UPDATES: &str = "check-for-updates";
 
@@ -322,9 +333,21 @@ fn search_ocr_day_impl(
             }
         })
         .collect();
-    let indices = source
-        .indices_of_frames(date, &numbers)
-        .map_err(|e| e.to_string())?;
+    // A day OCR read from video (see `ocr::OcrWorker::run_video_pass`)
+    // recorded 1-based positions in the day, so a position is an index plus
+    // one. A position past the day's end means its videos changed since.
+    let by_position = matches!(db.ocr_progress(date), Ok(Some(OcrProgress::VideoPosition(_))));
+    let indices = if by_position {
+        let count = source.day(date).map_err(|e| e.to_string())?.frame_count;
+        numbers
+            .iter()
+            .map(|&position| (position as usize).checked_sub(1).filter(|&index| index < count))
+            .collect()
+    } else {
+        source
+            .indices_of_frames(date, &numbers)
+            .map_err(|e| e.to_string())?
+    };
 
     let mut matches: Vec<DayMatch> = found
         .iter()
@@ -501,10 +524,101 @@ async fn evict_old_cache() -> Result<String, String> {
 async fn get_activity(
     activity: State<'_, ActivityState>,
     photographer: State<'_, PhotographerState>,
+    boost: State<'_, BoostState>,
 ) -> Result<Snapshot, String> {
     let capturing = is_timelapse_running_impl(photographer.inner())?;
     let activity = Arc::clone(activity.inner());
-    run_blocking(move || Ok(activity.snapshot(capturing, converter::on_ac_power))).await
+    let low_power_until = boost.low_power_until();
+    let boost = boost.status();
+    run_blocking(move || {
+        let mut snapshot = activity.snapshot(capturing, converter::on_ac_power);
+        snapshot.boost = boost;
+        snapshot.low_power_until = low_power_until;
+        Ok(snapshot)
+    })
+    .await
+}
+
+/// Clear a "Last error" line of the Activity window: the error from `source`
+/// that happened `at` (RFC 3339, as `get_activity` reported it). A newer
+/// error from the same source stays.
+#[tauri::command]
+fn dismiss_error(
+    activity: State<'_, ActivityState>,
+    source: activity::ErrorSource,
+    at: String,
+) -> Result<(), String> {
+    let at = chrono::DateTime::parse_from_rfc3339(&at).map_err(|e| e.to_string())?;
+    activity.dismiss_error(source, at);
+    Ok(())
+}
+
+/// Run conversion and OCR at full speed for `minutes`, on battery too if
+/// `allow_battery`, replacing any boost in progress. Returns the new boost.
+#[tauri::command]
+fn start_boost(
+    boost: State<'_, BoostState>,
+    minutes: u64,
+    allow_battery: bool,
+) -> Result<Option<boost::BoostStatus>, String> {
+    if minutes == 0 {
+        return Err("A boost needs a length".to_string());
+    }
+    boost.start(std::time::Duration::from_secs(minutes.saturating_mul(60)), allow_battery);
+    diagnostics::info("boost", "Boost started")
+        .data(serde_json::json!({ "minutes": minutes, "allowBattery": allow_battery }))
+        .record();
+    Ok(boost.status())
+}
+
+/// End the boost in progress, if any.
+#[tauri::command]
+fn stop_boost(boost: State<'_, BoostState>) {
+    boost.stop();
+    diagnostics::info("boost", "Boost stopped").record();
+}
+
+/// Keep conversion and OCR off for `minutes`, even on AC power, replacing
+/// any boost in progress. Returns when low-power mode ends.
+#[tauri::command]
+fn start_low_power(
+    boost: State<'_, BoostState>,
+    minutes: u64,
+) -> Result<Option<chrono::DateTime<chrono::Local>>, String> {
+    if minutes == 0 {
+        return Err("Low-power mode needs a length".to_string());
+    }
+    boost.start_low_power(std::time::Duration::from_secs(minutes.saturating_mul(60)));
+    diagnostics::info("boost", "Low-power mode started")
+        .data(serde_json::json!({ "minutes": minutes }))
+        .record();
+    Ok(boost.low_power_until())
+}
+
+/// End low-power mode, if it is on.
+#[tauri::command]
+fn stop_low_power(boost: State<'_, BoostState>) {
+    boost.stop_low_power();
+    diagnostics::info("boost", "Low-power mode stopped").record();
+}
+
+/// Let the boost in progress run on battery, or not. Returns the boost.
+#[tauri::command]
+fn set_boost_allow_battery(boost: State<'_, BoostState>, allow_battery: bool) -> Option<boost::BoostStatus> {
+    boost.set_allow_battery(allow_battery);
+    diagnostics::info("boost", "Boost on battery changed")
+        .data(serde_json::json!({ "allowBattery": allow_battery }))
+        .record();
+    boost.status()
+}
+
+/// Records an error the page caught (an uncaught exception or a rejected
+/// promise) in the diagnostics log.
+#[tauri::command]
+fn log_frontend_error(window: tauri::Window, message: String, detail: Option<String>) {
+    diagnostics::error("frontend", message)
+        .data(serde_json::json!({ "window": window.label(), "detail": detail }))
+        .record();
 }
 
 /// The app's settings. Changes apply at once and are saved straight away.
@@ -524,13 +638,176 @@ fn set_update_automatically(
     saved
 }
 
+/// What the viewer showed when the app last quit.
+#[tauri::command]
+fn get_viewer_position(state: State<'_, AppStateStore>) -> ViewerPosition {
+    state.get().viewer
+}
+
+/// Remembers what the viewer shows, to show it again after a relaunch. The
+/// page calls this only once the viewer has settled, not on every frame of a
+/// scrub.
+#[tauri::command]
+fn set_viewer_position(position: ViewerPosition, state: State<'_, AppStateStore>) {
+    state.update(|s| s.viewer = position);
+}
+
+/// The usable area of each screen (without the menu bar and Dock), in
+/// logical pixels, with the primary screen first.
+fn screens<R: Runtime>(app: &AppHandle<R>) -> Vec<Rect> {
+    let primary = app.primary_monitor().ok().flatten().map(|m| m.name().cloned());
+    let mut monitors = app.available_monitors().unwrap_or_default();
+    if let Some(primary) = primary {
+        monitors.sort_by_key(|m| m.name() != primary.as_ref());
+    }
+    monitors
+        .iter()
+        .map(|m| {
+            let scale = m.scale_factor();
+            let area = m.work_area();
+            Rect {
+                x: area.position.x as f64 / scale,
+                y: area.position.y as f64 / scale,
+                width: area.size.width as f64 / scale,
+                height: area.size.height as f64 / scale,
+            }
+        })
+        .collect()
+}
+
+/// Where to open the window `label`: where it was last, moved onto a screen
+/// if that place is out of reach now. `None` the first time.
+fn saved_place<R: Runtime>(app: &AppHandle<R>, label: &str) -> Option<Rect> {
+    let saved = app.try_state::<AppStateStore>()?.window(label)?;
+    let rect = Rect {
+        x: saved.x,
+        y: saved.y,
+        width: saved.width,
+        height: saved.height,
+    };
+    Some(app_state::fit(rect, &screens(app)))
+}
+
+/// Records where `window` is and how big, and that it is open. A minimised
+/// or full-screen window keeps the place it had before.
+fn remember_place<R: Runtime>(window: &tauri::Window<R>) {
+    let Some(state) = window.try_state::<AppStateStore>() else { return };
+    let place = || -> tauri::Result<Option<Rect>> {
+        if window.is_minimized()? || window.is_fullscreen()? {
+            return Ok(None);
+        }
+        let scale = window.scale_factor()?;
+        let position = window.outer_position()?.to_logical::<f64>(scale);
+        let size = window.inner_size()?.to_logical::<f64>(scale);
+        if size.width <= 0.0 || size.height <= 0.0 {
+            return Ok(None);
+        }
+        Ok(Some(Rect {
+            x: position.x,
+            y: position.y,
+            width: size.width,
+            height: size.height,
+        }))
+    };
+    match place() {
+        Ok(Some(rect)) => state.set_window(window.label(), rect),
+        Ok(None) => {}
+        Err(e) => eprintln!("Could not read where the {} window is: {}", window.label(), e),
+    }
+}
+
+/// Keeps track of where the app's windows are and which are open.
+fn on_window_event<R: Runtime>(window: &tauri::Window<R>, event: &tauri::WindowEvent) {
+    if ![MAIN_WINDOW, ACTIVITY_WINDOW, SETTINGS_WINDOW, ABOUT_WINDOW].contains(&window.label()) {
+        return;
+    }
+    match event {
+        tauri::WindowEvent::Moved(_) | tauri::WindowEvent::Resized(_) => remember_place(window),
+        // Quitting closes no window this way, so whatever is open when the
+        // app quits stays marked open.
+        tauri::WindowEvent::CloseRequested { .. } => {
+            if let Some(state) = window.try_state::<AppStateStore>() {
+                state.set_open(window.label(), false);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Opens the main window, from its entry in `tauri.conf.json` (which has
+/// `create: false` so it can be placed before it appears).
+fn open_main_window<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
+    let config = app
+        .config()
+        .app
+        .windows
+        .iter()
+        .find(|w| w.label == MAIN_WINDOW)
+        .cloned()
+        .unwrap_or_default();
+    let mut builder = WebviewWindowBuilder::from_config(app, &config)?;
+    if let Some(place) = saved_place(app, MAIN_WINDOW) {
+        builder = builder
+            .position(place.x, place.y)
+            .inner_size(place.width, place.height);
+    }
+    let window = builder.build()?;
+    remember_place(&window.as_ref().window());
+    Ok(())
+}
+
+/// Puts the windows back the way they were when the app quit. The Activity
+/// and Settings windows open without taking focus, and before the main
+/// window, so the main window ends up in front and focused, as on a first
+/// launch.
+fn restore_windows<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
+    let saved = app.state::<AppStateStore>().get();
+    let was_open = |label: &str| saved.windows.get(label).is_some_and(|w| w.open);
+    if was_open(ACTIVITY_WINDOW) {
+        if let Err(e) = show_activity_window(app, Opening::Restored) {
+            eprintln!("Could not reopen the Activity window: {}", e);
+        }
+    }
+    if was_open(SETTINGS_WINDOW) {
+        if let Err(e) = show_settings_window(app, Opening::Restored) {
+            eprintln!("Could not reopen the Settings window: {}", e);
+        }
+    }
+    open_main_window(app)
+}
+
+/// Whether a window opens because someone asked for it, or because it was
+/// open when the app last quit.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Opening {
+    Asked,
+    Restored,
+}
+
+/// What has to happen before the app quits or relaunches, however it does:
+/// ffmpeg is a separate process and would outlive the app, and the window
+/// state is otherwise written a second after the last change.
+pub(crate) fn before_quit<R: Runtime>(app: &AppHandle<R>) {
+    converter::kill_running_encode();
+    if let Some(state) = app.try_state::<AppStateStore>() {
+        state.save_now();
+    }
+    diagnostics::info("app", "Quit").record();
+    diagnostics::flush(std::time::Duration::from_secs(1));
+}
+
 /// The standard menu bar, with "Check for Updates…" and "Settings…" (⌘,)
 /// under About in the app menu, and "Activity" added to the Window menu.
+/// About opens the app's own About window, which has the change log, instead
+/// of the standard About panel.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn app_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     let menu = Menu::default(app)?;
     // On macOS the first submenu is the app menu, which starts with About.
     if let Some(MenuItemKind::Submenu(app_submenu)) = menu.items()?.first() {
+        app_submenu.remove_at(0)?;
+        let about = format!("About {}", app.package_info().name);
+        app_submenu.insert(&MenuItem::with_id(app, ABOUT_WINDOW, about, true, None::<&str>)?, 0)?;
         app_submenu.insert(
             &MenuItem::with_id(
                 app,
@@ -556,47 +833,71 @@ fn app_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
 
 /// Bring the Settings window to the front, opening it if it isn't open. Like
 /// a macOS settings window it has no Save button and doesn't resize.
-fn show_settings_window<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
+fn show_settings_window<R: Runtime>(app: &AppHandle<R>, opening: Opening) -> tauri::Result<()> {
     if let Some(window) = app.get_webview_window(SETTINGS_WINDOW) {
         window.unminimize()?;
         window.show()?;
         return window.set_focus();
     }
-    // It opens hidden, and `grow_settings_window` shows it once it is sized to
-    // its content, so it never visibly jumps. Shown anyway after a second in
-    // case the page never gets that far.
-    let window =
+    // It opens where it was last, at the height it had then, which is the
+    // height its content needed then. Only the width is fixed.
+    let place = saved_place(app, SETTINGS_WINDOW);
+    let restored = opening == Opening::Restored;
+    // Asked for, it opens hidden, and `grow_settings_window` shows it once
+    // it is sized to its content, so it never visibly jumps. Shown anyway
+    // after a second in case the page never gets that far. Showing a window
+    // focuses it, so one reopened at launch is visible from the start
+    // instead, without focus.
+    let mut builder =
         WebviewWindowBuilder::new(app, SETTINGS_WINDOW, WebviewUrl::App("index.html".into()))
             .title("Settings")
-            .inner_size(SETTINGS_WIDTH, 140.0)
+            .inner_size(SETTINGS_WIDTH, place.map_or(SETTINGS_HEIGHT, |p| p.height))
             .resizable(false)
             .minimizable(false)
             .maximizable(false)
-            .visible(false)
-            .build()?;
-    tauri::async_runtime::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        let _ = window.show();
-    });
+            .visible(restored)
+            .focused(!restored);
+    if let Some(place) = place {
+        builder = builder.position(place.x, place.y);
+    }
+    let window = builder.build()?;
+    remember_place(&window.as_ref().window());
+    if !restored {
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            let _ = window.show();
+        });
+    }
     Ok(())
 }
 
 /// Width of the Settings window, in logical pixels.
 const SETTINGS_WIDTH: f64 = 440.0;
+/// Its height the first time it opens, before it is fitted to its content.
+const SETTINGS_HEIGHT: f64 = 140.0;
 
 /// Makes the Settings window `by` logical pixels taller (shorter when
 /// negative) and shows it. The page asks for the difference between its
 /// content and its viewport rather than for a height, because what
 /// `set_size` sets on macOS is not the viewport's height (on Nino's Mac a
 /// 170pt window showed about 138pt of page), so only a change is reliable.
+/// The top-left corner stays where it is, so a window reopened where it was
+/// last stays there.
 #[tauri::command]
 fn grow_settings_window(by: f64, window: tauri::WebviewWindow) -> Result<(), String> {
     let resize = || -> tauri::Result<()> {
         if by.abs() >= 0.5 {
+            let corner = window.outer_position()?;
             let size = window.inner_size()?.to_logical::<f64>(window.scale_factor()?);
             window.set_size(tauri::LogicalSize::new(size.width, (size.height + by).round()))?;
+            window.set_position(corner)?;
         }
-        window.show()
+        // Already visible means it was reopened at launch, without focus;
+        // showing it again would take focus from the main window.
+        if !window.is_visible()? {
+            window.show()?;
+        }
+        Ok(())
     };
     resize().map_err(|e| e.to_string())
 }
@@ -604,17 +905,51 @@ fn grow_settings_window(by: f64, window: tauri::WebviewWindow) -> Result<(), Str
 /// Bring the Activity window to the front, opening it if it isn't open. It
 /// loads the same page as the main window, which picks the view by the
 /// window's label.
-fn show_activity_window<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
+fn show_activity_window<R: Runtime>(app: &AppHandle<R>, opening: Opening) -> tauri::Result<()> {
     if let Some(window) = app.get_webview_window(ACTIVITY_WINDOW) {
         window.unminimize()?;
         window.show()?;
         return window.set_focus();
     }
-    WebviewWindowBuilder::new(app, ACTIVITY_WINDOW, WebviewUrl::App("index.html".into()))
-        .title("Activity")
-        .inner_size(460.0, 700.0)
-        .min_inner_size(360.0, 360.0)
-        .build()?;
+    let mut builder =
+        WebviewWindowBuilder::new(app, ACTIVITY_WINDOW, WebviewUrl::App("index.html".into()))
+            .title("Activity")
+            .inner_size(460.0, 700.0)
+            .min_inner_size(360.0, 360.0)
+            .focused(opening == Opening::Asked);
+    if let Some(place) = saved_place(app, ACTIVITY_WINDOW) {
+        builder = builder
+            .position(place.x, place.y)
+            .inner_size(place.width, place.height);
+    }
+    let window = builder.build()?;
+    remember_place(&window.as_ref().window());
+    Ok(())
+}
+
+/// Bring the About window to the front, opening it if it isn't open. It opens
+/// where it was last, but unlike the Activity and Settings windows it isn't
+/// reopened at launch.
+fn show_about_window<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
+    if let Some(window) = app.get_webview_window(ABOUT_WINDOW) {
+        window.unminimize()?;
+        window.show()?;
+        return window.set_focus();
+    }
+    let mut builder =
+        WebviewWindowBuilder::new(app, ABOUT_WINDOW, WebviewUrl::App("index.html".into()))
+            .title(format!("About {}", app.package_info().name))
+            .inner_size(420.0, 560.0)
+            .min_inner_size(320.0, 320.0)
+            .minimizable(false)
+            .maximizable(false);
+    if let Some(place) = saved_place(app, ABOUT_WINDOW) {
+        builder = builder
+            .position(place.x, place.y)
+            .inner_size(place.width, place.height);
+    }
+    let window = builder.build()?;
+    remember_place(&window.as_ref().window());
     Ok(())
 }
 
@@ -635,11 +970,13 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(photographer_state)
         .manage(activity)
+        .manage(BoostState::default())
         .manage(UpdaterState::default())
         .on_menu_event(|app, event| {
             let opened = match event.id().as_ref() {
-                ACTIVITY_WINDOW => show_activity_window(app),
-                SETTINGS_WINDOW => show_settings_window(app),
+                ACTIVITY_WINDOW => show_activity_window(app, Opening::Asked),
+                SETTINGS_WINDOW => show_settings_window(app, Opening::Asked),
+                ABOUT_WINDOW => show_about_window(app),
                 CHECK_FOR_UPDATES => {
                     updater::check_from_menu(app.clone());
                     Ok(())
@@ -650,6 +987,7 @@ pub fn run() {
                 eprintln!("Could not open the {} window: {}", event.id().as_ref(), e);
             }
         })
+        .on_window_event(on_window_event)
         .register_asynchronous_uri_scheme_protocol("frames", |ctx, request, responder| {
             let source = ctx
                 .app_handle()
@@ -664,6 +1002,16 @@ pub fn run() {
         })
         .setup(|app| {
             app.manage(SettingsStore::load(app.path().app_config_dir().ok()));
+            // Per profile, like the library: the viewer position names a day
+            // in one library, and a dev build shouldn't move the release
+            // build's windows.
+            app.manage(AppStateStore::load(
+                app.path()
+                    .app_config_dir()
+                    .ok()
+                    .map(|dir| dir.join(paths::TIMELAPSE_DIR_NAME)),
+            ));
+            restore_windows(app.handle())?;
             updater::spawn(app.handle().clone());
 
             // Create the library up front. The frontend calls readDir on it
@@ -675,6 +1023,20 @@ pub fn run() {
                 Some(root) => {
                     if let Err(e) = std::fs::create_dir_all(&root) {
                         eprintln!("Failed to create {:?}: {}", root, e);
+                    }
+                    match diagnostics::init(&root) {
+                        Ok(()) => {
+                            diagnostics::record_panics();
+                            diagnostics::info("app", "Started")
+                                .data(serde_json::json!({
+                                    "version": app.package_info().version.to_string(),
+                                    "debug": cfg!(debug_assertions),
+                                    "os": std::env::consts::OS,
+                                    "arch": std::env::consts::ARCH,
+                                }))
+                                .record();
+                        }
+                        Err(e) => eprintln!("Could not open the diagnostics log: {}", e),
                     }
                     // Per-profile, like the library, so a dev build never
                     // serves frames cached from the real one. A failure here
@@ -702,16 +1064,28 @@ pub fn run() {
                         Ok(source) => {
                             app.manage::<FrameSourceState>(Arc::new(source));
                         }
-                        Err(e) => eprintln!("Failed to set up the frame source: {}", e),
+                        Err(e) => {
+                            eprintln!("Failed to set up the frame source: {}", e);
+                            diagnostics::error("app", format!("Failed to set up the frame source: {}", e)).record();
+                        }
                     }
                 }
                 None => eprintln!("Unable to find home directory"),
             }
 
+            // Scratch space for OCR's decoded video frames, per profile like
+            // the frame cache.
+            let ocr_dir = app
+                .path()
+                .app_cache_dir()
+                .ok()
+                .map(|dir| dir.join(paths::TIMELAPSE_DIR_NAME).join("ocr"));
+
             // Start timelapse automatically when app is ready
             let photographer_state = app.state::<PhotographerState>();
             let state_clone = Arc::clone(&photographer_state.inner());
             let activity = Arc::clone(app.state::<ActivityState>().inner());
+            let boost = Arc::clone(app.state::<BoostState>().inner());
 
             tauri::async_runtime::spawn(async move {
                 tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
@@ -732,6 +1106,7 @@ pub fn run() {
                     }
                     Err(e) => {
                         eprintln!("Failed to start timelapse automatically: {}", e);
+                        diagnostics::error("capture", format!("Failed to start: {}", e)).record();
                     }
                 }
 
@@ -747,9 +1122,10 @@ pub fn run() {
                             ocr::ocr_check(&root),
                         )
                         .reporting_to(Arc::clone(&activity))
+                        .boosted_by(Arc::clone(&boost))
                         .start();
 
-                        if ocr::start_background_ocr(root, activity) {
+                        if ocr::start_background_ocr(root, ocr_dir, activity, boost) {
                             println!("OCR started");
                         } else {
                             println!("OCR is not available on this platform");
@@ -781,12 +1157,26 @@ pub fn run() {
             count_ocr_matches,
             get_ocr_version,
             get_activity,
+            dismiss_error,
+            start_boost,
+            stop_boost,
+            start_low_power,
+            stop_low_power,
+            set_boost_allow_battery,
+            log_frontend_error,
             get_settings,
             set_update_automatically,
+            get_viewer_position,
+            set_viewer_position,
             grow_settings_window
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            if let tauri::RunEvent::Exit = event {
+                before_quit(app);
+            }
+        });
 }
 
 #[cfg(test)]
@@ -1161,6 +1551,39 @@ mod tests {
         assert!(search_ocr_day_impl(library.path(), &source, "2026-10-04", "")
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn test_search_ocr_day_places_video_positions_on_the_scrubber() {
+        let library = TempDir::new().unwrap();
+        // A day that only exists as one of the old script's videos, 6 frames.
+        let made = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-f", "lavfi", "-i", "color=c=gray:s=32x32:r=15"])
+            .args(["-frames:v", "6", "-c:v", "libx264", "-pix_fmt", "yuv420p"])
+            .arg(library.path().join("2024-12-20--23-00-00.mov"))
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if !made {
+            eprintln!("skipping: ffmpeg with libx264 is not available");
+            return;
+        }
+        let db = ScreenshotDatabase::new(library.path().join("screenshots.db")).unwrap();
+        db.record_video_ocr_frame("2024-12-20", 1, Some(("cargo build", &[]))).unwrap();
+        db.record_video_ocr_frame("2024-12-20", 3, Some(("bun test", &[]))).unwrap();
+        db.record_video_ocr_frame("2024-12-20", 5, Some(("cargo test", &[]))).unwrap();
+        db.record_video_ocr_frame("2024-12-20", 6, None).unwrap();
+        let (_cache, source) = frame_source_in(library.path());
+
+        let matches = search_ocr_day_impl(library.path(), &source, "2024-12-20", "cargo").unwrap();
+        assert_eq!(
+            matches,
+            vec![
+                DayMatch { index: 0, end_index: 2, frame: 1 },
+                // Runs to the last frame OCR handled, the day's last.
+                DayMatch { index: 4, end_index: 6, frame: 5 },
+            ]
+        );
     }
 
     #[test]

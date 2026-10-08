@@ -4,15 +4,40 @@ import { invoke } from "@tauri-apps/api/core";
 export const ACTIVITY_WINDOW = "activity";
 
 /** What a background loop is doing. Mirrors `State` in `activity.rs`. */
-export type WorkState = "starting" | "working" | "idle" | "resting" | "onBattery" | "unavailable";
+export type WorkState = "starting" | "working" | "idle" | "resting" | "onBattery" | "lowPower" | "unavailable";
 
 /** Times are RFC 3339 with the local offset. */
 export type FrameRef = { day: string; number: number; at: string };
 export type Failure = { at: string; message: string };
 
+/** A batch being encoded. Mirrors `Encoding` in `activity.rs`. */
+export type Encoding = {
+  video: string;
+  day: string;
+  hour: number;
+  frames: number;
+  startedAt: string;
+  /** Frames ffmpeg has encoded so far. */
+  framesDone: number;
+  /** When the encode was paused (unplugged), while it is. */
+  pausedSince: string | null;
+  /** Seconds spent paused before `pausedSince`. */
+  pausedSecs: number;
+};
+
+/** A boost in progress. Mirrors `BoostStatus` in `boost.rs`. */
+export type Boost = {
+  until: string;
+  /** Whether conversion and OCR also run on battery. */
+  allowBattery: boolean;
+};
+
 /** Mirrors `Snapshot` in `activity.rs`. */
 export type Activity = {
   onAcPower: boolean | null;
+  boost: Boost | null;
+  /** When low-power mode ends, while it is on. */
+  lowPowerUntil: string | null;
   capture: {
     running: boolean;
     lastFrame: FrameRef | null;
@@ -26,7 +51,7 @@ export type Activity = {
   };
   conversion: {
     state: WorkState;
-    current: { video: string; day: string; hour: number; frames: number; startedAt: string } | null;
+    current: Encoding | null;
     nextCheckAt: string | null;
     ready: number;
     waitingForOcr: number;
@@ -42,11 +67,46 @@ export type Activity = {
     skipped: number;
     nextCheckAt: string | null;
     lastError: Failure | null;
+    /** The current pass reads days that only exist as video; `current.number` is then a position in the day's videos. */
+    readingVideo: boolean;
+    /** Video-only days still to read, as of the last pass over them; null until OCR first gets to them. */
+    videoDaysLeft: number | null;
   };
 };
 
 export function getActivity(): Promise<Activity> {
   return invoke<Activity>("get_activity");
+}
+
+/** Run conversion and OCR at full speed for `minutes`, replacing any boost in progress. */
+/** Which "Last error" line. Mirrors `ErrorSource` in `activity.rs`. */
+export type ErrorSource = "capture" | "ocr";
+
+/** Clear the error from `source` reported at `at`; a newer one stays. */
+export function dismissError(source: ErrorSource, at: string): Promise<void> {
+  return invoke<void>("dismiss_error", { source, at });
+}
+
+export function startBoost(minutes: number, allowBattery: boolean): Promise<Boost | null> {
+  return invoke<Boost | null>("start_boost", { minutes, allowBattery });
+}
+
+export function stopBoost(): Promise<void> {
+  return invoke<void>("stop_boost");
+}
+
+/** Keep conversion and OCR off for `minutes`, even on AC power, replacing any boost in progress. */
+export function startLowPower(minutes: number): Promise<string | null> {
+  return invoke<string | null>("start_low_power", { minutes });
+}
+
+export function stopLowPower(): Promise<void> {
+  return invoke<void>("stop_low_power");
+}
+
+/** Let the boost in progress run on battery, or not. */
+export function setBoostAllowBattery(allowBattery: boolean): Promise<Boost | null> {
+  return invoke<Boost | null>("set_boost_allow_battery", { allowBattery });
 }
 
 /** A length of time, to the second under an hour: "45s", "3m 05s", "2h 14m". */
@@ -67,6 +127,31 @@ export function ago(time: string, now: number): string {
 export function until(time: string, now: number): string {
   const seconds = (Date.parse(time) - now) / 1000;
   return seconds < 1 ? "any moment now" : `in ${formatDuration(seconds)}`;
+}
+
+/** Seconds an encode has spent encoding, as of `now`: time paused doesn't count. */
+export function encodeSeconds(encoding: Encoding, now: number): number {
+  const pausedNow = encoding.pausedSince ? (now - Date.parse(encoding.pausedSince)) / 1000 : 0;
+  return (now - Date.parse(encoding.startedAt)) / 1000 - encoding.pausedSecs - pausedNow;
+}
+
+/**
+ * How far along an encode is, as a whole percentage, and an estimate of the
+ * seconds left at the rate so far (null until there is a rate to go by, and
+ * while the encode is paused).
+ */
+export function encodeProgress(
+  encoding: Encoding,
+  now: number,
+): { percent: number; secondsLeft: number | null } {
+  const { frames, framesDone } = encoding;
+  const percent = frames > 0 ? Math.floor((framesDone / frames) * 100) : 0;
+  const elapsed = encodeSeconds(encoding, now);
+  const secondsLeft =
+    framesDone > 0 && elapsed >= 10 && !encoding.pausedSince
+      ? ((frames - framesDone) * elapsed) / framesDone
+      : null;
+  return { percent, secondsLeft };
 }
 
 /** "3 frames", "1 frame". */

@@ -25,6 +25,7 @@ use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 use tauri_plugin_updater::{Update, UpdaterExt};
 use tokio::sync::{Mutex, Notify};
 
+use crate::diagnostics;
 use crate::settings::SettingsStore;
 
 /// How often to look for a new release. Every push to `main` is one.
@@ -79,6 +80,7 @@ pub fn spawn(app: AppHandle) {
         while window_is_focused(&app) {
             tokio::time::sleep(RELAUNCH_POLL).await;
         }
+        crate::before_quit(&app);
         app.restart();
     });
 }
@@ -100,7 +102,13 @@ async fn install_newer(app: &AppHandle, updater: &Updater) -> Result<Option<Stri
 
 async fn check(app: &AppHandle) -> Result<Option<Update>, String> {
     let updater = app.updater().map_err(|e| e.to_string())?;
-    updater.check().await.map_err(|e| e.to_string())
+    let checked = updater.check().await.map_err(|e| e.to_string());
+    match &checked {
+        Ok(Some(update)) => diagnostics::info("updater", format!("Found {}", update.version)).record(),
+        Ok(None) => {}
+        Err(e) => diagnostics::warn("updater", format!("Check failed: {}", e)).record(),
+    }
+    checked
 }
 
 async fn install(update: &Update) -> Result<(), String> {
@@ -108,13 +116,25 @@ async fn install(update: &Update) -> Result<(), String> {
         "Installing update {} (running {})",
         update.version, update.current_version
     );
-    if !can_install_silently() {
-        return install_with_password(update).await;
-    }
-    update
-        .download_and_install(|_, _| {}, || {})
-        .await
-        .map_err(|e| e.to_string())
+    let started = std::time::Instant::now();
+    let silently = can_install_silently();
+    let installed = if silently {
+        update
+            .download_and_install(|_, _| {}, || {})
+            .await
+            .map_err(|e| e.to_string())
+    } else {
+        install_with_password(update).await
+    };
+    let event = match &installed {
+        Ok(()) => diagnostics::info("updater", format!("Installed {}", update.version)),
+        Err(e) => diagnostics::warn("updater", format!("Could not install {}: {}", update.version, e)),
+    };
+    event
+        .took(started.elapsed())
+        .data(serde_json::json!({ "from": update.current_version, "withPassword": !silently }))
+        .record();
+    installed
 }
 
 /// Installs an update into a folder this account can't write to. The plugin
@@ -249,6 +269,7 @@ pub fn check_from_menu(app: AppHandle) {
         match install(&update).await {
             Ok(()) => {
                 *installed = Some(version);
+                crate::before_quit(&app);
                 app.restart();
             }
             Err(e) if cancelled(&e) => {}
@@ -271,6 +292,7 @@ fn offer_relaunch(app: &AppHandle, version: &str) {
         ))
         .blocking_show();
     if relaunch {
+        crate::before_quit(app);
         app.restart();
     }
 }

@@ -7,6 +7,7 @@ import { frameUrl, type Day } from './frames';
 import * as library from './hooks/useLibrary';
 import * as ocrSearch from './hooks/useOcrSearch';
 import type { DayCount, DayMatch, LineBox } from './search';
+import * as viewerPosition from './viewerPosition';
 
 // Spied on rather than replaced with `mock.module`: Bun runs every test file in
 // one process, and a module mock would also replace the real hooks and
@@ -19,8 +20,10 @@ const useMatchCounts = spyOn(ocrSearch, 'useMatchCounts');
 const useMatchLines = spyOn(ocrSearch, 'useMatchLines');
 const useOcrVersion = spyOn(ocrSearch, 'useOcrVersion');
 const getPendingFrames = spyOn(frames, 'getPendingFrames');
+const setViewerPosition = spyOn(viewerPosition, 'setViewerPosition');
 
 afterAll(() => {
+  setViewerPosition.mockRestore();
   useDays.mockRestore();
   useDay.mockRestore();
   getFrameTime.mockRestore();
@@ -135,6 +138,7 @@ describe('App', () => {
     getFrameTime.mockResolvedValue(null);
     mockSearch('', {});
     getPendingFrames.mockResolvedValue({ frameCount: 0, ranges: [] });
+    setViewerPosition.mockResolvedValue(undefined);
   });
 
   describe('Library states', () => {
@@ -219,6 +223,56 @@ describe('App', () => {
       fireEvent.keyDown(screen.getByRole('listbox'), { key: 'ArrowLeft' });
       expect(position()).toBe('3 / 3');
       await settleFrameTime();
+    });
+  });
+
+  describe('Remembering what was on screen', () => {
+    it('reopens the day and frame shown when the app quit', async () => {
+      mockLibrary({ '2024-12-20': 10, '2026-10-04': 3 });
+      render(<App initialPosition={{ day: '2024-12-20', index: 4 }} />);
+      await waitFor(() => expect(shownFrame()).toBe(frameUrl('2024-12-20', 4)));
+      expect(dayPicker()).toHaveTextContent('2024-12-20');
+      expect(position()).toBe('5 / 10');
+      // The newest day's frames were never asked for.
+      expect(useDay).not.toHaveBeenCalledWith('2026-10-04');
+    });
+
+    it("reopens a day's last frame when that is where it was", async () => {
+      mockLibrary({ '2024-12-20': 10, '2026-10-04': 3 });
+      render(<App initialPosition={{ day: '2024-12-20', index: null }} />);
+      await waitFor(() => expect(shownFrame()).toBe(frameUrl('2024-12-20', 9)));
+    });
+
+    it('opens the newest day when the saved one is gone', async () => {
+      mockLibrary({ '2024-12-20': 10, '2026-10-04': 3 });
+      render(<App initialPosition={{ day: '2023-01-01', index: 4 }} />);
+      await waitFor(() => expect(shownFrame()).toBe(frameUrl('2026-10-04', 2)));
+      expect(position()).toBe('3 / 3');
+    });
+
+    it('saves the frame once the scrubber stops, not every frame it passes', async () => {
+      mockLibrary({ '2024-12-20': 10, '2026-10-04': 100 });
+      render(<App />);
+      await waitFor(() => expect(shownFrame()).toBe(frameUrl('2026-10-04', 99)));
+      finishLoading();
+      for (const value of ['50', '40', '30', '5']) {
+        fireEvent.change(screen.getByRole('slider'), { target: { value } });
+      }
+      await waitFor(() => expect(setViewerPosition).toHaveBeenCalled(), { timeout: 2000 });
+      expect(setViewerPosition).toHaveBeenCalledTimes(1);
+      expect(setViewerPosition).toHaveBeenCalledWith({ day: '2026-10-04', index: 5 });
+    });
+
+    it("saves following the newest day's live edge as such", async () => {
+      mockLibrary({ '2024-12-20': 10, '2026-10-04': 100 });
+      render(<App />);
+      await waitFor(() => expect(setViewerPosition).toHaveBeenCalled(), { timeout: 2000 });
+      expect(setViewerPosition).toHaveBeenLastCalledWith({ day: null, index: null });
+      setViewerPosition.mockClear();
+
+      await pickDay('2024-12-20');
+      await waitFor(() => expect(setViewerPosition).toHaveBeenCalled(), { timeout: 2000 });
+      expect(setViewerPosition).toHaveBeenLastCalledWith({ day: '2024-12-20', index: null });
     });
   });
 

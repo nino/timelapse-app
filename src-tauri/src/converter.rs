@@ -6,7 +6,8 @@
 //! all of it, and one batch runs at a time, starting at most once every ten
 //! minutes, so a backlog (say, after a stretch on battery) is worked off
 //! quickly once OCR has caught up. Nothing is encoded unless the machine is on
-//! AC power, and an encode in progress is killed if the power is unplugged.
+//! AC power, and an encode in progress is paused while the power is unplugged.
+//! A boost (see `boost.rs`) lifts these limits for a while.
 //!
 //! An hour whose video exists counts as converted. Its PNGs are then deleted,
 //! as the scripts did, once `OcrCheck` still agrees that OCR has read them.
@@ -26,6 +27,7 @@
 //! run clears.
 
 use crate::activity::{Activity, Encoding, State};
+use crate::boost::{self, Boost};
 use crate::database::ScreenshotDatabase;
 use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, TimeZone, Timelike};
 use frame_source::filed_at;
@@ -33,7 +35,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Frames per second of the output video, as in `timelapse-to-video`.
@@ -60,8 +62,21 @@ const IDLE_POLL: Duration = Duration::from_secs(5 * 60);
 /// How long to wait before re-checking the power source while on battery.
 const ON_BATTERY_POLL: Duration = Duration::from_secs(60);
 
-/// How often a running encode re-checks the power source and the stop flag.
+/// How long to wait before looking again when there is nothing to convert
+/// during a boost, when OCR may finish an hour at any moment.
+const BOOSTED_IDLE_POLL: Duration = Duration::from_secs(30);
+
+/// How often a running encode re-checks the power source.
 const ENCODE_POWER_CHECK: Duration = Duration::from_secs(30);
+
+/// How often a running encode checks the stop flag and whether a boost
+/// started or ended.
+const ENCODE_CHECK: Duration = Duration::from_secs(1);
+
+/// The ffmpeg process of the encode in progress, if any. ffmpeg is a separate
+/// process, so quitting the app would leave it running, encoding into a
+/// staging folder the next launch deletes; `kill_running_encode` stops it.
+static RUNNING_ENCODE: Mutex<Option<Child>> = Mutex::new(None);
 
 /// Prefix of the staging folders under `.cache`.
 const STAGING_PREFIX: &str = ".convert-";
@@ -142,15 +157,36 @@ impl std::fmt::Display for ConvertError {
 /// have no battery check and always report `true`.
 pub fn on_ac_power() -> bool {
     if cfg!(target_os = "macos") {
-        Command::new("pmset")
+        let reading = Command::new("pmset")
             .args(["-g", "ps"])
             .output()
             .ok()
             .filter(|output| output.status.success())
-            .and_then(|output| parse_pmset_power_source(&String::from_utf8_lossy(&output.stdout)))
-            .unwrap_or(false)
+            .and_then(|output| parse_pmset_power_source(&String::from_utf8_lossy(&output.stdout)));
+        log_power_change(reading);
+        reading.unwrap_or(false)
     } else {
         true
+    }
+}
+
+/// Log a change in the power source, or in whether it could be read at all.
+/// Several loops ask, so the last reading is shared.
+fn log_power_change(reading: Option<bool>) {
+    use std::sync::atomic::AtomicU8;
+    // 0: not read yet, 1: unreadable, 2: battery, 3: AC.
+    static LAST: AtomicU8 = AtomicU8::new(0);
+    let code = match reading {
+        None => 1,
+        Some(false) => 2,
+        Some(true) => 3,
+    };
+    if LAST.swap(code, Ordering::Relaxed) != code {
+        match reading {
+            None => crate::diagnostics::warn("power", "Could not read the power source").record(),
+            Some(false) => crate::diagnostics::info("power", "On battery").record(),
+            Some(true) => crate::diagnostics::info("power", "On AC power").record(),
+        }
     }
 }
 
@@ -289,7 +325,11 @@ pub fn delete_frames(parts: &[HourBatch]) -> usize {
     for frame in parts.iter().flat_map(|batch| &batch.frames) {
         match std::fs::remove_file(&frame.path) {
             Ok(()) => deleted += 1,
-            Err(e) => eprintln!("Could not delete converted frame {:?}: {}", frame.path, e),
+            Err(e) => {
+                eprintln!("Could not delete converted frame {:?}: {}", frame.path, e);
+                crate::diagnostics::warn("converter", format!("Could not delete converted frame {:?}: {}", frame.path, e))
+                    .record();
+            }
         }
     }
     deleted
@@ -472,6 +512,7 @@ pub fn convert_batch(
         // hour's PNGs are only deleted once the record has been written.
         if let Err(e) = record_frames(root, std::slice::from_ref(batch), false) {
             eprintln!("Could not record the frames of {}; will retry before deleting them: {}", video_name, e);
+            crate::diagnostics::warn("converter", format!("Could not record the frames of {}: {}", video_name, e)).record();
         }
         std::fs::rename(&staged_video, &published)
             .map_err(|e| failed("Failed to publish video", e))?;
@@ -487,7 +528,8 @@ pub fn convert_batch(
 fn ffmpeg_command(frames_dir: &Path, output: &Path) -> Command {
     // On macOS, run ffmpeg under the background QoS policy: the scheduler
     // throttles it and, on Apple Silicon, keeps it on the efficiency cores,
-    // which is most of what keeps the machine cool while it encodes.
+    // which is most of what keeps the machine cool while it encodes. A boost
+    // lifts that while it lasts (`set_background`).
     let mut command = if cfg!(target_os = "macos") {
         let mut command = Command::new("taskpolicy");
         command.arg("-b").arg(crate::paths::ffmpeg());
@@ -496,7 +538,10 @@ fn ffmpeg_command(frames_dir: &Path, output: &Path) -> Command {
         Command::new(crate::paths::ffmpeg())
     };
     command
-        .args(["-y", "-loglevel", "error", "-framerate", FRAMERATE, "-i"])
+        // `-progress pipe:1` reports `frame=N` on stdout, for the Activity
+        // window's percentage.
+        .args(["-y", "-loglevel", "error", "-nostats", "-progress", "pipe:1"])
+        .args(["-framerate", FRAMERATE, "-i"])
         .arg(frames_dir.join("%05d.png"))
         .args(["-c:v", "libx265", "-crf", "28", "-preset", "veryslow", "-vf"])
         .arg(
@@ -508,15 +553,98 @@ fn ffmpeg_command(frames_dir: &Path, output: &Path) -> Command {
     command
 }
 
-/// Wait for `child`, killing it if `should_stop` turns true. `should_stop` is
-/// checked every `check_every`; the child's exit is checked every second.
+/// Kill the encode in progress, if there is one. The app calls this when it
+/// quits or restarts; the hour is converted again from the start on the next
+/// launch.
+pub fn kill_running_encode() {
+    kill_encode_in(&RUNNING_ENCODE);
+}
+
+fn kill_encode_in(slot: &Mutex<Option<Child>>) {
+    let mut slot = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(child) = slot.as_mut() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+/// What a running encode should do, as `wait_or_kill`'s `check` decides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Control {
+    Run,
+    /// Freeze ffmpeg where it is (on battery); `Run` lets it carry on.
+    Pause,
+    /// Kill ffmpeg (the converter is stopping).
+    Stop,
+}
+
+/// Put the process `pid` under the background policy `taskpolicy -b` starts
+/// ffmpeg with, or take it out of it. Only macOS has that policy; elsewhere
+/// this does nothing.
+fn set_background(pid: u32, background: bool) {
+    #[cfg(target_os = "macos")]
+    {
+        let priority = if background { libc::PRIO_DARWIN_BG } else { 0 };
+        // SAFETY: only changes the scheduling of `pid`, our own unreaped
+        // child, so it cannot belong to another process.
+        if unsafe { libc::setpriority(libc::PRIO_DARWIN_PROCESS, pid as libc::id_t, priority) } != 0 {
+            let error = std::io::Error::last_os_error();
+            eprintln!("Could not change ffmpeg's priority: {}", error);
+            crate::diagnostics::warn("converter", format!("Could not change ffmpeg's priority: {}", error)).record();
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = (pid, background);
+}
+
+/// Freeze (`SIGSTOP`) or thaw (`SIGCONT`) `child`. Returns whether that
+/// worked; where it can't, the caller kills the encode instead.
+fn set_suspended(child: &Child, suspended: bool) -> bool {
+    #[cfg(unix)]
+    {
+        let signal = if suspended { libc::SIGSTOP } else { libc::SIGCONT };
+        // SAFETY: `kill` only sends a signal; the pid is our own unreaped
+        // child, so it cannot belong to another process.
+        unsafe { libc::kill(child.id() as libc::pid_t, signal) == 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (child, suspended);
+        false
+    }
+}
+
+/// Wait for `child`, asking `check` every `check_every` what it should do:
+/// carry on, pause (frozen until `check` says `Run` again; `on_pause` hears
+/// of each change) or stop (killed). The child's exit is checked every
+/// second. While it runs the child sits in `slot`, where `kill_encode_in` can
+/// reach it.
 fn wait_or_kill(
-    mut child: Child,
+    slot: &Mutex<Option<Child>>,
+    child: Child,
     check_every: Duration,
-    mut should_stop: impl FnMut() -> bool,
+    mut check: impl FnMut() -> Control,
+    mut on_pause: impl FnMut(bool),
+) -> Result<(), ConvertError> {
+    *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(child);
+    let result = wait_in(slot, check_every, &mut check, &mut on_pause);
+    slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take();
+    result
+}
+
+fn wait_in(
+    slot: &Mutex<Option<Child>>,
+    check_every: Duration,
+    check: &mut impl FnMut() -> Control,
+    on_pause: &mut impl FnMut(bool),
 ) -> Result<(), ConvertError> {
     let mut last_check = Instant::now();
+    let mut paused = false;
     loop {
+        let mut guard = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(child) = guard.as_mut() else {
+            return Err(ConvertError::Interrupted);
+        };
         match child.try_wait() {
             Ok(Some(status)) if status.success() => return Ok(()),
             Ok(Some(status)) => {
@@ -533,22 +661,60 @@ fn wait_or_kill(
 
         if last_check.elapsed() >= check_every {
             last_check = Instant::now();
-            if should_stop() {
+            let control = check();
+            let stop = match control {
+                Control::Stop => true,
+                Control::Pause if !paused => {
+                    paused = set_suspended(child, true);
+                    if paused {
+                        on_pause(true);
+                    }
+                    !paused
+                }
+                Control::Run if paused => {
+                    // Should it fail, the next check tries again.
+                    if set_suspended(child, false) {
+                        paused = false;
+                        on_pause(false);
+                    }
+                    false
+                }
+                _ => false,
+            };
+            if stop {
+                // A frozen process still dies of SIGKILL.
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(ConvertError::Interrupted);
             }
         }
+        drop(guard);
 
         std::thread::sleep(Duration::from_secs(1).min(check_every));
     }
 }
 
-/// Encode with ffmpeg, giving up if power is unplugged or `running` clears.
-fn encode_with_ffmpeg(frames_dir: &Path, output: &Path, running: &AtomicBool) -> Result<(), ConvertError> {
-    let child = ffmpeg_command(frames_dir, output)
+/// The frame count in a line of ffmpeg's `-progress` output (`frame=123`).
+fn progress_frame(line: &str) -> Option<usize> {
+    line.trim().strip_prefix("frame=")?.trim().parse().ok()
+}
+
+/// Encode with ffmpeg, pausing while the power is unplugged (unless `boost`
+/// allows battery) and giving up if `running` clears. ffmpeg runs at
+/// background priority except during a boost. `on_progress` is called with
+/// the number of frames encoded so far, and `on_pause` with `true` when the
+/// encode pauses and `false` when it carries on.
+fn encode_with_ffmpeg(
+    frames_dir: &Path,
+    output: &Path,
+    running: &AtomicBool,
+    boost: &Boost,
+    on_progress: impl Fn(usize) + Send + 'static,
+    on_pause: impl FnMut(bool),
+) -> Result<(), ConvertError> {
+    let mut child = ffmpeg_command(frames_dir, output)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         // `-loglevel error` keeps stderr short enough that it cannot fill the
         // pipe while nothing reads it.
         .stderr(Stdio::piped())
@@ -560,9 +726,56 @@ fn encode_with_ffmpeg(frames_dir: &Path, output: &Path, running: &AtomicBool) ->
             ))
         })?;
 
-    wait_or_kill(child, ENCODE_POWER_CHECK, || {
-        !running.load(Ordering::SeqCst) || !on_ac_power()
-    })
+    // Read the progress reports as they come; the thread ends when ffmpeg
+    // exits and closes the pipe.
+    if let Some(stdout) = child.stdout.take() {
+        std::thread::spawn(move || {
+            use std::io::BufRead;
+            for line in std::io::BufReader::new(stdout).lines().map_while(Result::ok) {
+                if let Some(frames) = progress_frame(&line) {
+                    on_progress(frames);
+                }
+            }
+        });
+    }
+
+    // The child is reaped only once it has exited, after which `check` is no
+    // longer called, so its pid stays its own while `check` uses it.
+    let pid = child.id();
+    let mut boosted = false;
+    let mut power: Option<(Instant, bool)> = None;
+    wait_or_kill(
+        &RUNNING_ENCODE,
+        child,
+        ENCODE_CHECK,
+        || {
+            if !running.load(Ordering::SeqCst) {
+                return Control::Stop;
+            }
+            let boosted_now = boost.is_on();
+            if boosted_now != boosted {
+                boosted = boosted_now;
+                set_background(pid, !boosted);
+                // Look at the power again: the boost may allow battery, or
+                // its end may forbid it.
+                power = None;
+            }
+            let may_work = boost.may_work(|| match power {
+                Some((at, on_ac)) if at.elapsed() < ENCODE_POWER_CHECK => on_ac,
+                _ => {
+                    let on_ac = on_ac_power();
+                    power = Some((Instant::now(), on_ac));
+                    on_ac
+                }
+            });
+            if may_work {
+                Control::Run
+            } else {
+                Control::Pause
+            }
+        },
+        on_pause,
+    )
 }
 
 /// Runs batches in the background for as long as it is started.
@@ -571,6 +784,7 @@ pub struct Converter {
     running: Arc<AtomicBool>,
     ocr_done: OcrCheck,
     activity: Arc<Activity>,
+    boost: Arc<Boost>,
 }
 
 impl Converter {
@@ -580,7 +794,14 @@ impl Converter {
             running: Arc::new(AtomicBool::new(false)),
             ocr_done,
             activity: Arc::default(),
+            boost: Arc::default(),
         }
+    }
+
+    /// Follow `boost`: while one is on, run at full speed.
+    pub fn boosted_by(mut self, boost: Arc<Boost>) -> Self {
+        self.boost = boost;
+        self
     }
 
     /// Report progress to `activity`, for the Activity window.
@@ -598,17 +819,21 @@ impl Converter {
         let running = Arc::clone(&self.running);
         let ocr_done = Arc::clone(&self.ocr_done);
         let activity = Arc::clone(&self.activity);
+        let boost = Arc::clone(&self.boost);
 
         tokio::spawn(async move {
             println!("Starting video conversion background task...");
             if let Err(e) = clear_stale_staging(&root) {
                 eprintln!("Failed to clear stale conversion folders: {}", e);
+                crate::diagnostics::warn("converter", format!("Failed to clear stale conversion folders: {}", e)).record();
             }
 
+            let mut boost_changes = boost.subscribe();
             while running.load(Ordering::SeqCst) {
-                let (state, wait) = Self::run_once(&root, &running, &ocr_done, &activity).await;
+                let (state, wait) = Self::run_once(&root, &running, &ocr_done, &activity, &boost).await;
                 activity.converter_sleeps(state, wait);
-                tokio::time::sleep(wait).await;
+                // A boost starting or stopping ends the wait early.
+                boost::wait(&mut boost_changes, wait).await;
             }
 
             println!("Video conversion background task stopped.");
@@ -630,7 +855,8 @@ impl Converter {
         root: &Path,
         running: &Arc<AtomicBool>,
         ocr_done: &OcrCheck,
-        activity: &Activity,
+        activity: &Arc<Activity>,
+        boost: &Arc<Boost>,
     ) -> (State, Duration) {
         let now = Local::now();
 
@@ -642,45 +868,61 @@ impl Converter {
                     // record here, while the PNGs still say what is in them.
                     if let Err(e) = record_frames(root, &parts, true) {
                         eprintln!("Kept the frames of {} {:02}:00: could not record them: {}", parts[0].day, parts[0].hour, e);
+                        crate::diagnostics::warn("converter", format!("Kept the frames of {} {:02}:00: could not record them: {}", parts[0].day, parts[0].hour, e)).record();
                         continue;
                     }
                     match matches_record(root, &parts) {
                         Ok(true) => {}
                         Ok(false) => {
                             eprintln!("Kept the frames of {} {:02}:00: some are not in its video", parts[0].day, parts[0].hour);
+                        crate::diagnostics::warn("converter", format!("Kept the frames of {} {:02}:00: some are not in its video", parts[0].day, parts[0].hour)).record();
                             continue;
                         }
                         Err(e) => {
                             eprintln!("Kept the frames of {} {:02}:00: could not check its video: {}", parts[0].day, parts[0].hour, e);
+                        crate::diagnostics::warn("converter", format!("Kept the frames of {} {:02}:00: could not check its video: {}", parts[0].day, parts[0].hour, e)).record();
                             continue;
                         }
                     }
                     let deleted = delete_frames(&parts);
                     activity.frames_deleted(deleted);
+                    crate::diagnostics::info("converter", "Deleted converted frames")
+                        .data(serde_json::json!({ "day": parts[0].day, "hour": parts[0].hour, "frames": deleted }))
+                        .record();
                     println!("Deleted {} converted frames from {} {:02}:00", deleted, parts[0].day, parts[0].hour);
                 }
             }
-            Err(e) => eprintln!("Failed to scan for converted screenshots: {}", e),
+            Err(e) => {
+                eprintln!("Failed to scan for converted screenshots: {}", e);
+                crate::diagnostics::error("converter", format!("Failed to scan for converted screenshots: {}", e)).record();
+            }
         }
         if let Err(e) = remove_empty_day_folders(root, now) {
             eprintln!("Failed to remove empty day folders: {}", e);
+            crate::diagnostics::warn("converter", format!("Failed to remove empty day folders: {}", e)).record();
         }
 
-        if !on_ac_power() {
-            return (State::OnBattery, ON_BATTERY_POLL);
+        if let Some(left) = boost.low_power_left() {
+            return (State::LowPower, left);
         }
+        if !boost.may_work(on_ac_power) {
+            let poll = if boost.is_on() { boost::BOOSTED_POWER_POLL } else { ON_BATTERY_POLL };
+            return (State::OnBattery, poll);
+        }
+        let idle_poll = if boost.is_on() { BOOSTED_IDLE_POLL } else { IDLE_POLL };
 
         let batch = match read_batches(root, now, ocr_done) {
             Ok((read, waiting_for_ocr)) => {
                 activity.conversion_backlog(read.len().saturating_sub(1), waiting_for_ocr);
                 match read.into_iter().next() {
                     Some(batch) => batch,
-                    None => return (State::Idle, IDLE_POLL),
+                    None => return (State::Idle, idle_poll),
                 }
             }
             Err(e) => {
                 eprintln!("Failed to scan for screenshots to convert: {}", e);
-                return (State::Idle, IDLE_POLL);
+                crate::diagnostics::error("converter", format!("Failed to scan for screenshots to convert: {}", e)).record();
+                return (State::Idle, idle_poll);
             }
         };
 
@@ -698,12 +940,35 @@ impl Converter {
             hour: batch.hour,
             frames: batch.frames.len(),
             started_at: Local::now(),
+            frames_done: 0,
+            paused_since: None,
+            paused_secs: 0,
         });
         let root_owned = root.to_path_buf();
         let running_owned = Arc::clone(running);
+        let progress = Arc::clone(activity);
+        let pauses = Arc::clone(activity);
+        let boost_owned = Arc::clone(boost);
+        let pause_reason = Arc::clone(boost);
         let result = tokio::task::spawn_blocking(move || {
             convert_batch(&root_owned, &batch, |frames_dir, output| {
-                encode_with_ffmpeg(frames_dir, output, &running_owned)
+                encode_with_ffmpeg(
+                    frames_dir,
+                    output,
+                    &running_owned,
+                    &boost_owned,
+                    move |frames| progress.encoding_progress(frames),
+                    |paused| {
+                        if paused {
+                            let state = if pause_reason.is_low_power() { State::LowPower } else { State::OnBattery };
+                            println!("Paused the encode: {:?}", state);
+                            pauses.encoding_paused(state);
+                        } else {
+                            println!("Resumed the encode");
+                            pauses.encoding_resumed();
+                        }
+                    },
+                )
             })
         })
         .await
@@ -714,26 +979,31 @@ impl Converter {
             Ok(video_name) => {
                 println!("Published {} after {}s", video_name, took.as_secs());
                 activity.encoding_finished(video_name, took, None);
-                (State::Resting, rest_after(took))
+                (State::Resting, rest_after(took, boost.is_on()))
             }
             Err(ConvertError::Interrupted) => {
-                println!("Video conversion interrupted; the frames were kept");
-                activity.encoding_finished(video_name, took, Some("Stopped because the power was unplugged".to_string()));
+                println!("Video conversion stopped; the frames were kept");
+                activity.encoding_finished(video_name, took, Some("Stopped before it finished".to_string()));
                 (State::OnBattery, ON_BATTERY_POLL)
             }
             Err(e) => {
                 eprintln!("Video conversion failed, frames kept: {}", e);
                 activity.encoding_finished(video_name, took, Some(e.to_string()));
-                (State::Resting, rest_after(took))
+                (State::Resting, rest_after(took, boost.is_on()))
             }
         }
     }
 }
 
 /// How long to wait after a batch that took `took`, so that the next one
-/// starts `BATCH_INTERVAL` after this one started.
-fn rest_after(took: Duration) -> Duration {
-    BATCH_INTERVAL.saturating_sub(took)
+/// starts `BATCH_INTERVAL` after this one started. During a boost the next
+/// one starts straight away.
+fn rest_after(took: Duration, boosted: bool) -> Duration {
+    if boosted {
+        Duration::ZERO
+    } else {
+        BATCH_INTERVAL.saturating_sub(took)
+    }
 }
 
 #[cfg(test)]
@@ -1226,10 +1496,15 @@ mod tests {
     #[test]
     fn batches_start_every_ten_minutes_while_behind() {
         let minutes = |m: u64| Duration::from_secs(m * 60);
-        assert_eq!(rest_after(minutes(4)), minutes(6));
-        assert_eq!(rest_after(Duration::ZERO), minutes(10));
-        assert_eq!(rest_after(minutes(10)), Duration::ZERO);
-        assert_eq!(rest_after(minutes(25)), Duration::ZERO);
+        assert_eq!(rest_after(minutes(4), false), minutes(6));
+        assert_eq!(rest_after(Duration::ZERO, false), minutes(10));
+        assert_eq!(rest_after(minutes(10), false), Duration::ZERO);
+        assert_eq!(rest_after(minutes(25), false), Duration::ZERO);
+    }
+
+    #[test]
+    fn batches_follow_each_other_during_a_boost() {
+        assert_eq!(rest_after(Duration::from_secs(60), true), Duration::ZERO);
     }
 
     #[test]
@@ -1260,21 +1535,116 @@ mod tests {
     }
 
     #[test]
+    fn reads_the_frame_count_from_progress_lines() {
+        assert_eq!(progress_frame("frame=123"), Some(123));
+        assert_eq!(progress_frame("frame=  7\n"), Some(7));
+        assert_eq!(progress_frame("fps=2.5"), None);
+        assert_eq!(progress_frame("progress=continue"), None);
+    }
+
+    #[test]
     fn wait_or_kill_stops_a_running_process() {
         let child = Command::new("sleep").arg("30").spawn().unwrap();
         let started = Instant::now();
 
-        let result = wait_or_kill(child, Duration::from_millis(50), || true);
+        let slot = Mutex::new(None);
+        let result = wait_or_kill(&slot, child, Duration::from_millis(50), || Control::Stop, |_| {});
 
         assert_eq!(result, Err(ConvertError::Interrupted));
         assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(slot.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn quitting_kills_the_running_encode() {
+        let child = Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id();
+        let slot = Mutex::new(None);
+        let started = Instant::now();
+
+        let result = std::thread::scope(|scope| {
+            let waiter = scope.spawn(|| wait_or_kill(&slot, child, Duration::from_secs(60), || Control::Run, |_| {}));
+            while slot.lock().unwrap().is_none() {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            kill_encode_in(&slot);
+            waiter.join().unwrap()
+        });
+
+        assert!(result.is_err(), "a killed encode is not published");
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(slot.lock().unwrap().is_none());
+        let alive = Command::new("kill").args(["-0", &pid.to_string()]).status().unwrap().success();
+        assert!(!alive, "the process is gone, not orphaned");
     }
 
     #[test]
     fn wait_or_kill_reports_failure() {
         let child = Command::new("false").stderr(Stdio::piped()).spawn().unwrap();
-        let result = wait_or_kill(child, Duration::from_secs(60), || false);
+        let result = wait_or_kill(&Mutex::new(None), child, Duration::from_secs(60), || Control::Run, |_| {});
         assert!(matches!(result, Err(ConvertError::Failed(_))));
+    }
+
+    /// The process state `ps` reports for `pid`: `T` while it is stopped.
+    fn process_state(pid: u32) -> String {
+        let output = Command::new("ps").args(["-o", "stat=", "-p", &pid.to_string()]).output().unwrap();
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn unplugging_pauses_the_encode_and_plugging_in_resumes_it() {
+        let child = Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id();
+        let slot = Mutex::new(None);
+        // Battery for two checks, then AC, then the converter stops.
+        let mut checks = [Control::Pause, Control::Pause, Control::Run, Control::Stop].into_iter();
+        let mut events = Vec::new();
+
+        let result = wait_or_kill(
+            &slot,
+            child,
+            Duration::from_millis(50),
+            || checks.next().unwrap_or(Control::Stop),
+            |paused| events.push((paused, process_state(pid))),
+        );
+
+        assert_eq!(result, Err(ConvertError::Interrupted));
+        assert_eq!(events.len(), 2, "one pause and one resume: {:?}", events);
+        assert!(events[0].0 && events[0].1.starts_with('T'), "frozen while paused: {:?}", events);
+        assert!(!events[1].0 && !events[1].1.starts_with('T'), "running again: {:?}", events);
+    }
+
+    #[test]
+    fn a_paused_encode_still_dies_when_the_app_quits() {
+        let child = Command::new("sleep").arg("30").spawn().unwrap();
+        let slot = Mutex::new(None);
+        let started = Instant::now();
+
+        let result = std::thread::scope(|scope| {
+            let waiter = scope.spawn(|| {
+                wait_or_kill(&slot, child, Duration::from_millis(20), || Control::Pause, |_| {})
+            });
+            std::thread::sleep(Duration::from_millis(200));
+            kill_encode_in(&slot);
+            waiter.join().unwrap()
+        });
+
+        assert!(result.is_err());
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    /// Pausing and killing signal the process `ffmpeg_command` starts, which
+    /// on macOS is `taskpolicy`. That only reaches ffmpeg because taskpolicy
+    /// execs it in place rather than forking.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn taskpolicy_runs_its_command_in_its_own_process() {
+        let mut child = Command::new("taskpolicy").args(["-b", "sleep", "30"]).spawn().unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        let output = Command::new("ps").args(["-o", "comm=", "-p", &child.id().to_string()]).output().unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(String::from_utf8_lossy(&output.stdout).trim().ends_with("sleep"));
     }
 
     /// End to end with the real ffmpeg command, when ffmpeg (with libx265) is
@@ -1317,7 +1687,20 @@ mod tests {
         let batch = find_ready_batches(root, at("2026-10-02", 0, 0)).unwrap().remove(0);
 
         let running = AtomicBool::new(true);
-        let name = convert_batch(root, &batch, |dir, out| encode_with_ffmpeg(dir, out, &running)).unwrap();
+        let progress = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let reported = Arc::clone(&progress);
+        let name = convert_batch(root, &batch, |dir, out| {
+            encode_with_ffmpeg(dir, out, &running, &Boost::default(), move |frames| reported.lock().unwrap().push(frames), |_| {})
+        })
+        .unwrap();
+        // The reader thread may still be draining the pipe for a moment.
+        for _ in 0..50 {
+            if progress.lock().unwrap().last() == Some(&5) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(progress.lock().unwrap().last(), Some(&5), "progress reaches every frame");
 
         // Only ffmpeg is bundled, so inspect the result with it rather than
         // ffprobe: framecrc prints one line per packet without decoding, and
