@@ -6,6 +6,7 @@ mod timelapse;
 mod database;
 mod diagnostics;
 mod ocr;
+mod ocr_tiles;
 mod paths;
 mod settings;
 mod updater;

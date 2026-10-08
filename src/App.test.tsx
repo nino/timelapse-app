@@ -542,6 +542,14 @@ describe('App', () => {
       // 1800×1124 until a frame reports its own size; 4px of padding around.
       expect(rect?.getAttribute('x')).toBe(String(900 - 4));
       expect(rect?.getAttribute('y')).toBe(String(281 - 4));
+
+      // A big screen's frame, twice the size: the padding grows with it.
+      Object.defineProperty(image(), 'naturalWidth', { value: 3600, configurable: true });
+      Object.defineProperty(image(), 'naturalHeight', { value: 2248, configurable: true });
+      finishLoading();
+      const bigRect = screen.getByTestId('match-highlights').querySelector('rect');
+      expect(bigRect?.getAttribute('x')).toBe(String(1800 - 8));
+      expect(bigRect?.getAttribute('stroke-width')).toBe('8');
       await settleFrameTime();
     });
 

@@ -39,8 +39,9 @@ const LONG_PASS: Duration = Duration::from_secs(60);
 /// How long to wait before re-checking the power source while on battery.
 const BATTERY_SLEEP: Duration = Duration::from_secs(5 * 60);
 
-/// How many frames to read between power-source checks. At ~130 ms per frame
-/// that is a check every few seconds of work.
+/// How many frames to read between power-source checks. At 0.1–0.3 s for an
+/// ordinary frame that is a check every few seconds of work; a big screen's
+/// frame, read in tiles, takes about a second, so up to half a minute.
 const FRAMES_PER_POWER_CHECK: usize = 30;
 
 /// Most video frames handled per pass when there are no new screenshots, so
@@ -56,7 +57,8 @@ const VIDEO_CACHE_CAP_BYTES: u64 = 64 * 1024 * 1024;
 /// be deleted as all-black, so the worker leaves it for the next pass.
 const MIN_FRAME_AGE: Duration = Duration::from_secs(10);
 
-/// Frames are compared at a quarter of their 1800×1124 size.
+/// Frames are compared at a quarter of the ordinary 1800×1124 frame size (a
+/// big screen's bigger frame is shrunk to the same thumbnail).
 const THUMB_WIDTH: usize = 450;
 const THUMB_HEIGHT: usize = 281;
 
@@ -733,21 +735,27 @@ fn old_enough(path: &Path, now: SystemTime) -> bool {
 #[cfg(target_os = "macos")]
 mod vision {
     use super::{OcrLine, TextRecognizer};
+    use crate::ocr_tiles::{assemble, tiles};
     use objc2::rc::{autoreleasepool, Retained};
     use objc2::AnyThread;
+    use objc2_core_foundation::{CGPoint, CGRect, CGSize};
     use objc2_foundation::{NSArray, NSDictionary, NSString, NSURL};
     use objc2_vision::{
         VNImageRequestHandler, VNRecognizeTextRequest, VNRequest, VNRequestTextRecognitionLevel,
     };
     use std::path::Path;
 
-    /// Vision's text recognizer in accurate mode. Fast mode was tried on real
+    /// Vision's text recognizer in accurate mode, reading a big frame in tiles
+    /// (see `ocr_tiles`). Fast mode was tried on real
     /// captures and garbles too much text to be worth indexing.
     pub struct VisionRecognizer;
 
     impl TextRecognizer for VisionRecognizer {
         fn recognize(&self, image: &Path) -> Result<Vec<OcrLine>, String> {
             let path = image.to_str().ok_or("image path is not valid UTF-8")?;
+            let (width, height) = image::image_dimensions(image)
+                .map_err(|e| format!("Failed to read {}: {}", image.display(), e))?;
+            let tiles = tiles(width, height);
 
             autoreleasepool(|_| {
                 let url = NSURL::fileURLWithPath(&NSString::from_str(path));
@@ -762,35 +770,58 @@ mod vision {
                     )
                 };
 
-                let request = VNRecognizeTextRequest::new();
-                request.setRecognitionLevel(VNRequestTextRecognitionLevel::Accurate);
-                request.setUsesLanguageCorrection(true);
-
-                let as_request: Retained<VNRequest> =
-                    Retained::into_super(Retained::into_super(request.clone()));
-                let requests = NSArray::from_retained_slice(&[as_request]);
+                // One request per tile, limited to it by its region of
+                // interest, all performed on the one decoded image.
+                let requests: Vec<_> = tiles
+                    .iter()
+                    .map(|tile| {
+                        let request = VNRecognizeTextRequest::new();
+                        request.setRecognitionLevel(VNRequestTextRecognitionLevel::Accurate);
+                        request.setUsesLanguageCorrection(true);
+                        let region = tile.region();
+                        let region = CGRect::new(
+                            CGPoint::new(region.x, region.y),
+                            CGSize::new(region.width, region.height),
+                        );
+                        // SAFETY: the region lies within the unit square.
+                        unsafe { request.setRegionOfInterest(region) };
+                        request
+                    })
+                    .collect();
+                let as_requests: Vec<Retained<VNRequest>> = requests
+                    .iter()
+                    .map(|request| Retained::into_super(Retained::into_super(request.clone())))
+                    .collect();
 
                 handler
-                    .performRequests_error(&requests)
+                    .performRequests_error(&NSArray::from_retained_slice(&as_requests))
                     .map_err(|error| error.localizedDescription().to_string())?;
 
-                let mut lines = Vec::new();
-                for observation in request.results().iter().flat_map(|results| results.iter()) {
-                    let Some(best) = observation.topCandidates(1).firstObject() else {
-                        continue;
-                    };
-                    // SAFETY: a plain property read on a finished observation.
-                    let bounds = unsafe { observation.boundingBox() };
-                    lines.push(OcrLine {
-                        text: best.string().to_string(),
-                        confidence: best.confidence(),
-                        x: bounds.origin.x,
-                        y: bounds.origin.y,
-                        width: bounds.size.width,
-                        height: bounds.size.height,
-                    });
-                }
-                Ok(lines)
+                let read = tiles
+                    .iter()
+                    .zip(&requests)
+                    .map(|(tile, request)| {
+                        let mut lines = Vec::new();
+                        for observation in request.results().iter().flat_map(|results| results.iter()) {
+                            let Some(best) = observation.topCandidates(1).firstObject() else {
+                                continue;
+                            };
+                            // SAFETY: a plain property read on a finished
+                            // observation. The box is relative to the tile.
+                            let bounds = unsafe { observation.boundingBox() };
+                            lines.push(OcrLine {
+                                text: best.string().to_string(),
+                                confidence: best.confidence(),
+                                x: bounds.origin.x,
+                                y: bounds.origin.y,
+                                width: bounds.size.width,
+                                height: bounds.size.height,
+                            });
+                        }
+                        (*tile, lines)
+                    })
+                    .collect();
+                Ok(assemble(read))
             })
         }
     }

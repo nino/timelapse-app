@@ -207,6 +207,8 @@ export function App({
   // Stretches still to be decoded from video are drawn paler on the scrubber.
   const pendingFrames = usePendingFrames(day, loaded);
   const [frameSize, setFrameSize] = React.useState(DEFAULT_FRAME_SIZE);
+  // Big screens get bigger frames; the outlines keep the same look on them.
+  const outlineScale = frameSize.width / DEFAULT_FRAME_SIZE.width;
   const currentMatch: DayMatch | null = matches?.[rangeAt(matches, currentIndex)] ?? null;
   const matchLines = useMatchLines(selectedDay, currentMatch?.frame ?? null, query);
   // Outline the matching lines only once the frame on screen is the one the
@@ -373,14 +375,14 @@ export function App({
             {highlights.map((line, i) => (
               <rect
                 key={i}
-                x={line.x * frameSize.width - 4}
-                y={line.y * frameSize.height - 4}
-                width={line.width * frameSize.width + 8}
-                height={line.height * frameSize.height + 8}
-                rx={4}
+                x={line.x * frameSize.width - 4 * outlineScale}
+                y={line.y * frameSize.height - 4 * outlineScale}
+                width={line.width * frameSize.width + 8 * outlineScale}
+                height={line.height * frameSize.height + 8 * outlineScale}
+                rx={4 * outlineScale}
                 fill="rgba(250, 204, 21, 0.2)"
                 stroke="#facc15"
-                strokeWidth={4}
+                strokeWidth={4 * outlineScale}
               />
             ))}
           </svg>
