@@ -108,10 +108,92 @@ async fn install(update: &Update) -> Result<(), String> {
         "Installing update {} (running {})",
         update.version, update.current_version
     );
+    if !can_install_silently() {
+        return install_with_password(update).await;
+    }
     update
         .download_and_install(|_, _| {}, || {})
         .await
         .map_err(|e| e.to_string())
+}
+
+/// Installs an update into a folder this account can't write to. The plugin
+/// would do this through an AppleScript admin prompt run on the main thread,
+/// which beachballs every window until the prompt is answered, so instead
+/// `osascript` asks for the password in a process of its own while this
+/// waits off the main thread. `download` checks the signature, as
+/// `download_and_install` does.
+#[cfg(target_os = "macos")]
+async fn install_with_password(update: &Update) -> Result<(), String> {
+    let bytes = update
+        .download(|_, _| {}, || {})
+        .await
+        .map_err(|e| e.to_string())?;
+    let bundle = current_bundle().ok_or("Couldn't find the running app")?;
+    tauri::async_runtime::spawn_blocking(move || replace_with_password(&bytes, &bundle))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn install_with_password(update: &Update) -> Result<(), String> {
+    update
+        .download_and_install(|_, _| {}, || {})
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Unpacks the update next to nothing that matters (a temp folder), then has
+/// an admin move it over `bundle`.
+#[cfg(target_os = "macos")]
+fn replace_with_password(archive: &[u8], bundle: &std::path::Path) -> Result<(), String> {
+    let staging = std::env::temp_dir().join(format!("timelapse-update-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&staging);
+    std::fs::create_dir_all(&staging).map_err(|e| e.to_string())?;
+    let result = unpack_app(archive, &staging).and_then(|new_app| {
+        let output = std::process::Command::new("/usr/bin/osascript")
+            .args([
+                "-e",
+                "on run argv",
+                "-e",
+                "set {oldApp, newApp} to {quoted form of item 1 of argv, quoted form of item 2 of argv}",
+                "-e",
+                "do shell script \"rm -rf \" & oldApp & \" && mv -f \" & newApp & \" \" & oldApp & \" && touch \" & oldApp with administrator privileges",
+                "-e",
+                "end run",
+            ])
+            .arg(bundle)
+            .arg(&new_app)
+            .output()
+            .map_err(|e| e.to_string())?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+        }
+    });
+    let _ = std::fs::remove_dir_all(&staging);
+    result
+}
+
+/// Unpacks an updater archive (a gzipped tar of one `.app`) into `dir`, and
+/// returns the app's path.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn unpack_app(archive: &[u8], dir: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    tar::Archive::new(flate2::read::GzDecoder::new(archive))
+        .unpack(dir)
+        .map_err(|e| format!("Couldn't unpack the update: {}", e))?;
+    std::fs::read_dir(dir)
+        .map_err(|e| e.to_string())?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "app"))
+        .ok_or_else(|| "The update has no app in it".to_string())
+}
+
+/// Whether the user cancelled the admin password prompt.
+fn cancelled(error: &str) -> bool {
+    error.contains("(-128)")
 }
 
 /// "Check for Updates…": check now and say what was found.
@@ -169,6 +251,7 @@ pub fn check_from_menu(app: AppHandle) {
                 *installed = Some(version);
                 app.restart();
             }
+            Err(e) if cancelled(&e) => {}
             Err(e) => warn(&app, "Couldn't install the update", &e),
         }
     });
@@ -214,13 +297,14 @@ fn window_is_focused(app: &AppHandle) -> bool {
 /// plugin moves the bundle out of its folder and the new one in, and asks for
 /// an admin password when it can't.
 fn can_install_silently() -> bool {
-    let bundle = std::env::current_exe()
+    current_bundle().is_some_and(|bundle| can_replace(&bundle))
+}
+
+/// The running app's `.app`, from `….app/Contents/MacOS/<binary>`.
+fn current_bundle() -> Option<std::path::PathBuf> {
+    std::env::current_exe()
         .ok()
-        .and_then(|exe| exe.ancestors().nth(3).map(std::path::Path::to_path_buf));
-    match bundle {
-        Some(bundle) => can_replace(&bundle),
-        None => false,
-    }
+        .and_then(|exe| exe.ancestors().nth(3).map(std::path::Path::to_path_buf))
 }
 
 /// Moving a bundle needs write access to the folder it is in, and to the
@@ -254,6 +338,37 @@ mod tests {
         let bundle = dir.path().join("Timelapse App.app");
         std::fs::create_dir(&bundle).unwrap();
         assert!(can_replace(&bundle));
+    }
+
+    #[test]
+    fn unpacks_the_app_from_an_update_archive() {
+        let mut archive = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::fast(),
+        ));
+        let plist = b"<plist/>";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(plist.len() as u64);
+        header.set_mode(0o644);
+        archive
+            .append_data(
+                &mut header,
+                "Timelapse App.app/Contents/Info.plist",
+                &plist[..],
+            )
+            .unwrap();
+        let bytes = archive.into_inner().unwrap().finish().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let app = unpack_app(&bytes, dir.path()).unwrap();
+        assert_eq!(app, dir.path().join("Timelapse App.app"));
+        assert!(app.join("Contents/Info.plist").is_file());
+    }
+
+    #[test]
+    fn recognises_a_cancelled_password_prompt() {
+        assert!(cancelled("execution error: User canceled. (-128)"));
+        assert!(!cancelled("execution error: rm: Permission denied (1)"));
     }
 
     #[test]
