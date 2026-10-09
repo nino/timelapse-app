@@ -1640,11 +1640,20 @@ mod tests {
     #[test]
     fn taskpolicy_runs_its_command_in_its_own_process() {
         let mut child = Command::new("taskpolicy").args(["-b", "sleep", "30"]).spawn().unwrap();
-        std::thread::sleep(Duration::from_millis(500));
-        let output = Command::new("ps").args(["-o", "comm=", "-p", &child.id().to_string()]).output().unwrap();
+        // The exec can take a while on a busy machine, so look until it has
+        // happened rather than once after a fixed wait.
+        let started = Instant::now();
+        let name = loop {
+            let output = Command::new("ps").args(["-o", "comm=", "-p", &child.id().to_string()]).output().unwrap();
+            let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if name.ends_with("sleep") || started.elapsed() > Duration::from_secs(10) {
+                break name;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        };
         let _ = child.kill();
         let _ = child.wait();
-        assert!(String::from_utf8_lossy(&output.stdout).trim().ends_with("sleep"));
+        assert!(name.ends_with("sleep"), "process {} is {:?}", child.id(), name);
     }
 
     /// End to end with the real ffmpeg command, when ffmpeg (with libx265) is
