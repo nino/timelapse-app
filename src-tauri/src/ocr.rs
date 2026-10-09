@@ -389,7 +389,7 @@ impl OcrWorker {
                 if *attempts < RECOGNIZER_ATTEMPTS {
                     eprintln!("OCR: could not read {} {}, will retry: {}", what, number, error);
                     self.activity.ocr_failed(format!(
-                        "Could not read {} {} (will try again): {}",
+                        "Could not read {} {}, will try again (if this keeps happening, quitting and reopening the app fixes it): {}",
                         what, number, error
                     ));
                     return None;
@@ -816,7 +816,7 @@ fn old_enough(path: &Path, now: SystemTime) -> bool {
 #[cfg(target_os = "macos")]
 mod vision {
     use super::{OcrLine, TextRecognizer};
-    use crate::ocr_tiles::{assemble, tiles, Tile};
+    use crate::ocr_tiles::{assemble, tiles};
     use objc2::rc::{autoreleasepool, Retained};
     use objc2::AnyThread;
     use objc2_core_foundation::{CGPoint, CGRect, CGSize};
@@ -851,87 +851,60 @@ mod vision {
                     )
                 };
 
-                // Vision can lose the Neural Engine for the rest of the
-                // process's life: every request then fails with
-                // `CRImageReaderError error 1` (after an E5RT error in the
-                // system log) while a new process reads the same image
-                // fine. Reading on the CPU alone still works then.
-                read(&handler, &tiles, false).or_else(|error| {
-                    read(&handler, &tiles, true).map_err(|cpu_error| {
-                        if cpu_error == error {
-                            error
-                        } else {
-                            format!("{} (on the CPU alone: {})", error, cpu_error)
-                        }
+                // One request per tile, limited to it by its region of
+                // interest, all performed on the one decoded image.
+                let requests: Vec<_> = tiles
+                    .iter()
+                    .map(|tile| {
+                        let request = VNRecognizeTextRequest::new();
+                        request.setRecognitionLevel(VNRequestTextRecognitionLevel::Accurate);
+                        request.setUsesLanguageCorrection(true);
+                        let region = tile.region();
+                        let region = CGRect::new(
+                            CGPoint::new(region.x, region.y),
+                            CGSize::new(region.width, region.height),
+                        );
+                        // SAFETY: the region lies within the unit square.
+                        unsafe { request.setRegionOfInterest(region) };
+                        request
                     })
-                })
+                    .collect();
+                let as_requests: Vec<Retained<VNRequest>> = requests
+                    .iter()
+                    .map(|request| Retained::into_super(Retained::into_super(request.clone())))
+                    .collect();
+
+                handler
+                    .performRequests_error(&NSArray::from_retained_slice(&as_requests))
+                    .map_err(|error| error.localizedDescription().to_string())?;
+
+                let read = tiles
+                    .iter()
+                    .zip(&requests)
+                    .map(|(tile, request)| {
+                        let mut lines = Vec::new();
+                        for observation in request.results().iter().flat_map(|results| results.iter()) {
+                            let Some(best) = observation.topCandidates(1).firstObject() else {
+                                continue;
+                            };
+                            // SAFETY: a plain property read on a finished
+                            // observation. The box is relative to the tile.
+                            let bounds = unsafe { observation.boundingBox() };
+                            lines.push(OcrLine {
+                                text: best.string().to_string(),
+                                confidence: best.confidence(),
+                                x: bounds.origin.x,
+                                y: bounds.origin.y,
+                                width: bounds.size.width,
+                                height: bounds.size.height,
+                            });
+                        }
+                        (*tile, lines)
+                    })
+                    .collect();
+                Ok(assemble(read))
             })
         }
-    }
-
-    /// Read `tiles` of the image `handler` holds: one request per tile,
-    /// limited to it by its region of interest, all performed on the one
-    /// decoded image. `cpu_only` keeps Vision off the GPU and Neural Engine.
-    fn read(
-        handler: &VNImageRequestHandler,
-        tiles: &[Tile],
-        cpu_only: bool,
-    ) -> Result<Vec<OcrLine>, String> {
-        let requests: Vec<_> = tiles
-            .iter()
-            .map(|tile| {
-                let request = VNRecognizeTextRequest::new();
-                request.setRecognitionLevel(VNRequestTextRecognitionLevel::Accurate);
-                request.setUsesLanguageCorrection(true);
-                // SAFETY: a plain property write before the request runs.
-                #[allow(deprecated)]
-                unsafe {
-                    request.setUsesCPUOnly(cpu_only)
-                };
-                let region = tile.region();
-                let region = CGRect::new(
-                    CGPoint::new(region.x, region.y),
-                    CGSize::new(region.width, region.height),
-                );
-                // SAFETY: the region lies within the unit square.
-                unsafe { request.setRegionOfInterest(region) };
-                request
-            })
-            .collect();
-        let as_requests: Vec<Retained<VNRequest>> = requests
-            .iter()
-            .map(|request| Retained::into_super(Retained::into_super(request.clone())))
-            .collect();
-
-        handler
-            .performRequests_error(&NSArray::from_retained_slice(&as_requests))
-            .map_err(|error| error.localizedDescription().to_string())?;
-
-        let read = tiles
-            .iter()
-            .zip(&requests)
-            .map(|(tile, request)| {
-                let mut lines = Vec::new();
-                for observation in request.results().iter().flat_map(|results| results.iter()) {
-                    let Some(best) = observation.topCandidates(1).firstObject() else {
-                        continue;
-                    };
-                    // SAFETY: a plain property read on a finished
-                    // observation. The box is relative to the tile.
-                    let bounds = unsafe { observation.boundingBox() };
-                    lines.push(OcrLine {
-                        text: best.string().to_string(),
-                        confidence: best.confidence(),
-                        x: bounds.origin.x,
-                        y: bounds.origin.y,
-                        width: bounds.size.width,
-                        height: bounds.size.height,
-                    });
-                }
-                (*tile, lines)
-            })
-            .collect();
-        Ok(assemble(read))
     }
 }
 
