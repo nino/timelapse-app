@@ -42,6 +42,7 @@ function activity(overrides: Partial<Activity> = {}): Activity {
       remaining: 334,
       recognized: 120,
       skipped: 780,
+      failed: 0,
       nextCheckAt: null,
       lastError: null,
       readingVideo: false,

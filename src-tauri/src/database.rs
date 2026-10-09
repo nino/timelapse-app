@@ -205,6 +205,24 @@ impl ScreenshotDatabase {
             )?;
         }
 
+        // Migration 6: from 2026-10-08 16:01, Vision failed on every frame
+        // in a long-running app (it had lost the Neural Engine), and OCR
+        // marked each frame it failed on as done. Start every day read from
+        // video over, and re-read the screenshots still on disk from that
+        // day on. Rows already found stay; reading a frame again replaces
+        // its row.
+        if !Self::migration_applied(&tx, "reread_after_vision_failure")? {
+            tx.execute_batch(
+                "DELETE FROM ocr_progress WHERE by_position;
+                 UPDATE ocr_progress SET last_frame = 0
+                     WHERE NOT by_position AND day >= '2026-10-08';",
+            )?;
+            tx.execute(
+                "INSERT INTO migrations (migration_name, applied_at) VALUES (?1, ?2)",
+                rusqlite::params!["reread_after_vision_failure", Utc::now().to_rfc3339()],
+            )?;
+        }
+
         tx.commit()?;
 
         Ok(vacuum)
@@ -1307,6 +1325,28 @@ mod tests {
             assert!((got - want).abs() <= 0.5 / 65535.0, "{got} vs {want}");
         }
         assert!(unpack_boxes(&[]).is_empty());
+    }
+
+    #[test]
+    fn test_reread_after_vision_failure_migration() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        {
+            let db = ScreenshotDatabase::new(db_path.clone()).unwrap();
+            db.record_ocr_frame("2026-10-07", 900, None).unwrap();
+            db.record_ocr_frame("2026-10-08", 7528, Some(("kept", &[[0.0, 0.0, 1.0, 1.0]]))).unwrap();
+            db.record_video_ocr_frame("2026-02-07", 2476, None).unwrap();
+            db.conn
+                .execute("DELETE FROM migrations WHERE migration_name = 'reread_after_vision_failure'", [])
+                .unwrap();
+        }
+
+        let db = ScreenshotDatabase::new(db_path.clone()).unwrap();
+
+        assert_eq!(db.ocr_progress("2026-10-07").unwrap(), Some(OcrProgress::FrameNumber(900)));
+        assert_eq!(db.ocr_progress("2026-10-08").unwrap(), Some(OcrProgress::FrameNumber(0)));
+        assert_eq!(db.ocr_progress("2026-02-07").unwrap(), None);
+        assert!(db.ocr_lines("2026-10-08", 7528).unwrap().is_some());
     }
 
     #[test]

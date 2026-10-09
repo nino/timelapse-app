@@ -53,6 +53,16 @@ const VIDEO_FRAMES_PER_PASS: usize = 1800;
 /// by streaming, which caches nothing, so this only bounds the folder.
 const VIDEO_CACHE_CAP_BYTES: u64 = 64 * 1024 * 1024;
 
+/// How many times one frame is given to the recognizer, a pass apart, before
+/// it is passed over. A recognizer failure is usually the recognizer's, not
+/// the frame's (Vision can lose the Neural Engine for the rest of the
+/// process's life), so the pass stops there and the frame is tried again
+/// rather than marked done unread.
+const RECOGNIZER_ATTEMPTS: u32 = 3;
+
+/// How long to wait before trying again after the recognizer failed.
+const RETRY_SLEEP: Duration = Duration::from_secs(60);
+
 /// A frame younger than this may still be being written, or may be about to
 /// be deleted as all-black, so the worker leaves it for the next pass.
 const MIN_FRAME_AGE: Duration = Duration::from_secs(10);
@@ -192,12 +202,46 @@ pub struct PassSummary {
     pub recognized: usize,
     /// Frames skipped because the screen had not changed.
     pub skipped: usize,
+    /// Frames passed over unread: unreadable, or the recognizer failed on
+    /// them `RECOGNIZER_ATTEMPTS` times.
+    pub failed: usize,
+    /// Whether the pass stopped because the recognizer failed, leaving the
+    /// frame it failed on for a later pass.
+    pub stalled: bool,
 }
 
 impl PassSummary {
     fn handled(&self) -> usize {
-        self.recognized + self.skipped
+        self.recognized + self.skipped + self.failed
     }
+
+    fn count(&mut self, outcome: Outcome) {
+        match outcome {
+            Outcome::Read => self.recognized += 1,
+            Outcome::Unchanged => self.skipped += 1,
+            Outcome::Failed => self.failed += 1,
+        }
+    }
+}
+
+/// What became of one frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    Read,
+    Unchanged,
+    /// Passed over unread, and marked done all the same.
+    Failed,
+}
+
+/// Why a frame was not read.
+#[derive(Debug)]
+enum FrameError {
+    /// The frame itself can't be read (deleted meanwhile, or corrupt), so it
+    /// is passed over at once rather than retried forever, which would hold
+    /// back the rest of the day.
+    Unreadable(String),
+    /// The recognizer failed on it.
+    Recognizer(String),
 }
 
 /// The state a pass needs from one call to the next.
@@ -211,7 +255,11 @@ pub struct OcrWorker {
     last_text: HashMap<String, String>,
     activity: Arc<Activity>,
     videos: Option<VideoReader>,
+    /// How many times the recognizer has failed on a frame, by day and
+    /// number (or video position), until it reads or is passed over.
+    attempts: HashMap<(String, u32), u32>,
 }
+
 /// What the worker needs to read days that only exist as video.
 pub struct VideoReader {
     source: FrameSource,
@@ -245,6 +293,7 @@ impl OcrWorker {
             last_text: Default::default(),
             activity: Arc::default(),
             videos: None,
+            attempts: HashMap::new(),
         }
     }
 
@@ -298,36 +347,66 @@ impl OcrWorker {
                     break;
                 }
 
-                let recognized = match self.handle_frame(&day, frame_number, &path) {
-                    Ok(recognized) => recognized,
-                    Err(error) => {
-                        // A frame that cannot be read (deleted meanwhile, or
-                        // corrupt) is passed over rather than retried forever,
-                        // which would hold back the rest of the day.
-                        eprintln!("OCR: skipping {}: {}", path.display(), error);
-                        self.activity
-                            .ocr_failed(format!("Skipped {} frame {}: {}", day, frame_number, error));
-                        self.db
-                            .record_ocr_frame(&day, frame_number, None)
-                            .map_err(std::io::Error::other)?;
-                        false
-                    }
+                let result = self.handle_frame(&day, frame_number, &path);
+                let Some(outcome) = self.settle(&day, frame_number, &format!("{} frame", day), result)
+                else {
+                    summary.stalled = true;
+                    return Ok(summary);
                 };
-                if recognized {
-                    summary.recognized += 1;
-                } else {
-                    summary.skipped += 1;
+                if outcome == Outcome::Failed {
+                    self.db
+                        .record_ocr_frame(&day, frame_number, None)
+                        .map_err(std::io::Error::other)?;
                 }
-                self.activity.ocr_frame_handled(&day, frame_number, recognized);
+                summary.count(outcome);
+                self.activity.ocr_frame_handled(&day, frame_number, outcome);
             }
         }
 
         Ok(summary)
     }
 
+    /// What to make of handling frame `number` of `day` (`what` names it in
+    /// messages): its outcome, or `None` to stop the pass and try the frame
+    /// again later. A failed frame's progress is for the caller to record.
+    fn settle(
+        &mut self,
+        day: &str,
+        number: u32,
+        what: &str,
+        result: Result<bool, FrameError>,
+    ) -> Option<Outcome> {
+        let key = (day.to_string(), number);
+        let error = match result {
+            Ok(read) => {
+                self.attempts.remove(&key);
+                return Some(if read { Outcome::Read } else { Outcome::Unchanged });
+            }
+            Err(FrameError::Unreadable(error)) => error,
+            Err(FrameError::Recognizer(error)) => {
+                let attempts = self.attempts.entry(key.clone()).or_insert(0);
+                *attempts += 1;
+                if *attempts < RECOGNIZER_ATTEMPTS {
+                    eprintln!("OCR: could not read {} {}, will retry: {}", what, number, error);
+                    self.activity.ocr_failed(format!(
+                        "Could not read {} {}, will try again (if this keeps happening, quitting and reopening the app fixes it): {}",
+                        what, number, error
+                    ));
+                    return None;
+                }
+                error
+            }
+        };
+        self.attempts.remove(&key);
+        eprintln!("OCR: skipping {} {}: {}", what, number, error);
+        self.activity
+            .ocr_failed(format!("Skipped {} {}: {}", what, number, error));
+        Some(Outcome::Failed)
+    }
+
     /// Read one frame if the screen changed. Returns whether it was read.
-    fn handle_frame(&mut self, day: &str, frame_number: u32, path: &Path) -> Result<bool, String> {
-        let thumbnail = Thumbnail::of(path)?;
+    fn handle_frame(&mut self, day: &str, frame_number: u32, path: &Path) -> Result<bool, FrameError> {
+        let thumbnail = Thumbnail::of(path).map_err(FrameError::Unreadable)?;
         self.read_if_changed(day, thumbnail, &|| Ok(path.to_path_buf()), &|db, result| {
             db.record_ocr_frame(day, frame_number, result)
         })
@@ -342,18 +421,19 @@ impl OcrWorker {
         thumbnail: Thumbnail,
         image: &dyn Fn() -> Result<PathBuf, String>,
         record: &dyn Fn(&ScreenshotDatabase, Option<(&str, &[LineBox])>) -> rusqlite::Result<()>,
-    ) -> Result<bool, String> {
+    ) -> Result<bool, FrameError> {
         let changed = self
             .last_read
             .get(day)
             .map_or(true, |last| thumbnail.differs_from(last));
 
         if !changed {
-            record(&self.db, None).map_err(|e| e.to_string())?;
+            record(&self.db, None).map_err(|e| FrameError::Unreadable(e.to_string()))?;
             return Ok(false);
         }
 
-        let lines = self.recognizer.recognize(&image()?)?;
+        let image = image().map_err(FrameError::Recognizer)?;
+        let lines = self.recognizer.recognize(&image).map_err(FrameError::Recognizer)?;
         // One line of text per box, so a line's own newlines go.
         let text = lines
             .iter()
@@ -370,7 +450,7 @@ impl OcrWorker {
             Some(lines.iter().map(|l| [l.x, l.y, l.width, l.height]).collect::<Vec<_>>())
         };
         record(&self.db, result.as_deref().map(|boxes| (text.as_str(), boxes)))
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| FrameError::Unreadable(e.to_string()))?;
         self.last_read.insert(day.to_string(), thumbnail);
         self.last_text.insert(day.to_string(), text);
         Ok(true)
@@ -433,6 +513,7 @@ impl OcrWorker {
             for video in day_videos {
                 let end = video.first_index + video.frame_count;
                 let mut stopped = false;
+                let mut stalled = false;
                 let mut failure = None;
                 let scratch = videos.scratch.as_path();
                 let streamed = videos.source.stream_video(
@@ -448,37 +529,30 @@ impl OcrWorker {
                             return false;
                         }
                         let position = (video.first_index + index + 1) as u32;
-                        let recognized =
-                            match self.handle_video_frame(&day, position, &frame, scratch) {
-                                Ok(recognized) => recognized,
-                                Err(error) => {
-                                    // As for an unreadable screenshot: pass
-                                    // over it so the rest of the day is not
-                                    // held back.
-                                    eprintln!("OCR: skipping frame {} of {}: {}", position, day, error);
-                                    self.activity.ocr_failed(format!(
-                                        "Skipped {} video frame {}: {}",
-                                        day, position, error
-                                    ));
-                                    let recorded = self.db.record_video_ocr_frame(&day, position, None);
-                                    if let Err(error) = recorded {
-                                        failure = Some(error.to_string());
-                                        return false;
-                                    }
-                                    false
-                                }
-                            };
-                        if recognized {
-                            summary.recognized += 1;
-                        } else {
-                            summary.skipped += 1;
+                        let result = self.handle_video_frame(&day, position, &frame, scratch);
+                        let what = format!("{} video frame", day);
+                        let Some(outcome) = self.settle(&day, position, &what, result) else {
+                            stalled = true;
+                            return false;
+                        };
+                        if outcome == Outcome::Failed {
+                            let recorded = self.db.record_video_ocr_frame(&day, position, None);
+                            if let Err(error) = recorded {
+                                failure = Some(error.to_string());
+                                return false;
+                            }
                         }
-                        self.activity.ocr_frame_handled(&day, position, recognized);
+                        summary.count(outcome);
+                        self.activity.ocr_frame_handled(&day, position, outcome);
                         true
                     },
                 );
                 if let Some(error) = failure {
                     return Err(error);
+                }
+                if stalled {
+                    summary.stalled = true;
+                    return Ok(summary);
                 }
                 if stopped {
                     return Ok(summary);
@@ -514,8 +588,8 @@ impl OcrWorker {
         position: u32,
         frame: &RawFrame,
         scratch: &Path,
-    ) -> Result<bool, String> {
-        let thumbnail = Thumbnail::of_rgb(frame)?;
+    ) -> Result<bool, FrameError> {
+        let thumbnail = Thumbnail::of_rgb(frame).map_err(FrameError::Unreadable)?;
         // Written only when it is going to be read.
         let image = || {
             let path = scratch.join("video-frame.png");
@@ -652,7 +726,7 @@ fn run_forever(worker: &mut OcrWorker, boost: &Boost) {
         let started = Instant::now();
         let screenshots = worker.run_pass(SystemTime::now(), usize::MAX, &mut keep_going);
         let result = match screenshots {
-            Ok(summary) if summary.handled() == 0 => worker
+            Ok(summary) if summary.handled() == 0 && !summary.stalled => worker
                 .run_video_pass(VIDEO_FRAMES_PER_PASS, &mut keep_going)
                 .map(|summary| ("video frames", summary)),
             Ok(summary) => Ok(("screenshots", summary)),
@@ -660,12 +734,17 @@ fn run_forever(worker: &mut OcrWorker, boost: &Boost) {
         };
         let took = started.elapsed();
         match result {
-            Ok((kind, summary)) if summary.handled() > 0 => {
+            Ok((kind, summary)) if summary.handled() > 0 || summary.stalled => {
                 println!(
-                    "OCR: read {} {}, skipped {} unchanged",
-                    summary.recognized, kind, summary.skipped
+                    "OCR: read {} {}, skipped {} unchanged, {} failed",
+                    summary.recognized, kind, summary.skipped, summary.failed
                 );
-                log_pass(&mut tally, kind, &summary, took, boost.is_on());
+                if summary.handled() > 0 {
+                    log_pass(&mut tally, kind, &summary, took, boost.is_on());
+                }
+                if summary.stalled {
+                    sleep(State::Retrying, RETRY_SLEEP);
+                }
             }
             Ok(_) => {
                 tally.report_if_due();
@@ -691,12 +770,14 @@ fn log_pass(tally: &mut crate::diagnostics::Tally, kind: &str, summary: &PassSum
             .data(serde_json::json!({
                 "recognized": summary.recognized,
                 "skipped": summary.skipped,
+                "failed": summary.failed,
                 "boosted": boosted,
             }))
             .record();
     } else {
         tally.count("recognized", summary.recognized as u64);
         tally.count("skipped", summary.skipped as u64);
+        tally.count("failed", summary.failed as u64);
         tally.time("pass", took);
     }
     tally.report_if_due();
@@ -990,7 +1071,7 @@ mod tests {
 
         let summary = library.pass();
 
-        assert_eq!(summary, PassSummary { recognized: 2, skipped: 2 });
+        assert_eq!(summary, PassSummary { recognized: 2, skipped: 2, ..Default::default() });
         assert_eq!(library.seen(), vec!["00001.png", "00003.png"]);
         assert_eq!(library.done_through(DAY_1), Some(4));
 
@@ -1029,7 +1110,7 @@ mod tests {
         let summary = library.pass();
 
         // The pixels changed each time, so every frame was read.
-        assert_eq!(summary, PassSummary { recognized: 4, skipped: 0 });
+        assert_eq!(summary, PassSummary { recognized: 4, ..Default::default() });
         assert_eq!(library.done_through(DAY_1), Some(3));
         let db = &library.worker.db;
         // Vision's one line with a newline in it stays one line.
@@ -1089,8 +1170,68 @@ mod tests {
 
         let summary = library.pass();
 
-        assert_eq!(summary, PassSummary { recognized: 2, skipped: 1 });
+        assert_eq!(summary, PassSummary { recognized: 2, failed: 1, ..Default::default() });
         assert_eq!(library.done_through(DAY_1), Some(3));
+    }
+
+    /// Fails while `broken` is set, as Vision does once it has lost the
+    /// Neural Engine; otherwise reads like `FakeRecognizer`.
+    struct Breakable {
+        broken: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        inner: FakeRecognizer,
+    }
+
+    impl TextRecognizer for Breakable {
+        fn recognize(&self, image: &Path) -> Result<Vec<OcrLine>, String> {
+            if self.broken.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err("CRImageReaderError error 1".into());
+            }
+            self.inner.recognize(image)
+        }
+    }
+
+    fn breakable() -> (Library, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let broken = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let recognizer = Breakable { broken: broken.clone(), inner: FakeRecognizer { seen: seen.clone() } };
+        (Library::with(seen, Box::new(recognizer)), broken)
+    }
+
+    #[test]
+    fn a_recognizer_failure_stops_the_pass_without_moving_the_mark() {
+        let (mut library, broken) = breakable();
+        frame(&library.root, DAY_1, 1, 0, false);
+        frame(&library.root, DAY_1, 2, 200, false);
+
+        let summary = library.pass();
+        assert_eq!(summary, PassSummary { stalled: true, ..Default::default() });
+        assert_eq!(library.done_through(DAY_1), None);
+
+        broken.store(false, std::sync::atomic::Ordering::SeqCst);
+        let summary = library.pass();
+        assert_eq!(summary, PassSummary { recognized: 2, ..Default::default() });
+        assert_eq!(library.seen(), vec!["00001.png", "00002.png"]);
+        assert_eq!(library.done_through(DAY_1), Some(2));
+    }
+
+    #[test]
+    fn a_frame_the_recognizer_keeps_failing_on_is_passed_over() {
+        let (mut library, broken) = breakable();
+        frame(&library.root, DAY_1, 1, 0, false);
+        frame(&library.root, DAY_1, 2, 200, false);
+
+        for _ in 1..RECOGNIZER_ATTEMPTS {
+            assert!(library.pass().stalled);
+        }
+        // The last attempt gives up on frame 1, and frame 2's first one
+        // stops the pass.
+        let summary = library.pass();
+        assert_eq!(summary, PassSummary { failed: 1, stalled: true, ..Default::default() });
+        assert_eq!(library.done_through(DAY_1), Some(1));
+
+        broken.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(library.pass().recognized, 1);
+        assert_eq!(library.seen(), vec!["00002.png"]);
     }
 
     #[test]
@@ -1225,7 +1366,7 @@ mod tests {
         let summary = library.video_pass(usize::MAX);
 
         // Newest day first; within a day, only frames that changed.
-        assert_eq!(summary, PassSummary { recognized: 5, skipped: 2 });
+        assert_eq!(summary, PassSummary { recognized: 5, skipped: 2, ..Default::default() });
         assert_eq!(library.seen().len(), 5);
         assert_eq!(library.progress(DAY_1), Some(OcrProgress::VideoPosition(5)));
         assert_eq!(library.progress(DAY_2), Some(OcrProgress::VideoPosition(2)));
@@ -1264,6 +1405,23 @@ mod tests {
         assert_eq!(library.progress(DAY_1), Some(OcrProgress::VideoPosition(5)));
         // Every frame differs from the one before it, so all are read.
         assert_eq!(library.seen().len(), 5);
+    }
+
+    #[test]
+    fn a_recognizer_failure_stops_a_video_pass_too() {
+        let (library, broken) = breakable();
+        let mut library = library.with_videos();
+        if !write_video(&library.root.join("2024-01-01--18-00-00.mov"), &[0, 200]) {
+            eprintln!("skipping: ffmpeg with libx264 is not available");
+            return;
+        }
+
+        assert_eq!(library.video_pass(usize::MAX), PassSummary { stalled: true, ..Default::default() });
+        assert_eq!(library.progress(DAY_1), None);
+
+        broken.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(library.video_pass(usize::MAX).recognized, 2);
+        assert_eq!(library.progress(DAY_1), Some(OcrProgress::VideoPosition(2)));
     }
 
     #[test]
