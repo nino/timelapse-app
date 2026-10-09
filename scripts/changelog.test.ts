@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'bun:test';
 
-import { commitCounts, noticeable, parseLog, pullRequest, type MainCommit } from './changelog';
+import { commitCounts, noticeable, parseLog, pullRequest, versions, type MainCommit } from './changelog';
 
 function commit(subject: string, body = '', files = ['src/App.tsx']): MainCommit {
   return { sha: 'a', date: '2026-10-08', subject, body, files };
@@ -57,5 +57,21 @@ describe('commitCounts', () => {
     const revList = ['d m', 'm b c', 'c a', 'b a', 'a'].join('\n');
     const counts = commitCounts(revList, ['d', 'm', 'b', 'a']);
     expect(Object.fromEntries(counts)).toEqual({ a: 1, b: 2, m: 4, d: 5 });
+  });
+});
+
+describe('versions', () => {
+  it('numbers commits before 0.2.0 by commit count and later ones by the release that shipped them', () => {
+    const numbered = [
+      { config: '0.1.3', count: 198 },
+      { config: '0.1.3', count: 200 },
+      { config: '0.2.0', count: 203, tag: '0.2.0' },
+      // Superseded before its release published: shipped in the next one.
+      { config: '0.2.0', count: 205 },
+      { config: '0.2.0', count: 207, tag: '0.2.1' },
+      // Not released yet.
+      { config: '0.2.0', count: 209 },
+    ];
+    expect(versions(numbered, '0.2.2')).toEqual(['0.1.198', '0.1.200', '0.2.0', '0.2.1', '0.2.1', '0.2.2']);
   });
 });

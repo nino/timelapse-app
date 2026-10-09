@@ -20,11 +20,14 @@ on:
 permissions:
   contents: write
 
-# One release build at a time per ref; a newer push supersedes an in-flight
-# one, but a beta never cancels the stable release.
+# One release build at a time per ref, and a beta never waits for the stable
+# release. On main a running release finishes (a release cancelled while it
+# publishes could leave a tag without its build) and only the newest waiting
+# push is built after it, as the next version; a newer beta supersedes an
+# in-flight one.
 concurrency:
   group: release-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   # productName in tauri.conf.json, which names the bundle.
@@ -41,7 +44,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          fetch-depth: 0 # the version is derived from the commit count
+          fetch-depth: 0 # the version comes from the tags of earlier releases
 
       - uses: oven-sh/setup-bun@v2
 
@@ -57,16 +60,19 @@ jobs:
           shared-key: release
           cache-on-failure: true
 
-      # A future updater decides there is something to install by comparing
-      # versions, so every release needs one that is both new and larger than
-      # the one before. Major and minor come from tauri.conf.json (so
-      # `bun run version:bump major|minor` still means something); the patch is
-      # the commit count, which only grows, and re-running on the same commit
-      # stamps the same version. Nothing is committed back.
+      # The updater installs a version only when it is greater than its own,
+      # so every release needs one that is both new and larger than the one
+      # before. Stable releases are numbered contiguously: each is tagged
+      # `v<version>`, and the next is the highest tag plus one patch, or
+      # tauri.conf.json's version when that is higher (`bun run version:bump
+      # minor`). scripts/version.ts holds the rule, which the About window's
+      # change log follows too. Re-running on a released commit rebuilds the
+      # same version. Nothing is committed back; the tag is made when the
+      # release is published.
       #
-      # A beta adds the run number, so it sorts above the stable build of the
-      # same commit and below the next one, and rebuilding a beta from an
-      # unchanged tree is still an update.
+      # A beta is a prerelease of the next stable version plus the run number,
+      # so it sorts above every stable release and below the one it leads up to,
+      # and rebuilding a beta from an unchanged tree is still an update.
       - name: Work out the channel and the version
         run: |
           CHANNEL="${{ inputs.channel }}"
@@ -77,8 +83,6 @@ jobs:
               *) echo "::error::nothing to release from $GITHUB_REF"; exit 1 ;;
             esac
           fi
-          MAJOR_MINOR=$(python3 -c "import json;v=json.load(open('src-tauri/tauri.conf.json'))['version'].split('.');print(f'{v[0]}.{v[1]}')")
-          COMMITS=$(git rev-list --count HEAD)
           if [ "$CHANNEL" = stable ]; then
             # workflow_dispatch offers every branch, and a stable release
             # replaces the one installed copies will update from. Fail before
@@ -87,13 +91,14 @@ jobs:
               echo "::error::a stable release can only be built from main (got $GITHUB_REF)"
               exit 1
             fi
-            VERSION="$MAJOR_MINOR.$COMMITS"
+            VERSION=$(bun scripts/release.ts version)
             BUILD="$VERSION"
-            TAG=latest
+            TAG="v$VERSION"
           else
-            VERSION="$MAJOR_MINOR.$COMMITS-beta.$GITHUB_RUN_NUMBER"
+            NEXT=$(bun scripts/release.ts version --beta)
+            VERSION="$NEXT-beta.$GITHUB_RUN_NUMBER"
             # CFBundleVersion is meant to be digits and dots only.
-            BUILD="$MAJOR_MINOR.$COMMITS.$GITHUB_RUN_NUMBER"
+            BUILD="$NEXT.$GITHUB_RUN_NUMBER"
             TAG=beta
           fi
           {
@@ -284,23 +289,32 @@ jobs:
           print(json.dumps(manifest, indent=2))
           PY
 
-      # The stable release is a rolling one under the `latest` tag, so
-      # `releases/latest/download/<asset>` always resolves to the newest stable
-      # build without a GitHub API call, which is where the updater reads
-      # latest.json from. A beta is a prerelease, which
-      # `releases/latest` skips, so it can never reach the stable channel.
+      # Every stable version is its own release, tagged `v<version>`, so old
+      # builds stay downloadable. The newest is marked as GitHub's latest
+      # release, which is what `releases/latest/download/<asset>` resolves to:
+      # that is where the updater reads latest.json from, without an API call.
+      # A beta is a prerelease, which `releases/latest` skips, so it can never
+      # reach the stable channel.
       - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           SHORT_SHA=${GITHUB_SHA:0:7}
           if [ "$CHANNEL" = stable ]; then
-            # Recreate the rolling release so its tag always points at this commit.
-            gh release delete "$TAG" --yes --cleanup-tag || true
+            bun scripts/release.ts notes "$VERSION" > "$RUNNER_TEMP/notes.md"
+            printf '\nBuilt from `%s`. Signed and notarised Apple Silicon macOS build.\n' "$GITHUB_SHA" >> "$RUNNER_TEMP/notes.md"
+            # A re-run on a released commit replaces that version's release;
+            # its tag already points here.
+            gh release delete "$TAG" --yes || true
             gh release create "$TAG" \
-              --title "$APP v${VERSION} (${SHORT_SHA})" \
-              --notes "Automated build of \`${GITHUB_SHA}\` from \`main\`. Signed and notarised Apple Silicon macOS build." \
+              --target "$GITHUB_SHA" \
+              --latest \
+              --title "$APP $VERSION" \
+              --notes-file "$RUNNER_TEMP/notes.md" \
               "$DMG" "$UPDATE" dist/latest.json
+            # Until 0.2.0 the stable build was one rolling release under the
+            # `latest` tag. It would otherwise linger as an old build.
+            gh release delete latest --yes --cleanup-tag || true
           else
             # Point the tag at this commit when it is not already there — a
             # dispatched beta has no tag push behind it. A tag written with

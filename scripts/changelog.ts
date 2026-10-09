@@ -1,17 +1,18 @@
 // The change log the About window shows, read from git at build time.
 //
-// Every push to main is released (release.yml), as version
-// `<major>.<minor>.<commit count>`, so each commit on main's first-parent line
-// is a version. Each one that came from a pull request becomes an entry titled
-// with the PR's title; commits pushed straight to main, and PRs that only
-// touched docs, CI or tests, are left out, since nobody using the app would
-// notice them.
+// Every push to main is released (release.yml) and tagged `v<version>`
+// (scripts/version.ts). Each commit on main's first-parent line that came from
+// a pull request becomes an entry titled with the PR's title and numbered with
+// the version that first shipped it; commits pushed straight to main, and PRs
+// that only touched docs, CI or tests, are left out, since nobody using the app
+// would notice them.
 //
 // Runs under Node (vite.config.ts imports it), so no Bun APIs here.
 
 import { execFileSync } from "node:child_process";
 
 import type { ChangelogEntry } from "../src/about.ts";
+import { isLegacy, nextVersion, readTags } from "./version.ts";
 
 export type { ChangelogEntry };
 
@@ -89,8 +90,8 @@ export function noticeable(commit: MainCommit): boolean {
 
 /**
  * How many commits each first-parent commit has, itself included, which is
- * what `git rev-list --count <sha>` says and what release.yml puts in the
- * version. `revList` is `git rev-list --parents HEAD`; `line` is the first-parent
+ * what `git rev-list --count <sha>` says and what release.yml put in the
+ * version before 0.2.0. `revList` is `git rev-list --parents HEAD`; `line` is the first-parent
  * line, newest first.
  */
 export function commitCounts(revList: string, line: string[]): Map<string, number> {
@@ -120,9 +121,42 @@ function git(cwd: string, args: string[]): string {
   return execFileSync("git", args, { cwd, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
 }
 
-function majorMinor(config: string): string {
-  const version = String(JSON.parse(config).version ?? "0.0.0");
-  return version.split(".").slice(0, 2).join(".");
+/** One first-parent commit, oldest first, with what its version depends on. */
+export type Numbered = {
+  /** `version` in tauri.conf.json at this commit. */
+  config: string;
+  /** `git rev-list --count` at this commit; numbers releases before 0.2.0. */
+  count: number;
+  /** The version tagged on this commit, if it was released. */
+  tag?: string;
+};
+
+/**
+ * The version that first shipped each commit, oldest first. Before 0.2.0 that
+ * is `<major>.<minor>.<commit count>`. From then on it is the next tag at or
+ * after the commit (a release that was superseded before it published leaves
+ * its commits to the next one), and `next` for commits not released yet.
+ */
+export function versions(commits: Numbered[], next: string): string[] {
+  const result: string[] = [];
+  let pending: number[] = [];
+  commits.forEach((commit, index) => {
+    if (isLegacy(commit.config)) {
+      result[index] = `${commit.config.split(".").slice(0, 2).join(".")}.${commit.count}`;
+      return;
+    }
+    pending.push(index);
+    if (commit.tag) {
+      for (const at of pending) result[at] = commit.tag;
+      pending = [];
+    }
+  });
+  for (const at of pending) result[at] = next;
+  return result;
+}
+
+function configVersion(config: string): string {
+  return String(JSON.parse(config).version ?? "0.0.0");
 }
 
 /**
@@ -132,6 +166,8 @@ function majorMinor(config: string): string {
 export function readChangelog(cwd: string): ChangelogEntry[] {
   let commits: MainCommit[];
   let counts: Map<string, number>;
+  let tags: Map<string, string>;
+  let head: string;
   try {
     commits = parseLog(
       git(cwd, ["log", "--first-parent", "--date=short", `--format=${LOG_FORMAT}`, "--name-only", "HEAD"]),
@@ -140,35 +176,42 @@ export function readChangelog(cwd: string): ChangelogEntry[] {
       git(cwd, ["rev-list", "--parents", "HEAD"]),
       commits.map((c) => c.sha),
     );
+    tags = readTags(cwd);
+    head = configVersion(git(cwd, ["show", `HEAD:${CONFIG}`]));
   } catch (error) {
     console.warn(`No change log: could not read git history (${String(error)})`);
     return [];
   }
 
-  // Major and minor as tauri.conf.json had them at each commit, so a later
-  // `version:bump minor` doesn't renumber what was released before it.
+  // tauri.conf.json's version at each commit, so a later `version:bump minor`
+  // doesn't renumber what was released before it.
   const bumps = new Map<string, string>();
   try {
     for (const sha of git(cwd, ["log", "--first-parent", "--format=%H", "HEAD", "--", CONFIG]).split("\n")) {
       if (sha.trim() === "") continue;
       try {
-        bumps.set(sha.trim(), majorMinor(git(cwd, ["show", `${sha.trim()}:${CONFIG}`])));
+        bumps.set(sha.trim(), configVersion(git(cwd, ["show", `${sha.trim()}:${CONFIG}`])));
       } catch {
         // The file was deleted or moved in that commit.
       }
     }
   } catch {
-    // Falls back to "0.0" below.
+    // Falls back to "0.0.0" below.
   }
 
-  // Oldest first, carrying the version forward from each change to the config.
-  let current = "0.0";
+  // Oldest first, carrying the config's version forward from each change to it.
+  const line = [...commits].reverse();
+  let config = "0.0.0";
+  const numbered = line.map((commit) => {
+    config = bumps.get(commit.sha) ?? config;
+    return { config, count: counts.get(commit.sha) ?? 0, tag: tags.get(commit.sha) };
+  });
+  const numbers = versions(numbered, nextVersion(head, [...tags.values()]));
+
   const entries: ChangelogEntry[] = [];
-  for (const commit of [...commits].reverse()) {
-    current = bumps.get(commit.sha) ?? current;
+  line.forEach((commit, index) => {
     const pr = pullRequest(commit);
-    if (!pr || !noticeable(commit)) continue;
-    entries.push({ version: `${current}.${counts.get(commit.sha) ?? 0}`, date: commit.date, ...pr });
-  }
+    if (pr && noticeable(commit)) entries.push({ version: numbers[index], date: commit.date, ...pr });
+  });
   return entries.reverse();
 }
