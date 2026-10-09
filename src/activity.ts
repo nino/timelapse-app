@@ -4,7 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 export const ACTIVITY_WINDOW = "activity";
 
 /** What a background loop is doing. Mirrors `State` in `activity.rs`. */
-export type WorkState = "starting" | "working" | "idle" | "resting" | "onBattery" | "lowPower" | "unavailable";
+export type WorkState = "starting" | "working" | "idle" | "resting" | "onBattery" | "lowPower" | "unavailable" | "retrying";
 
 /** Times are RFC 3339 with the local offset. */
 export type FrameRef = { day: string; number: number; at: string };
@@ -65,6 +65,8 @@ export type Activity = {
     remaining: number;
     recognized: number;
     skipped: number;
+    /** Frames passed over unread since launch. */
+    failed: number;
     nextCheckAt: string | null;
     lastError: Failure | null;
     /** The current pass reads days that only exist as video; `current.number` is then a position in the day's videos. */

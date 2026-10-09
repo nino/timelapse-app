@@ -358,6 +358,10 @@ function Conversion({
     case "unavailable":
       headline = "Not available";
       break;
+    case "retrying":
+      tone = "failing";
+      headline = `Trying again ${next}`;
+      break;
     case "starting":
       headline = "Starting";
       break;
@@ -418,7 +422,7 @@ function EncodeProgress({ encoding, now }: { encoding: Encoding; now: number }):
 }
 
 function Ocr({ ocr, now }: { ocr: Activity["ocr"]; now: number }): React.ReactNode {
-  const { state, current, remaining, recognized, skipped, nextCheckAt, lastError, readingVideo, videoDaysLeft } =
+  const { state, current, remaining, recognized, skipped, failed, nextCheckAt, lastError, readingVideo, videoDaysLeft } =
     ocr;
   const next = nextCheckAt ? until(nextCheckAt, now) : "soon";
   let tone: Tone = "quiet";
@@ -451,6 +455,10 @@ function Ocr({ ocr, now }: { ocr: Activity["ocr"]; now: number }): React.ReactNo
     case "unavailable":
       headline = "Not available on this platform";
       break;
+    case "retrying":
+      tone = "failing";
+      headline = `Text recognition failed; trying again ${next}`;
+      break;
     case "starting":
       headline = "Starting";
       break;
@@ -464,6 +472,7 @@ function Ocr({ ocr, now }: { ocr: Activity["ocr"]; now: number }): React.ReactNo
       )}
       <Row label="Since launch">
         {count(recognized, "frame")} read, {skipped.toLocaleString("en-US")} unchanged
+        {failed > 0 && `, ${failed.toLocaleString("en-US")} could not be read`}
       </Row>
       <ErrorRow source="ocr" failure={lastError} now={now} />
     </Section>

@@ -104,6 +104,9 @@ pub enum State {
     LowPower,
     /// Not available on this platform (OCR outside macOS).
     Unavailable,
+    /// The last attempt failed (OCR's recognizer); tries again at
+    /// `next_check_at`.
+    Retrying,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
@@ -169,6 +172,9 @@ pub struct OcrStatus {
     /// Frames skipped since the app started because the screen had not
     /// changed.
     pub skipped: u64,
+    /// Frames passed over unread since the app started (see
+    /// `ocr::Outcome::Failed`).
+    pub failed: u64,
     /// When OCR next looks for new frames, while idle or on battery.
     pub next_check_at: Option<DateTime<Local>>,
     pub last_error: Option<Failure>,
@@ -417,14 +423,14 @@ impl Activity {
         });
     }
 
-    pub fn ocr_frame_handled(&self, day: &str, number: u32, recognized: bool) {
+    pub fn ocr_frame_handled(&self, day: &str, number: u32, outcome: crate::ocr::Outcome) {
         self.update(|s| {
             s.ocr.current = Some(FrameRef { day: day.to_string(), number, at: Local::now() });
             s.ocr.remaining = s.ocr.remaining.saturating_sub(1);
-            if recognized {
-                s.ocr.recognized += 1;
-            } else {
-                s.ocr.skipped += 1;
+            match outcome {
+                crate::ocr::Outcome::Read => s.ocr.recognized += 1,
+                crate::ocr::Outcome::Unchanged => s.ocr.skipped += 1,
+                crate::ocr::Outcome::Failed => s.ocr.failed += 1,
             }
         });
     }
@@ -553,8 +559,8 @@ mod tests {
     fn counts_ocr_progress_down() {
         let activity = Activity::default();
         activity.ocr_pass_started(3);
-        activity.ocr_frame_handled("2024-01-01", 1, true);
-        activity.ocr_frame_handled("2024-01-01", 2, false);
+        activity.ocr_frame_handled("2024-01-01", 1, crate::ocr::Outcome::Read);
+        activity.ocr_frame_handled("2024-01-01", 2, crate::ocr::Outcome::Unchanged);
         let ocr = activity.snapshot(false, || true).ocr;
         assert_eq!(ocr.state, State::Working);
         assert_eq!(ocr.remaining, 1);
