@@ -7,6 +7,7 @@ mod database;
 mod menu_app;
 mod diagnostics;
 mod ocr;
+mod ocr_helper;
 mod ocr_tiles;
 mod paths;
 mod settings;
@@ -956,6 +957,17 @@ fn show_about_window<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
+/// If this process was started as the OCR helper (see `ocr_helper`), serve
+/// text recognition until the app closes its stdin, and return `true`: the
+/// caller then exits instead of starting the app.
+pub fn run_ocr_helper_if_asked() -> bool {
+    if std::env::args().nth(1).as_deref() != Some(ocr_helper::HELPER_ARG) {
+        return false;
+    }
+    ocr::run_helper();
+    true
+}
+
 pub fn run() {
     let photographer_state: PhotographerState = Arc::new(Mutex::new(None));
     let activity: ActivityState = Arc::default();
