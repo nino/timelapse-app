@@ -3,6 +3,7 @@ use serde::Serialize;
 use std::path::PathBuf;
 use std::time::Duration;
 use chrono::{DateTime, Utc, Local};
+use crate::menu_app::menu_bar_app;
 
 /// How `ocr_fts` splits text into words. Has to stay what the
 /// `add_day_and_ocr` migration created the table with, so that
@@ -263,9 +264,37 @@ impl ScreenshotDatabase {
             )?;
         }
 
+        // Migration 8: the front app as the menu bar names it, read from
+        // each OCR row's text, for screenshots taken before `window_id` was
+        // recorded and for days that only exist as video.
+        if !Self::migration_applied(&tx, "add_menu_app")? {
+            tx.execute("ALTER TABLE ocr_frames ADD COLUMN menu_app TEXT", [])?;
+            Self::fill_menu_apps(&tx)?;
+            tx.execute(
+                "INSERT INTO migrations (migration_name, applied_at) VALUES (?1, ?2)",
+                rusqlite::params!["add_menu_app", Utc::now().to_rfc3339()],
+            )?;
+        }
+
         tx.commit()?;
 
         Ok(vacuum)
+    }
+
+    /// Set every OCR row's `menu_app` from its text.
+    fn fill_menu_apps(tx: &Transaction) -> Result<()> {
+        let mut select = tx.prepare("SELECT id, text, boxes FROM ocr_frames")?;
+        let mut update = tx.prepare("UPDATE ocr_frames SET menu_app = ?1 WHERE id = ?2")?;
+        let mut rows = select.query([])?;
+        while let Some(row) = rows.next()? {
+            let id: i64 = row.get(0)?;
+            let text: String = row.get(1)?;
+            let boxes: Vec<u8> = row.get(2)?;
+            if let Some(app) = menu_bar_app(&text, &unpack_boxes(&boxes)) {
+                update.execute(rusqlite::params![app, id])?;
+            }
+        }
+        Ok(())
     }
 
     fn compact_ocr_frames(tx: &Transaction) -> Result<()> {
@@ -506,13 +535,21 @@ impl ScreenshotDatabase {
 
         if let Some((text, boxes)) = result {
             tx.execute(
-                "INSERT INTO ocr_frames (day, frame_number, text, boxes, processed_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)
+                "INSERT INTO ocr_frames (day, frame_number, text, boxes, processed_at, menu_app)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                  ON CONFLICT (day, frame_number) DO UPDATE SET
                      text = excluded.text,
                      boxes = excluded.boxes,
-                     processed_at = excluded.processed_at",
-                rusqlite::params![day, frame_number, text, pack_boxes(boxes), Utc::now().to_rfc3339()],
+                     processed_at = excluded.processed_at,
+                     menu_app = excluded.menu_app",
+                rusqlite::params![
+                    day,
+                    frame_number,
+                    text,
+                    pack_boxes(boxes),
+                    Utc::now().to_rfc3339(),
+                    menu_bar_app(text, boxes)
+                ],
             )?;
         }
 
@@ -977,6 +1014,57 @@ mod tests {
         db.insert_capture("2026-10-10", 1, Utc::now(), Local::now(), Some(&tool)).unwrap();
 
         assert_eq!(db.front_window("2026-10-10", 1).unwrap(), Some(tool));
+    }
+
+    fn menu_app(db: &ScreenshotDatabase, day: &str, frame_number: u32) -> Option<String> {
+        db.conn
+            .query_row(
+                "SELECT menu_app FROM ocr_frames WHERE day = ?1 AND frame_number = ?2",
+                rusqlite::params![day, frame_number],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    const MENU_BAR: &str = "Blender\nWindow";
+    const MENU_BAR_BOXES: [LineBox; 2] =
+        [[0.0523, 0.9766, 0.0349, 0.0143], [0.0974, 0.9767, 0.0334, 0.0139]];
+
+    #[test]
+    fn ocr_rows_record_the_app_the_menu_bar_names() {
+        let temp_dir = TempDir::new().unwrap();
+        let db = ScreenshotDatabase::new(temp_dir.path().join("test.db")).unwrap();
+
+        db.record_ocr_frame("2026-10-10", 1, Some((MENU_BAR, &MENU_BAR_BOXES))).unwrap();
+        db.record_video_ocr_frame("2026-10-09", 1, Some((MENU_BAR, &MENU_BAR_BOXES))).unwrap();
+        db.record_ocr_frame("2026-10-10", 2, Some(("22:39", &[[0.38, 0.75, 0.22, 0.1]])))
+            .unwrap();
+
+        assert_eq!(menu_app(&db, "2026-10-10", 1).as_deref(), Some("Blender"));
+        assert_eq!(menu_app(&db, "2026-10-09", 1).as_deref(), Some("Blender"));
+        assert_eq!(menu_app(&db, "2026-10-10", 2), None);
+    }
+
+    #[test]
+    fn the_migration_reads_the_app_from_existing_ocr_rows() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        {
+            let db = ScreenshotDatabase::new(db_path.clone()).unwrap();
+            db.record_ocr_frame("2026-10-10", 1, Some((MENU_BAR, &MENU_BAR_BOXES))).unwrap();
+            // As the row was before the migration.
+            db.conn
+                .execute_batch(
+                    "UPDATE ocr_frames SET menu_app = NULL;
+                     DELETE FROM migrations WHERE migration_name = 'add_menu_app';
+                     ALTER TABLE ocr_frames DROP COLUMN menu_app;",
+                )
+                .unwrap();
+        }
+
+        let db = ScreenshotDatabase::new(db_path).unwrap();
+
+        assert_eq!(menu_app(&db, "2026-10-10", 1).as_deref(), Some("Blender"));
     }
 
     #[test]
