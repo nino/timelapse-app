@@ -4,8 +4,9 @@
 //! Events are rare (state changes, errors, finished batches, hourly
 //! summaries), never one per frame. Recording one only sends it down a
 //! channel; a thread of its own writes whatever has queued up in one
-//! transaction, so no worker ever waits on the disk for it. Before `init`
-//! (and in tests) events go nowhere.
+//! transaction, so no worker ever waits on the disk for it. Warnings and
+//! errors also go to stderr. Before `init` (and in tests) events go nowhere
+//! else.
 //!
 //! Rows older than `MAX_AGE`, and beyond the newest `MAX_ROWS`, are deleted
 //! when the log opens and every `PRUNE_EVERY` after that.
@@ -94,8 +95,12 @@ impl Event {
         self
     }
 
-    /// Queue the event for the log. Never blocks.
+    /// Queue the event for the log, and print warnings and errors to stderr
+    /// too. Never blocks.
     pub fn record(self) {
+        if self.level != Level::Info {
+            eprintln!("{}: {}", self.source, self.message);
+        }
         if let Some(sink) = SINK.get() {
             let _ = sink.send(Message::Event(self));
         }

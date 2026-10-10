@@ -436,8 +436,15 @@ impl Activity {
     }
 
     pub fn ocr_failed(&self, message: String) {
-        diagnostics::error("ocr", message.clone()).record();
-        self.update(|s| s.ocr.last_error = Some(Failure { at: Local::now(), message }));
+        let mut repeated = false;
+        self.update(|s| {
+            repeated = s.ocr.last_error.as_ref().is_some_and(|last| last.message == message);
+            s.ocr.last_error = Some(Failure { at: Local::now(), message: message.clone() });
+        });
+        // A frame retried every minute fails with the same message each time.
+        if !repeated {
+            diagnostics::error("ocr", message).record();
+        }
     }
 
     /// OCR goes to sleep for `wait`, in `state`.

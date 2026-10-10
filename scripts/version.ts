@@ -69,11 +69,13 @@ export function parseTags(refs: string): Map<string, string> {
 
 export const TAG_FORMAT = "%(refname:short) %(*objectname) %(objectname)";
 
-function git(cwd: string, args: string[]): string {
+/** Run git in `cwd` and return what it printed. */
+export function git(cwd: string, args: string[]): string {
   return execFileSync("git", args, { cwd, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
 }
 
-/** The released versions' tags reachable from HEAD, by commit. */
-export function readTags(cwd: string): Map<string, string> {
-  return parseTags(git(cwd, ["for-each-ref", "--merged", "HEAD", `--format=${TAG_FORMAT}`, "refs/tags/v*"]));
+/** The released versions' tags, by commit: those reachable from HEAD, or with `all`, every one. */
+export function readTags(cwd: string, all = false): Map<string, string> {
+  const merged = all ? [] : ["--merged", "HEAD"];
+  return parseTags(git(cwd, ["for-each-ref", ...merged, `--format=${TAG_FORMAT}`, "refs/tags/v*"]));
 }
