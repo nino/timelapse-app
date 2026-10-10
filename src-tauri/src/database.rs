@@ -3,6 +3,7 @@ use serde::Serialize;
 use std::path::PathBuf;
 use std::time::Duration;
 use chrono::{DateTime, Utc, Local};
+use crate::menu_app::menu_bar_app;
 
 /// How `ocr_fts` splits text into words. Has to stay what the
 /// `add_day_and_ocr` migration created the table with, so that
@@ -11,6 +12,21 @@ const OCR_TOKENIZER: &str = "unicode61 remove_diacritics 2";
 
 pub struct ScreenshotDatabase {
     conn: Connection,
+}
+
+/// The app and window that were in front when a screenshot was taken.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrontWindow {
+    /// The app's name, as the window server reports it (`Blender`).
+    pub app_name: String,
+    /// The app's bundle identifier (`org.blenderfoundation.blender`), when it
+    /// has one.
+    pub bundle_id: Option<String>,
+    /// The app bundle on macOS (`/Applications/Blender.app`), the executable
+    /// elsewhere.
+    pub app_path: String,
+    /// The window's title. Empty when the app doesn't give its window one.
+    pub title: String,
 }
 
 impl ScreenshotDatabase {
@@ -223,9 +239,62 @@ impl ScreenshotDatabase {
             )?;
         }
 
+        // Migration 7: which app and window were in front for each
+        // screenshot, so a day can later be cut down to the time spent in one
+        // app. A window is stored once and screenshots point at it, so a
+        // long title isn't repeated every second.
+        if !Self::migration_applied(&tx, "add_windows")? {
+            tx.execute_batch(
+                "CREATE TABLE windows (
+                     id INTEGER PRIMARY KEY,
+                     app_name TEXT NOT NULL,
+                     bundle_id TEXT,
+                     app_path TEXT NOT NULL,
+                     title TEXT NOT NULL,
+                     UNIQUE (app_path, app_name, title)
+                 );
+                 CREATE INDEX windows_bundle_id ON windows (bundle_id);
+                 -- NULL: taken before this was recorded, or with no window
+                 -- in front.
+                 ALTER TABLE screenshots ADD COLUMN window_id INTEGER REFERENCES windows (id);",
+            )?;
+            tx.execute(
+                "INSERT INTO migrations (migration_name, applied_at) VALUES (?1, ?2)",
+                rusqlite::params!["add_windows", Utc::now().to_rfc3339()],
+            )?;
+        }
+
+        // Migration 8: the front app as the menu bar names it, read from
+        // each OCR row's text, for screenshots taken before `window_id` was
+        // recorded and for days that only exist as video.
+        if !Self::migration_applied(&tx, "add_menu_app")? {
+            tx.execute("ALTER TABLE ocr_frames ADD COLUMN menu_app TEXT", [])?;
+            Self::fill_menu_apps(&tx)?;
+            tx.execute(
+                "INSERT INTO migrations (migration_name, applied_at) VALUES (?1, ?2)",
+                rusqlite::params!["add_menu_app", Utc::now().to_rfc3339()],
+            )?;
+        }
+
         tx.commit()?;
 
         Ok(vacuum)
+    }
+
+    /// Set every OCR row's `menu_app` from its text.
+    fn fill_menu_apps(tx: &Transaction) -> Result<()> {
+        let mut select = tx.prepare("SELECT id, text, boxes FROM ocr_frames")?;
+        let mut update = tx.prepare("UPDATE ocr_frames SET menu_app = ?1 WHERE id = ?2")?;
+        let mut rows = select.query([])?;
+        while let Some(row) = rows.next()? {
+            let id: i64 = row.get(0)?;
+            let text: String = row.get(1)?;
+            let boxes: Vec<u8> = row.get(2)?;
+            if let Some(app) = menu_bar_app(&text, &unpack_boxes(&boxes)) {
+                update.execute(rusqlite::params![app, id])?;
+            }
+        }
+        Ok(())
     }
 
     fn compact_ocr_frames(tx: &Transaction) -> Result<()> {
@@ -344,6 +413,7 @@ impl ScreenshotDatabase {
 
     /// Insert a new screenshot record. `day` is the name of the day folder the
     /// PNG was written to (`YYYY-MM-DD`).
+    #[cfg(test)]
     pub fn insert_screenshot(
         &self,
         day: &str,
@@ -351,17 +421,63 @@ impl ScreenshotDatabase {
         created_at: DateTime<Utc>,
         local_time: DateTime<Local>,
     ) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO screenshots (day, frame_number, created_at, local_time) VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![
+        self.insert_capture(day, frame_number, created_at, local_time, None)
+    }
+
+    /// Insert a new screenshot record, with the window that was in front
+    /// when it was taken.
+    pub fn insert_capture(
+        &self,
+        day: &str,
+        frame_number: u32,
+        created_at: DateTime<Utc>,
+        local_time: DateTime<Local>,
+        window: Option<&FrontWindow>,
+    ) -> Result<()> {
+        let window_id = window.map(|window| self.window_id(window)).transpose()?;
+        self.conn
+            .prepare_cached(
+                "INSERT INTO screenshots (day, frame_number, created_at, local_time, window_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+            )?
+            .execute(rusqlite::params![
                 day,
                 frame_number,
                 created_at.to_rfc3339(),
-                local_time.to_rfc3339()
-            ],
-        )?;
+                local_time.to_rfc3339(),
+                window_id,
+            ])?;
         Ok(())
     }
+
+    /// The `windows` row for `window`, added if it is new. The same window
+    /// stays in front for most captures, so this is nearly always one
+    /// indexed lookup.
+    fn window_id(&self, window: &FrontWindow) -> Result<i64> {
+        let key = rusqlite::params![window.app_path, window.app_name, window.title];
+        let found = self
+            .conn
+            .prepare_cached(
+                "SELECT id FROM windows WHERE app_path = ?1 AND app_name = ?2 AND title = ?3",
+            )?
+            .query_row(key, |row| row.get(0))
+            .optional()?;
+        if let Some(id) = found {
+            return Ok(id);
+        }
+        self.conn
+            .prepare_cached(
+                "INSERT INTO windows (app_path, app_name, title, bundle_id) VALUES (?1, ?2, ?3, ?4)",
+            )?
+            .execute(rusqlite::params![
+                window.app_path,
+                window.app_name,
+                window.title,
+                window.bundle_id
+            ])?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
 
     /// Get screenshot metadata by frame number. Frame numbers restart in every
     /// day folder, so pass `day` to get the right one; without it this returns
@@ -419,13 +535,21 @@ impl ScreenshotDatabase {
 
         if let Some((text, boxes)) = result {
             tx.execute(
-                "INSERT INTO ocr_frames (day, frame_number, text, boxes, processed_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)
+                "INSERT INTO ocr_frames (day, frame_number, text, boxes, processed_at, menu_app)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                  ON CONFLICT (day, frame_number) DO UPDATE SET
                      text = excluded.text,
                      boxes = excluded.boxes,
-                     processed_at = excluded.processed_at",
-                rusqlite::params![day, frame_number, text, pack_boxes(boxes), Utc::now().to_rfc3339()],
+                     processed_at = excluded.processed_at,
+                     menu_app = excluded.menu_app",
+                rusqlite::params![
+                    day,
+                    frame_number,
+                    text,
+                    pack_boxes(boxes),
+                    Utc::now().to_rfc3339(),
+                    menu_bar_app(text, boxes)
+                ],
             )?;
         }
 
@@ -823,6 +947,124 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM screenshots", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    impl ScreenshotDatabase {
+    /// The window that was in front for frame `frame_number` of `day`, if it
+    /// was recorded.
+    fn front_window(&self, day: &str, frame_number: u32) -> Result<Option<FrontWindow>> {
+        self.conn
+            .query_row(
+                "SELECT w.app_name, w.bundle_id, w.app_path, w.title
+                 FROM screenshots s JOIN windows w ON w.id = s.window_id
+                 WHERE s.day = ?1 AND s.frame_number = ?2
+                 ORDER BY s.id DESC LIMIT 1",
+                rusqlite::params![day, frame_number],
+                |row| {
+                    Ok(FrontWindow {
+                        app_name: row.get(0)?,
+                        bundle_id: row.get(1)?,
+                        app_path: row.get(2)?,
+                        title: row.get(3)?,
+                    })
+                },
+            )
+            .optional()
+    }
+    }
+
+    fn window(app_name: &str, title: &str) -> FrontWindow {
+        FrontWindow {
+            app_name: app_name.to_string(),
+            bundle_id: Some(format!("org.example.{}", app_name.to_lowercase())),
+            app_path: format!("/Applications/{app_name}.app"),
+            title: title.to_string(),
+        }
+    }
+
+    #[test]
+    fn records_the_window_in_front_once_per_window() {
+        let temp_dir = TempDir::new().unwrap();
+        let db = ScreenshotDatabase::new(temp_dir.path().join("test.db")).unwrap();
+        let blender = window("Blender", "scene.blend");
+        let editor = window("Zed", "main.rs");
+
+        db.insert_capture("2026-10-10", 1, Utc::now(), Local::now(), Some(&blender)).unwrap();
+        db.insert_capture("2026-10-10", 2, Utc::now(), Local::now(), Some(&blender)).unwrap();
+        db.insert_capture("2026-10-10", 3, Utc::now(), Local::now(), Some(&editor)).unwrap();
+        db.insert_capture("2026-10-10", 4, Utc::now(), Local::now(), None).unwrap();
+
+        assert_eq!(db.front_window("2026-10-10", 1).unwrap(), Some(blender.clone()));
+        assert_eq!(db.front_window("2026-10-10", 2).unwrap(), Some(blender));
+        assert_eq!(db.front_window("2026-10-10", 3).unwrap(), Some(editor));
+        assert_eq!(db.front_window("2026-10-10", 4).unwrap(), None);
+        let windows: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM windows", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(windows, 2);
+    }
+
+    #[test]
+    fn a_window_without_a_bundle_id_is_recorded() {
+        let temp_dir = TempDir::new().unwrap();
+        let db = ScreenshotDatabase::new(temp_dir.path().join("test.db")).unwrap();
+        let tool = FrontWindow { bundle_id: None, ..window("tool", "") };
+
+        db.insert_capture("2026-10-10", 1, Utc::now(), Local::now(), Some(&tool)).unwrap();
+
+        assert_eq!(db.front_window("2026-10-10", 1).unwrap(), Some(tool));
+    }
+
+    fn menu_app(db: &ScreenshotDatabase, day: &str, frame_number: u32) -> Option<String> {
+        db.conn
+            .query_row(
+                "SELECT menu_app FROM ocr_frames WHERE day = ?1 AND frame_number = ?2",
+                rusqlite::params![day, frame_number],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    const MENU_BAR: &str = "Blender\nWindow";
+    const MENU_BAR_BOXES: [LineBox; 2] =
+        [[0.0523, 0.9766, 0.0349, 0.0143], [0.0974, 0.9767, 0.0334, 0.0139]];
+
+    #[test]
+    fn ocr_rows_record_the_app_the_menu_bar_names() {
+        let temp_dir = TempDir::new().unwrap();
+        let db = ScreenshotDatabase::new(temp_dir.path().join("test.db")).unwrap();
+
+        db.record_ocr_frame("2026-10-10", 1, Some((MENU_BAR, &MENU_BAR_BOXES))).unwrap();
+        db.record_video_ocr_frame("2026-10-09", 1, Some((MENU_BAR, &MENU_BAR_BOXES))).unwrap();
+        db.record_ocr_frame("2026-10-10", 2, Some(("22:39", &[[0.38, 0.75, 0.22, 0.1]])))
+            .unwrap();
+
+        assert_eq!(menu_app(&db, "2026-10-10", 1).as_deref(), Some("Blender"));
+        assert_eq!(menu_app(&db, "2026-10-09", 1).as_deref(), Some("Blender"));
+        assert_eq!(menu_app(&db, "2026-10-10", 2), None);
+    }
+
+    #[test]
+    fn the_migration_reads_the_app_from_existing_ocr_rows() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        {
+            let db = ScreenshotDatabase::new(db_path.clone()).unwrap();
+            db.record_ocr_frame("2026-10-10", 1, Some((MENU_BAR, &MENU_BAR_BOXES))).unwrap();
+            // As the row was before the migration.
+            db.conn
+                .execute_batch(
+                    "UPDATE ocr_frames SET menu_app = NULL;
+                     DELETE FROM migrations WHERE migration_name = 'add_menu_app';
+                     ALTER TABLE ocr_frames DROP COLUMN menu_app;",
+                )
+                .unwrap();
+        }
+
+        let db = ScreenshotDatabase::new(db_path).unwrap();
+
+        assert_eq!(menu_app(&db, "2026-10-10", 1).as_deref(), Some("Blender"));
     }
 
     #[test]

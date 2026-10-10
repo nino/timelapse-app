@@ -403,6 +403,36 @@ describe('App', () => {
       await settleFrameTime();
     });
 
+    it('plays at the picked speed and remembers it', async () => {
+      localStorage.removeItem('playbackSpeed');
+      mockLibrary({ '2026-10-04': 100 });
+      const { unmount } = render(<App initialPosition={{ day: '2026-10-04', index: 10 }} />);
+      await waitFor(() => expect(shownFrame()).toBe(frameUrl('2026-10-04', 10)));
+      finishLoading();
+
+      const speed = screen.getByRole('button', { name: 'Playback speed' });
+      expect(speed).toHaveTextContent('15 fps');
+      fireEvent.click(speed);
+      fireEvent.click(await screen.findByRole('option', { name: '5 fps' }));
+      expect(speed).toHaveTextContent('5 fps');
+
+      // At 5 fps a frame stays up for 200 ms, even once it has loaded.
+      fireEvent.click(playButton());
+      await waitFor(() => expect(shownFrame()).toBe(frameUrl('2026-10-04', 11)));
+      finishLoading();
+      await act(() => new Promise((resolve) => setTimeout(resolve, 100)));
+      expect(shownFrame()).toBe(frameUrl('2026-10-04', 11));
+      await waitFor(() => expect(shownFrame()).toBe(frameUrl('2026-10-04', 12)));
+      fireEvent.click(playButton());
+      await settleFrameTime();
+      unmount();
+
+      render(<App initialPosition={{ day: '2026-10-04', index: 10 }} />);
+      expect(screen.getByRole('button', { name: 'Playback speed' })).toHaveTextContent('5 fps');
+      localStorage.removeItem('playbackSpeed');
+      await settleFrameTime();
+    });
+
     it('stops when another day is opened', async () => {
       mockLibrary({ '2026-10-03': 50, '2026-10-04': 100 });
       render(<App initialPosition={{ day: '2026-10-04', index: 10 }} />);

@@ -52,7 +52,7 @@ export function DayPicker({
   );
 }
 
-function Chevron(): React.ReactNode {
+export function Chevron(): React.ReactNode {
   return (
     <svg viewBox="0 0 16 16" aria-hidden="true" className="size-4 text-muted-fg">
       <path
@@ -68,7 +68,7 @@ function Chevron(): React.ReactNode {
 }
 
 // Only shown on the selected option (ListboxOption sets data-selected).
-function Check(): React.ReactNode {
+export function Check(): React.ReactNode {
   return (
     <svg viewBox="0 0 16 16" aria-hidden="true" className="invisible size-3.5 in-data-selected:visible">
       <path

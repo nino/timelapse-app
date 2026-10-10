@@ -13,6 +13,7 @@ import {
 import { usePendingFrames } from "./hooks/usePendingFrames";
 import { PendingStretches } from "./PendingStretches";
 import { nextStop, previousStop, rangeAt, toStops, type DayMatch, type Stop } from "./search";
+import { savedPlaybackSpeed, savePlaybackSpeed, SpeedPicker, type PlaybackSpeed } from "./SpeedPicker";
 import { fieldFrame, focusRing, segmentButton } from "./ui";
 import { setViewerPosition, type ViewerPosition } from "./viewerPosition";
 
@@ -23,9 +24,6 @@ const DEFAULT_FRAME_SIZE = { width: 1800, height: 1124 };
 // How long the viewer must stay on a frame before it is remembered for the
 // next launch, so a scrub doesn't save every frame it passes.
 const SAVE_POSITION_DELAY_MS = 500;
-// Playback speed: 15 frames a second, the rate the old exported videos used,
-// so with one capture a second an hour plays in four minutes.
-const PLAYBACK_FRAME_MS = 1000 / 15;
 
 export function App({
   initialPosition,
@@ -207,7 +205,9 @@ export function App({
   const wantedSrc =
     selectedDay && frameCount > 0 ? frameUrl(selectedDay, currentIndex) : null;
   const { src, frameFailed, loaded, settled, onLoad, onError } = useGatedImage(wantedSrc);
+  const [speed, setSpeed] = React.useState<PlaybackSpeed>(savedPlaybackSpeed);
   const { playing, togglePlaying } = usePlayback({
+    frameMs: 1000 / speed,
     selectedDay,
     frameCount,
     currentIndex,
@@ -417,25 +417,35 @@ export function App({
 
       <div className="bg-card px-4 py-3 border-t border-border">
         <div className="flex items-center gap-4">
-          <button
-            type="button"
-            aria-label={playing ? "Pause" : "Play"}
-            title={playing ? "Pause (Space)" : "Play (Space)"}
-            disabled={frameCount === 0}
-            onClick={togglePlaying}
-            className={`inline-flex size-7.5 shrink-0 items-center justify-center rounded-full border border-input bg-field text-fg transition-colors hover:bg-muted disabled:pointer-events-none disabled:opacity-50 ${focusRing}`}
-          >
-            {playing ? (
-              <svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor" aria-hidden="true">
-                <rect x="2" y="1.5" width="2.75" height="9" rx="0.75" />
-                <rect x="7.25" y="1.5" width="2.75" height="9" rx="0.75" />
-              </svg>
-            ) : (
-              <svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor" aria-hidden="true">
-                <path d="M3.5 1.9v8.2a.6.6 0 0 0 .9.5l6.6-4.1a.6.6 0 0 0 0-1L4.4 1.4a.6.6 0 0 0-.9.5Z" />
-              </svg>
-            )}
-          </button>
+          <div className="flex h-7.5 shrink-0 rounded-full border border-input bg-field text-fg">
+            <button
+              type="button"
+              aria-label={playing ? "Pause" : "Play"}
+              title={playing ? "Pause (Space)" : "Play (Space)"}
+              disabled={frameCount === 0}
+              onClick={togglePlaying}
+              className={`inline-flex w-8.5 items-center justify-center rounded-l-full pl-0.5 transition-colors hover:bg-muted disabled:pointer-events-none disabled:opacity-50 ${focusRing}`}
+            >
+              {playing ? (
+                <svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor" aria-hidden="true">
+                  <rect x="2" y="1.5" width="2.75" height="9" rx="0.75" />
+                  <rect x="7.25" y="1.5" width="2.75" height="9" rx="0.75" />
+                </svg>
+              ) : (
+                <svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor" aria-hidden="true">
+                  <path d="M3.5 1.9v8.2a.6.6 0 0 0 .9.5l6.6-4.1a.6.6 0 0 0 0-1L4.4 1.4a.6.6 0 0 0-.9.5Z" />
+                </svg>
+              )}
+            </button>
+            <SpeedPicker
+              value={speed}
+              onChange={(next) => {
+                setSpeed(next);
+                savePlaybackSpeed(next);
+              }}
+              className="rounded-r-full border-l border-input"
+            />
+          </div>
           <div className="relative flex-1 scrub-track p-1 pt-0 rounded-full">
             <PendingStretches pending={pendingFrames} />
             <MatchMarks stops={stops} frameCount={frameCount} currentIndex={currentIndex} />
@@ -567,18 +577,20 @@ function useDebounced<T>(value: T, delayMs: number): T {
 }
 
 /**
- * Play the selected day forward at `PLAYBACK_FRAME_MS` a frame, one frame
+ * Play the selected day forward at `frameMs` a frame, one frame
  * after the other, until its last frame. Space toggles it too. Switching
  * days or hiding the window pauses; scrubbing while playing carries on from
  * wherever the scrubber was moved to.
  */
 function usePlayback({
+  frameMs,
   selectedDay,
   frameCount,
   currentIndex,
   frameShown,
   goTo,
 }: {
+  frameMs: number;
   selectedDay: string | null;
   frameCount: number;
   currentIndex: number;
@@ -606,14 +618,14 @@ function usePlayback({
 
   React.useEffect(() => {
     if (!playing || !frameShown) return;
-    const wait = Math.max(0, lastStepAt.current + PLAYBACK_FRAME_MS - performance.now());
+    const wait = Math.max(0, lastStepAt.current + frameMs - performance.now());
     const timer = setTimeout((): void => {
       lastStepAt.current = performance.now();
       goTo(currentIndex + 1);
       if (currentIndex + 1 >= frameCount - 1) setPlayingDay(null);
     }, wait);
     return (): void => clearTimeout(timer);
-  }, [playing, frameShown, currentIndex, frameCount, goTo]);
+  }, [playing, frameShown, currentIndex, frameCount, frameMs, goTo]);
 
   // Nobody is watching a hidden or minimised window: stop rather than keep
   // loading frames.
