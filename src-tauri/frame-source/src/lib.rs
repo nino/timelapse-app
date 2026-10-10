@@ -13,6 +13,7 @@
 //! only source for the hour still being captured.
 
 mod cache;
+mod gate;
 mod library;
 mod read_ahead;
 mod video;
@@ -27,6 +28,7 @@ use chrono::{DateTime, Duration, NaiveDate, NaiveDateTime};
 use serde::Serialize;
 
 use cache::ChunkCache;
+use gate::Gate;
 use library::{Shot, VideoFile, VideoKind};
 pub use library::filed_at;
 use read_ahead::ReadAhead;
@@ -43,6 +45,11 @@ pub const CHUNK_FRAMES: usize = 150;
 /// (Alt+arrow) is 100 frames, so one step never lands on a chunk read-ahead
 /// hasn't asked for.
 pub const READ_AHEAD_FRAMES: usize = 100;
+
+/// How many videos are probed at once. A probe has ffmpeg read the whole
+/// file, so this is a limit on disk reads, not on CPU: two keep an SSD busy
+/// without filling its queue.
+const PROBES_AT_ONCE: usize = 2;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -167,6 +174,12 @@ pub struct FrameSource {
     last_frame: Mutex<Option<(String, usize)>>,
     /// Per-video facts keyed by path, valid while size and mtime match.
     probes: Mutex<HashMap<PathBuf, Probe>>,
+    /// Probes take turns through this. See `gate`.
+    probe_gate: Gate,
+    /// One lock per video, held while it is probed, so that callers asking
+    /// about the same video at once wait for one probe and don't each run
+    /// their own.
+    probing: Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>,
     /// Screenshot listings keyed by day, valid while the folder's mtime
     /// matches. Today's folder changes every second; older ones never do.
     screenshots: Mutex<HashMap<NaiveDate, (SystemTime, Arc<Vec<Shot>>)>>,
@@ -200,6 +213,8 @@ impl FrameSource {
             read_ahead: None,
             last_frame: Mutex::new(None),
             probes: Mutex::new(HashMap::new()),
+            probe_gate: Gate::new(PROBES_AT_ONCE),
+            probing: Mutex::new(HashMap::new()),
             screenshots: Mutex::new(HashMap::new()),
             day_times: Mutex::new(HashMap::new()),
             recorded_frames: Mutex::new(HashMap::new()),
@@ -728,11 +743,27 @@ impl FrameSource {
     fn probe(&self, path: &Path) -> Result<Probe, Error> {
         let meta = fs::metadata(path)?;
         let (len, modified) = (meta.len(), meta.modified()?);
-        if let Some(probe) = self.probes.lock().unwrap().get(path) {
-            if probe.len == len && probe.modified == modified {
-                return Ok(*probe);
-            }
+        let known = || {
+            let probes = self.probes.lock().unwrap();
+            probes
+                .get(path)
+                .filter(|probe| probe.len == len && probe.modified == modified)
+                .copied()
+        };
+        if let Some(probe) = known() {
+            return Ok(probe);
         }
+        let this_video = {
+            let mut probing = self.probing.lock().unwrap();
+            Arc::clone(probing.entry(path.to_owned()).or_default())
+        };
+        let _only_probe = this_video.lock().unwrap();
+        // Someone else asking about the same day may have probed this video
+        // while this call waited.
+        if let Some(probe) = known() {
+            return Ok(probe);
+        }
+        let _turn = self.probe_gate.enter();
         let probe = Probe {
             len,
             modified,
