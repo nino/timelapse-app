@@ -23,6 +23,9 @@ const DEFAULT_FRAME_SIZE = { width: 1800, height: 1124 };
 // How long the viewer must stay on a frame before it is remembered for the
 // next launch, so a scrub doesn't save every frame it passes.
 const SAVE_POSITION_DELAY_MS = 500;
+// Playback speed: 15 frames a second, the rate the old exported videos used,
+// so with one capture a second an hour plays in four minutes.
+const PLAYBACK_FRAME_MS = 1000 / 15;
 
 export function App({
   initialPosition,
@@ -203,7 +206,17 @@ export function App({
 
   const wantedSrc =
     selectedDay && frameCount > 0 ? frameUrl(selectedDay, currentIndex) : null;
-  const { src, frameFailed, loaded, onLoad, onError } = useGatedImage(wantedSrc);
+  const { src, frameFailed, loaded, settled, onLoad, onError } = useGatedImage(wantedSrc);
+  const { playing, togglePlaying } = usePlayback({
+    selectedDay,
+    frameCount,
+    currentIndex,
+    // The next frame is asked for only once this one is on screen (or has
+    // failed), so playback slows down rather than queueing decodes when
+    // frames come from video faster than they can be decoded.
+    frameShown: wantedSrc !== null && settled === wantedSrc,
+    goTo,
+  });
   // Stretches still to be decoded from video are drawn paler on the scrubber.
   const pendingFrames = usePendingFrames(day, loaded);
   const [frameSize, setFrameSize] = React.useState(DEFAULT_FRAME_SIZE);
@@ -404,6 +417,25 @@ export function App({
 
       <div className="bg-card px-4 py-3 border-t border-border">
         <div className="flex items-center gap-4">
+          <button
+            type="button"
+            aria-label={playing ? "Pause" : "Play"}
+            title={playing ? "Pause (Space)" : "Play (Space)"}
+            disabled={frameCount === 0}
+            onClick={togglePlaying}
+            className={`inline-flex size-7.5 shrink-0 items-center justify-center rounded-full border border-input bg-field text-fg transition-colors hover:bg-muted disabled:pointer-events-none disabled:opacity-50 ${focusRing}`}
+          >
+            {playing ? (
+              <svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor" aria-hidden="true">
+                <rect x="2" y="1.5" width="2.75" height="9" rx="0.75" />
+                <rect x="7.25" y="1.5" width="2.75" height="9" rx="0.75" />
+              </svg>
+            ) : (
+              <svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor" aria-hidden="true">
+                <path d="M3.5 1.9v8.2a.6.6 0 0 0 .9.5l6.6-4.1a.6.6 0 0 0 0-1L4.4 1.4a.6.6 0 0 0-.9.5Z" />
+              </svg>
+            )}
+          </button>
           <div className="relative flex-1 scrub-track p-1 pt-0 rounded-full">
             <PendingStretches pending={pendingFrames} />
             <MatchMarks stops={stops} frameCount={frameCount} currentIndex={currentIndex} />
@@ -535,6 +567,84 @@ function useDebounced<T>(value: T, delayMs: number): T {
 }
 
 /**
+ * Play the selected day forward at `PLAYBACK_FRAME_MS` a frame, one frame
+ * after the other, until its last frame. Space toggles it too. Switching
+ * days or hiding the window pauses; scrubbing while playing carries on from
+ * wherever the scrubber was moved to.
+ */
+function usePlayback({
+  selectedDay,
+  frameCount,
+  currentIndex,
+  frameShown,
+  goTo,
+}: {
+  selectedDay: string | null;
+  frameCount: number;
+  currentIndex: number;
+  /** Whether the frame at `currentIndex` has finished loading. */
+  frameShown: boolean;
+  goTo: (index: number) => void;
+}): { playing: boolean; togglePlaying: () => void } {
+  // The day being played, so that opening another day stops playback.
+  const [playingDay, setPlayingDay] = React.useState<string | null>(null);
+  const atEnd = currentIndex >= frameCount - 1;
+  const playing = playingDay !== null && playingDay === selectedDay && !atEnd;
+  const lastStepAt = React.useRef(0);
+
+  const togglePlaying = React.useCallback((): void => {
+    if (playing) {
+      setPlayingDay(null);
+      return;
+    }
+    if (selectedDay === null || frameCount === 0) return;
+    // Playing from the last frame starts the day over.
+    if (atEnd) goTo(0);
+    lastStepAt.current = 0;
+    setPlayingDay(selectedDay);
+  }, [playing, selectedDay, frameCount, atEnd, goTo]);
+
+  React.useEffect(() => {
+    if (!playing || !frameShown) return;
+    const wait = Math.max(0, lastStepAt.current + PLAYBACK_FRAME_MS - performance.now());
+    const timer = setTimeout((): void => {
+      lastStepAt.current = performance.now();
+      goTo(currentIndex + 1);
+      if (currentIndex + 1 >= frameCount - 1) setPlayingDay(null);
+    }, wait);
+    return (): void => clearTimeout(timer);
+  }, [playing, frameShown, currentIndex, frameCount, goTo]);
+
+  // Nobody is watching a hidden or minimised window: stop rather than keep
+  // loading frames.
+  React.useEffect(() => {
+    if (!playing) return;
+    const handleVisibility = (): void => {
+      if (document.hidden) setPlayingDay(null);
+    };
+    document.addEventListener("visibilitychange", handleVisibility);
+    return (): void => document.removeEventListener("visibilitychange", handleVisibility);
+  }, [playing]);
+
+  // Space plays and pauses, except where it types or presses a button.
+  React.useEffect(() => {
+    const handleKeydown = (e: KeyboardEvent): void => {
+      if (e.key !== " " || e.metaKey || e.ctrlKey || e.altKey) return;
+      if (e.target instanceof Element) {
+        if (e.target.closest('button, [role="listbox"], [aria-haspopup="listbox"], textarea')) return;
+        if (e.target instanceof HTMLInputElement && e.target.type !== "range") return;
+      }
+      e.preventDefault();
+      togglePlaying();
+    };
+    window.addEventListener("keydown", handleKeydown);
+    return (): void => window.removeEventListener("keydown", handleKeydown);
+  }, [togglePlaying]);
+
+  return { playing, togglePlaying };
+}
+
+/**
  * Show `wanted` in an `<img>`, but never start loading a frame while another
  * is still loading. Dragging the scrubber across a video day would otherwise
  * queue a decode for every chunk it passes; this way each load that finishes
@@ -545,12 +655,15 @@ function useGatedImage(wanted: string | null): {
   frameFailed: boolean;
   /** The last frame that finished loading successfully. */
   loaded: string | null;
+  /** The last frame that finished loading, successfully or not. */
+  settled: string | null;
   onLoad: () => void;
   onError: () => void;
 } {
   const [src, setSrc] = React.useState<string | null>(null);
   const [frameFailed, setFrameFailed] = React.useState(false);
   const [loaded, setLoaded] = React.useState<string | null>(null);
+  const [settled, setSettled] = React.useState<string | null>(null);
   const srcRef = React.useRef<string | null>(null);
   const wantedRef = React.useRef<string | null>(wanted);
   const inFlight = React.useRef(false);
@@ -572,6 +685,7 @@ function useGatedImage(wanted: string | null): {
     (failed: boolean): void => {
       inFlight.current = false;
       setFrameFailed(failed);
+      setSettled(srcRef.current);
       if (!failed) setLoaded(srcRef.current);
       if (wantedRef.current !== srcRef.current) {
         show(wantedRef.current);
@@ -584,6 +698,7 @@ function useGatedImage(wanted: string | null): {
     src,
     frameFailed,
     loaded,
+    settled,
     onLoad: React.useCallback((): void => settle(false), [settle]),
     onError: React.useCallback((): void => settle(true), [settle]),
   };

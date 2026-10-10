@@ -342,6 +342,80 @@ describe('App', () => {
     });
   });
 
+  describe('Playback', () => {
+    function playButton(): HTMLElement {
+      return screen.getByRole('button', { name: /^(Play|Pause)$/ });
+    }
+
+    it('plays forward one frame at a time, waiting for each to load', async () => {
+      mockLibrary({ '2026-10-04': 100 });
+      render(<App initialPosition={{ day: '2026-10-04', index: 10 }} />);
+      await waitFor(() => expect(shownFrame()).toBe(frameUrl('2026-10-04', 10)));
+      finishLoading();
+
+      fireEvent.click(playButton());
+      expect(playButton()).toHaveAccessibleName('Pause');
+      await waitFor(() => expect(shownFrame()).toBe(frameUrl('2026-10-04', 11)));
+      // Frame 11 hasn't loaded, so playback waits for it.
+      await act(() => new Promise((resolve) => setTimeout(resolve, 150)));
+      expect(shownFrame()).toBe(frameUrl('2026-10-04', 11));
+
+      finishLoading();
+      await waitFor(() => expect(shownFrame()).toBe(frameUrl('2026-10-04', 12)));
+      finishLoading();
+
+      fireEvent.click(playButton());
+      expect(playButton()).toHaveAccessibleName('Play');
+      await act(() => new Promise((resolve) => setTimeout(resolve, 150)));
+      expect(position()).toBe('13 / 100');
+      await settleFrameTime();
+    });
+
+    it('stops at the last frame, and starts over from there', async () => {
+      mockLibrary({ '2026-10-04': 3 });
+      render(<App initialPosition={{ day: '2026-10-04', index: 1 }} />);
+      await waitFor(() => expect(shownFrame()).toBe(frameUrl('2026-10-04', 1)));
+      finishLoading();
+
+      fireEvent.click(playButton());
+      await waitFor(() => expect(shownFrame()).toBe(frameUrl('2026-10-04', 2)));
+      finishLoading();
+      await waitFor(() => expect(playButton()).toHaveAccessibleName('Play'));
+      expect(position()).toBe('3 / 3');
+
+      fireEvent.click(playButton());
+      await waitFor(() => expect(shownFrame()).toBe(frameUrl('2026-10-04', 0)));
+      expect(playButton()).toHaveAccessibleName('Pause');
+      await settleFrameTime();
+    });
+
+    it('toggles with Space, but not while typing in the find bar', async () => {
+      mockLibrary({ '2026-10-04': 100 });
+      render(<App initialPosition={{ day: '2026-10-04', index: 10 }} />);
+      await waitFor(() => expect(shownFrame()).toBe(frameUrl('2026-10-04', 10)));
+
+      fireEvent.keyDown(findBar(), { key: ' ' });
+      expect(playButton()).toHaveAccessibleName('Play');
+      fireEvent.keyDown(window, { key: ' ' });
+      expect(playButton()).toHaveAccessibleName('Pause');
+      fireEvent.keyDown(window, { key: ' ' });
+      expect(playButton()).toHaveAccessibleName('Play');
+      await settleFrameTime();
+    });
+
+    it('stops when another day is opened', async () => {
+      mockLibrary({ '2026-10-03': 50, '2026-10-04': 100 });
+      render(<App initialPosition={{ day: '2026-10-04', index: 10 }} />);
+      await waitFor(() => expect(shownFrame()).toBe(frameUrl('2026-10-04', 10)));
+
+      fireEvent.click(playButton());
+      await pickDay('2026-10-03');
+      await waitFor(() => expect(position()).toBe('50 / 50'));
+      expect(playButton()).toHaveAccessibleName('Play');
+      await settleFrameTime();
+    });
+  });
+
   describe('Frame times', () => {
     it('shows the capture time', async () => {
       getFrameTime.mockResolvedValue({
