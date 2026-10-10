@@ -24,9 +24,10 @@ use crate::converter::{is_day_folder_name, on_ac_power, OcrCheck, HourBatch};
 use crate::database::{LineBox, OcrProgress, ScreenshotDatabase};
 use frame_source::{FrameSource, RawFrame};
 use image::{imageops, GrayImage};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -56,8 +57,10 @@ const VIDEO_CACHE_CAP_BYTES: u64 = 64 * 1024 * 1024;
 /// How many times one frame is given to the recognizer, a pass apart, before
 /// it is passed over. A recognizer failure is usually the recognizer's, not
 /// the frame's (Vision can lose the Neural Engine for the rest of the
-/// process's life), so the pass stops there and the frame is tried again
-/// rather than marked done unread.
+/// process's life, which the helper process `ocr_helper` runs it in is
+/// replaced for, and the system's may be busy or broken for a while), so the
+/// pass stops there and the frame is tried again rather than marked done
+/// unread.
 const RECOGNIZER_ATTEMPTS: u32 = 3;
 
 /// How long to wait before trying again after the recognizer failed.
@@ -85,7 +88,7 @@ const CHANGED_PIXELS: usize = 60;
 
 /// One line of recognized text. The box is normalized to the image size, with
 /// the origin at the bottom-left corner, as Vision reports it.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OcrLine {
     pub text: String,
     pub confidence: f32,
@@ -99,15 +102,49 @@ pub trait TextRecognizer: Send {
     fn recognize(&self, image: &Path) -> Result<Vec<OcrLine>, String>;
 }
 
-/// The platform's text recognizer, if it has one.
+/// The platform's text recognizer, if it has one: on macOS, Vision in a
+/// helper process (see `ocr_helper`), so that Vision breaking for the rest of
+/// a process's life costs a new helper rather than a relaunch of the app.
 pub fn system_recognizer() -> Option<Box<dyn TextRecognizer>> {
     #[cfg(target_os = "macos")]
     {
-        Some(Box::new(vision::VisionRecognizer))
+        use crate::ocr_helper::{HelperRecognizer, HELPER_ARG};
+        match std::env::current_exe() {
+            Ok(exe) => Some(Box::new(HelperRecognizer::new(
+                move || {
+                    let mut command = std::process::Command::new(&exe);
+                    command.arg(HELPER_ARG);
+                    command
+                },
+                || BOOSTED.load(Ordering::Relaxed),
+            ))),
+            Err(error) => {
+                crate::diagnostics::warn("ocr", format!("Reading text in the app's own process: {}", error))
+                    .record();
+                Some(Box::new(vision::VisionRecognizer))
+            }
+        }
     }
     #[cfg(not(target_os = "macos"))]
     {
         None
+    }
+}
+
+/// Serve text recognition on stdin and stdout until stdin closes: the helper
+/// process `system_recognizer` starts.
+pub fn run_helper() {
+    #[cfg(target_os = "macos")]
+    {
+        let stdin = std::io::stdin();
+        if let Err(error) = crate::ocr_helper::serve(
+            &vision::VisionRecognizer,
+            stdin.lock(),
+            std::io::stdout().lock(),
+            set_thread_priority,
+        ) {
+            eprintln!("OCR helper: {}", error);
+        }
     }
 }
 
@@ -262,8 +299,8 @@ pub struct OcrWorker {
     attempts: HashMap<(String, u32), u32>,
     /// Whether a frame was passed over for recognizer failures and none has
     /// been read since. A failure on the next frame then says the recognizer
-    /// itself is broken (Vision losing the Neural Engine, which only a
-    /// relaunch recovers), so no more frames are passed over until one reads.
+    /// itself is broken, even in a new helper process, so no more frames are
+    /// passed over until one reads.
     recognizer_broken: bool,
 }
 
@@ -404,7 +441,7 @@ impl OcrWorker {
                 *attempts += 1;
                 if *attempts < RECOGNIZER_ATTEMPTS || self.recognizer_broken {
                     self.activity.ocr_failed(format!(
-                        "Could not read {} {}, will try again (if this keeps happening, quitting and reopening the app fixes it): {}",
+                        "Could not read {} {}, will try again: {}",
                         what, number, error
                     ));
                     return None;
@@ -685,12 +722,17 @@ pub fn start_background_ocr(
         .is_ok()
 }
 
+/// Whether the OCR thread last went to the boosted priority, for the helper
+/// process to follow.
+static BOOSTED: AtomicBool = AtomicBool::new(false);
+
 /// Run this thread at background priority, as the converter runs ffmpeg: on
 /// Apple silicon that keeps it on the efficiency cores and lets the system
 /// throttle it, so a long backlog does not heat the machine. During a boost
 /// (`boosted`) it runs at the user-initiated class instead, so it gets the
 /// performance cores.
 fn set_thread_priority(boosted: bool) {
+    BOOSTED.store(boosted, Ordering::Relaxed);
     #[cfg(target_os = "macos")]
     // SAFETY: only changes the calling thread's own scheduling class.
     unsafe {
@@ -1467,7 +1509,7 @@ mod tests {
     fn vision_reads_a_real_capture() {
         let image = std::env::var("OCR_TEST_IMAGE").expect("set OCR_TEST_IMAGE");
         let started = std::time::Instant::now();
-        let lines = system_recognizer().unwrap().recognize(Path::new(&image)).unwrap();
+        let lines = vision::VisionRecognizer.recognize(Path::new(&image)).unwrap();
         println!("{} lines in {:?}", lines.len(), started.elapsed());
         for line in lines.iter().take(20) {
             println!("{:.2} {}", line.confidence, line.text);
@@ -1495,7 +1537,7 @@ mod tests {
             frame_source::Tools::new("ffmpeg"),
         )
         .unwrap();
-        let mut worker = OcrWorker::new(library, db, system_recognizer().unwrap())
+        let mut worker = OcrWorker::new(library, db, Box::new(vision::VisionRecognizer))
             .with_videos(VideoReader::new(source, work.path().to_path_buf()));
 
         let started = std::time::Instant::now();
