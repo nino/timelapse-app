@@ -94,6 +94,16 @@ jobs:
             VERSION=$(bun scripts/release.ts version)
             BUILD="$VERSION"
             TAG="v$VERSION"
+            # The version comes from the tags reachable from this commit, so a
+            # re-run of an older commit's failed run, after a newer commit was
+            # released, comes up with that newer release's number and would
+            # replace it with older code.
+            at=$(git rev-parse -q --verify "refs/tags/$TAG^{commit}" || true)
+            if [ -n "$at" ] && [ "$at" != "$GITHUB_SHA" ]; then
+              echo "::error::$TAG was already released from $at, a newer commit"
+              exit 1
+            fi
+            LATEST=$(bun scripts/release.ts latest "$VERSION")
           else
             NEXT=$(bun scripts/release.ts version --beta)
             VERSION="$NEXT-beta.$GITHUB_RUN_NUMBER"
@@ -106,6 +116,7 @@ jobs:
             echo "VERSION=$VERSION"
             echo "BUILD=$BUILD"
             echo "TAG=$TAG"
+            echo "LATEST=${LATEST:-false}"
           } >> "$GITHUB_ENV"
           echo "Building $CHANNEL version $VERSION (bundle version $BUILD)"
 
@@ -308,7 +319,7 @@ jobs:
             gh release delete "$TAG" --yes || true
             gh release create "$TAG" \
               --target "$GITHUB_SHA" \
-              --latest \
+              --latest="$LATEST" \
               --title "$APP $VERSION" \
               --notes-file "$RUNNER_TEMP/notes.md" \
               "$DMG" "$UPDATE" dist/latest.json

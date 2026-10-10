@@ -1067,7 +1067,6 @@ pub fn run() {
                             app.manage::<FrameSourceState>(Arc::new(source));
                         }
                         Err(e) => {
-                            eprintln!("Failed to set up the frame source: {}", e);
                             diagnostics::error("app", format!("Failed to set up the frame source: {}", e)).record();
                         }
                     }
@@ -1107,7 +1106,6 @@ pub fn run() {
                         println!("Timelapse started automatically on app startup");
                     }
                     Err(e) => {
-                        eprintln!("Failed to start timelapse automatically: {}", e);
                         diagnostics::error("capture", format!("Failed to start: {}", e)).record();
                     }
                 }

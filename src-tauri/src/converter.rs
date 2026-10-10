@@ -322,15 +322,22 @@ pub fn matches_record(root: &Path, parts: &[HourBatch]) -> rusqlite::Result<bool
 /// Delete the PNGs of a converted hour, and return how many went.
 pub fn delete_frames(parts: &[HourBatch]) -> usize {
     let mut deleted = 0;
+    let mut failed = 0;
+    let mut first_error = None;
     for frame in parts.iter().flat_map(|batch| &batch.frames) {
         match std::fs::remove_file(&frame.path) {
             Ok(()) => deleted += 1,
             Err(e) => {
                 eprintln!("Could not delete converted frame {:?}: {}", frame.path, e);
-                crate::diagnostics::warn("converter", format!("Could not delete converted frame {:?}: {}", frame.path, e))
-                    .record();
+                failed += 1;
+                first_error.get_or_insert_with(|| format!("{:?}: {}", frame.path, e));
             }
         }
+    }
+    // One event for the hour, not one a frame.
+    if let Some(error) = first_error {
+        crate::diagnostics::warn("converter", format!("Could not delete {} converted frames, first {}", failed, error))
+            .record();
     }
     deleted
 }
@@ -511,8 +518,7 @@ pub fn convert_batch(
         // viewer first sees it. A failure doesn't throw the encode away: the
         // hour's PNGs are only deleted once the record has been written.
         if let Err(e) = record_frames(root, std::slice::from_ref(batch), false) {
-            eprintln!("Could not record the frames of {}; will retry before deleting them: {}", video_name, e);
-            crate::diagnostics::warn("converter", format!("Could not record the frames of {}: {}", video_name, e)).record();
+            crate::diagnostics::warn("converter", format!("Could not record the frames of {}; will retry before deleting them: {}", video_name, e)).record();
         }
         std::fs::rename(&staged_video, &published)
             .map_err(|e| failed("Failed to publish video", e))?;
@@ -524,13 +530,15 @@ pub fn convert_batch(
 }
 
 /// The ffmpeg invocation from `timelapse-to-video`, reading `frames_dir` and
-/// writing `output`.
-fn ffmpeg_command(frames_dir: &Path, output: &Path) -> Command {
+/// writing `output`, under the background policy if `background`.
+fn ffmpeg_command(frames_dir: &Path, output: &Path, background: bool) -> Command {
     // On macOS, run ffmpeg under the background QoS policy: the scheduler
     // throttles it and, on Apple Silicon, keeps it on the efficiency cores,
     // which is most of what keeps the machine cool while it encodes. A boost
-    // lifts that while it lasts (`set_background`).
-    let mut command = if cfg!(target_os = "macos") {
+    // lifts that while it lasts (`set_background`). One already on when the
+    // encode starts leaves taskpolicy out: lifting the policy right after
+    // the spawn could come before taskpolicy has applied it.
+    let mut command = if cfg!(target_os = "macos") && background {
         let mut command = Command::new("taskpolicy");
         command.arg("-b").arg(crate::paths::ffmpeg());
         command
@@ -589,7 +597,6 @@ fn set_background(pid: u32, background: bool) {
         // child, so it cannot belong to another process.
         if unsafe { libc::setpriority(libc::PRIO_DARWIN_PROCESS, pid as libc::id_t, priority) } != 0 {
             let error = std::io::Error::last_os_error();
-            eprintln!("Could not change ffmpeg's priority: {}", error);
             crate::diagnostics::warn("converter", format!("Could not change ffmpeg's priority: {}", error)).record();
         }
     }
@@ -712,7 +719,8 @@ fn encode_with_ffmpeg(
     on_progress: impl Fn(usize) + Send + 'static,
     on_pause: impl FnMut(bool),
 ) -> Result<(), ConvertError> {
-    let mut child = ffmpeg_command(frames_dir, output)
+    let mut boosted = boost.is_on();
+    let mut child = ffmpeg_command(frames_dir, output, !boosted)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         // `-loglevel error` keeps stderr short enough that it cannot fill the
@@ -742,7 +750,6 @@ fn encode_with_ffmpeg(
     // The child is reaped only once it has exited, after which `check` is no
     // longer called, so its pid stays its own while `check` uses it.
     let pid = child.id();
-    let mut boosted = false;
     let mut power: Option<(Instant, bool)> = None;
     wait_or_kill(
         &RUNNING_ENCODE,
@@ -824,12 +831,18 @@ impl Converter {
         tokio::spawn(async move {
             println!("Starting video conversion background task...");
             if let Err(e) = clear_stale_staging(&root) {
-                eprintln!("Failed to clear stale conversion folders: {}", e);
                 crate::diagnostics::warn("converter", format!("Failed to clear stale conversion folders: {}", e)).record();
             }
 
             let mut boost_changes = boost.subscribe();
+            let mut deleted_at: Option<Instant> = None;
             while running.load(Ordering::SeqCst) {
+                // At most once a minute: a boost can wake the loop every few
+                // seconds, and each time would scan the whole library.
+                if deleted_at.map_or(true, |at| at.elapsed() >= ON_BATTERY_POLL) {
+                    deleted_at = Some(Instant::now());
+                    delete_converted(&root, &ocr_done, &activity);
+                }
                 let (state, wait) = Self::run_once(&root, &running, &ocr_done, &activity, &boost).await;
                 activity.converter_sleeps(state, wait);
                 // A boost starting or stopping ends the wait early.
@@ -848,9 +861,8 @@ impl Converter {
         self.running.store(false, Ordering::SeqCst);
     }
 
-    /// Delete the PNGs of every hour that may go, convert at most one batch,
-    /// and return what the converter waits for and how long before the next
-    /// attempt.
+    /// Convert at most one batch, and return what the converter waits for
+    /// and how long before the next attempt.
     async fn run_once(
         root: &Path,
         running: &Arc<AtomicBool>,
@@ -859,48 +871,6 @@ impl Converter {
         boost: &Arc<Boost>,
     ) -> (State, Duration) {
         let now = Local::now();
-
-        // Deleting is cheap, so it does not wait for AC power.
-        match find_deletable_hours(root, now, ocr_done) {
-            Ok(hours) => {
-                for parts in hours {
-                    // Videos converted before frames were recorded get their
-                    // record here, while the PNGs still say what is in them.
-                    if let Err(e) = record_frames(root, &parts, true) {
-                        eprintln!("Kept the frames of {} {:02}:00: could not record them: {}", parts[0].day, parts[0].hour, e);
-                        crate::diagnostics::warn("converter", format!("Kept the frames of {} {:02}:00: could not record them: {}", parts[0].day, parts[0].hour, e)).record();
-                        continue;
-                    }
-                    match matches_record(root, &parts) {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            eprintln!("Kept the frames of {} {:02}:00: some are not in its video", parts[0].day, parts[0].hour);
-                        crate::diagnostics::warn("converter", format!("Kept the frames of {} {:02}:00: some are not in its video", parts[0].day, parts[0].hour)).record();
-                            continue;
-                        }
-                        Err(e) => {
-                            eprintln!("Kept the frames of {} {:02}:00: could not check its video: {}", parts[0].day, parts[0].hour, e);
-                        crate::diagnostics::warn("converter", format!("Kept the frames of {} {:02}:00: could not check its video: {}", parts[0].day, parts[0].hour, e)).record();
-                            continue;
-                        }
-                    }
-                    let deleted = delete_frames(&parts);
-                    activity.frames_deleted(deleted);
-                    crate::diagnostics::info("converter", "Deleted converted frames")
-                        .data(serde_json::json!({ "day": parts[0].day, "hour": parts[0].hour, "frames": deleted }))
-                        .record();
-                    println!("Deleted {} converted frames from {} {:02}:00", deleted, parts[0].day, parts[0].hour);
-                }
-            }
-            Err(e) => {
-                eprintln!("Failed to scan for converted screenshots: {}", e);
-                crate::diagnostics::error("converter", format!("Failed to scan for converted screenshots: {}", e)).record();
-            }
-        }
-        if let Err(e) = remove_empty_day_folders(root, now) {
-            eprintln!("Failed to remove empty day folders: {}", e);
-            crate::diagnostics::warn("converter", format!("Failed to remove empty day folders: {}", e)).record();
-        }
 
         if let Some(left) = boost.low_power_left() {
             return (State::LowPower, left);
@@ -920,7 +890,6 @@ impl Converter {
                 }
             }
             Err(e) => {
-                eprintln!("Failed to scan for screenshots to convert: {}", e);
                 crate::diagnostics::error("converter", format!("Failed to scan for screenshots to convert: {}", e)).record();
                 return (State::Idle, idle_poll);
             }
@@ -949,7 +918,6 @@ impl Converter {
         let progress = Arc::clone(activity);
         let pauses = Arc::clone(activity);
         let boost_owned = Arc::clone(boost);
-        let pause_reason = Arc::clone(boost);
         let result = tokio::task::spawn_blocking(move || {
             convert_batch(&root_owned, &batch, |frames_dir, output| {
                 encode_with_ffmpeg(
@@ -960,7 +928,7 @@ impl Converter {
                     move |frames| progress.encoding_progress(frames),
                     |paused| {
                         if paused {
-                            let state = if pause_reason.is_low_power() { State::LowPower } else { State::OnBattery };
+                            let state = if boost_owned.is_low_power() { State::LowPower } else { State::OnBattery };
                             println!("Paused the encode: {:?}", state);
                             pauses.encoding_paused(state);
                         } else {
@@ -989,9 +957,48 @@ impl Converter {
             Err(e) => {
                 eprintln!("Video conversion failed, frames kept: {}", e);
                 activity.encoding_finished(video_name, took, Some(e.to_string()));
-                (State::Resting, rest_after(took, boost.is_on()))
+                // Not straight away even during a boost: the same hour is
+                // next in line and would likely fail again at once.
+                (State::Resting, rest_after(took, false))
             }
         }
+    }
+}
+
+/// Delete the PNGs of every hour that may go, and remove day folders left
+/// empty. Deleting is cheap, so it does not wait for AC power.
+fn delete_converted(root: &Path, ocr_done: &OcrCheck, activity: &Activity) {
+    let now = Local::now();
+    match find_deletable_hours(root, now, ocr_done) {
+        Ok(hours) => {
+            for parts in hours {
+                let hour = format!("{} {:02}:00", parts[0].day, parts[0].hour);
+                // Videos converted before frames were recorded get their
+                // record here, while the PNGs still say what is in them.
+                let kept = match record_frames(root, &parts, true).map(|()| matches_record(root, &parts)) {
+                    Err(e) => Some(format!("could not record them: {}", e)),
+                    Ok(Ok(true)) => None,
+                    Ok(Ok(false)) => Some("some are not in its video".to_string()),
+                    Ok(Err(e)) => Some(format!("could not check its video: {}", e)),
+                };
+                if let Some(why) = kept {
+                    crate::diagnostics::warn("converter", format!("Kept the frames of {}: {}", hour, why)).record();
+                    continue;
+                }
+                let deleted = delete_frames(&parts);
+                activity.frames_deleted(deleted);
+                crate::diagnostics::info("converter", "Deleted converted frames")
+                    .data(serde_json::json!({ "day": parts[0].day, "hour": parts[0].hour, "frames": deleted }))
+                    .record();
+                println!("Deleted {} converted frames from {}", deleted, hour);
+            }
+        }
+        Err(e) => {
+            crate::diagnostics::error("converter", format!("Failed to scan for converted screenshots: {}", e)).record();
+        }
+    }
+    if let Err(e) = remove_empty_day_folders(root, now) {
+        crate::diagnostics::warn("converter", format!("Failed to remove empty day folders: {}", e)).record();
     }
 }
 

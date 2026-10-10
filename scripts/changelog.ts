@@ -9,10 +9,8 @@
 //
 // Runs under Node (vite.config.ts imports it), so no Bun APIs here.
 
-import { execFileSync } from "node:child_process";
-
 import type { ChangelogEntry } from "../src/about.ts";
-import { isLegacy, nextVersion, readTags } from "./version.ts";
+import { git, isLegacy, nextVersion, readTags } from "./version.ts";
 
 export type { ChangelogEntry };
 
@@ -115,10 +113,6 @@ export function commitCounts(revList: string, line: string[]): Map<string, numbe
     counts.set(sha, seen.size);
   }
   return counts;
-}
-
-function git(cwd: string, args: string[]): string {
-  return execFileSync("git", args, { cwd, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
 }
 
 /** One first-parent commit, oldest first, with what its version depends on. */

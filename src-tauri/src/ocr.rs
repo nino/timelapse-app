@@ -133,7 +133,6 @@ pub fn ocr_check(root: &Path) -> OcrCheck {
     let db = match ScreenshotDatabase::new(root.join("screenshots.db")) {
         Ok(db) => Mutex::new(db),
         Err(error) => {
-            eprintln!("OCR: cannot open database for the delete check: {}", error);
             crate::diagnostics::error("ocr", format!("Cannot open database for the delete check: {}", error)).record();
             return Arc::new(|_| false);
         }
@@ -205,8 +204,8 @@ pub struct PassSummary {
     /// Frames passed over unread: unreadable, or the recognizer failed on
     /// them `RECOGNIZER_ATTEMPTS` times.
     pub failed: usize,
-    /// Whether the pass stopped because the recognizer failed, leaving the
-    /// frame it failed on for a later pass.
+    /// Whether the pass stopped because the recognizer failed or a result
+    /// could not be stored, leaving that frame for a later pass.
     pub stalled: bool,
 }
 
@@ -242,6 +241,9 @@ enum FrameError {
     Unreadable(String),
     /// The recognizer failed on it.
     Recognizer(String),
+    /// Its result could not be stored, so the pass stops and the frame is
+    /// tried again later: the frame and the recognizer are fine.
+    Database(String),
 }
 
 /// The state a pass needs from one call to the next.
@@ -258,6 +260,11 @@ pub struct OcrWorker {
     /// How many times the recognizer has failed on a frame, by day and
     /// number (or video position), until it reads or is passed over.
     attempts: HashMap<(String, u32), u32>,
+    /// Whether a frame was passed over for recognizer failures and none has
+    /// been read since. A failure on the next frame then says the recognizer
+    /// itself is broken (Vision losing the Neural Engine, which only a
+    /// relaunch recovers), so no more frames are passed over until one reads.
+    recognizer_broken: bool,
 }
 
 /// What the worker needs to read days that only exist as video.
@@ -294,6 +301,7 @@ impl OcrWorker {
             activity: Arc::default(),
             videos: None,
             attempts: HashMap::new(),
+            recognizer_broken: false,
         }
     }
 
@@ -380,25 +388,32 @@ impl OcrWorker {
         let error = match result {
             Ok(read) => {
                 self.attempts.remove(&key);
+                if read {
+                    self.recognizer_broken = false;
+                }
                 return Some(if read { Outcome::Read } else { Outcome::Unchanged });
             }
             Err(FrameError::Unreadable(error)) => error,
+            Err(FrameError::Database(error)) => {
+                self.activity
+                    .ocr_failed(format!("Could not store the text of {} {}, will try again: {}", what, number, error));
+                return None;
+            }
             Err(FrameError::Recognizer(error)) => {
                 let attempts = self.attempts.entry(key.clone()).or_insert(0);
                 *attempts += 1;
-                if *attempts < RECOGNIZER_ATTEMPTS {
-                    eprintln!("OCR: could not read {} {}, will retry: {}", what, number, error);
+                if *attempts < RECOGNIZER_ATTEMPTS || self.recognizer_broken {
                     self.activity.ocr_failed(format!(
                         "Could not read {} {}, will try again (if this keeps happening, quitting and reopening the app fixes it): {}",
                         what, number, error
                     ));
                     return None;
                 }
+                self.recognizer_broken = true;
                 error
             }
         };
         self.attempts.remove(&key);
-        eprintln!("OCR: skipping {} {}: {}", what, number, error);
         self.activity
             .ocr_failed(format!("Skipped {} {}: {}", what, number, error));
         Some(Outcome::Failed)
@@ -428,7 +443,7 @@ impl OcrWorker {
             .map_or(true, |last| thumbnail.differs_from(last));
 
         if !changed {
-            record(&self.db, None).map_err(|e| FrameError::Unreadable(e.to_string()))?;
+            record(&self.db, None).map_err(|e| FrameError::Database(e.to_string()))?;
             return Ok(false);
         }
 
@@ -450,7 +465,7 @@ impl OcrWorker {
             Some(lines.iter().map(|l| [l.x, l.y, l.width, l.height]).collect::<Vec<_>>())
         };
         record(&self.db, result.as_deref().map(|boxes| (text.as_str(), boxes)))
-            .map_err(|e| FrameError::Unreadable(e.to_string()))?;
+            .map_err(|e| FrameError::Database(e.to_string()))?;
         self.last_read.insert(day.to_string(), thumbnail);
         self.last_text.insert(day.to_string(), text);
         Ok(true)
@@ -567,7 +582,6 @@ impl OcrWorker {
                         .record_video_ocr_frame(&day, end as u32, None)
                         .map_err(|e| e.to_string())?,
                     Err(error) => {
-                        eprintln!("OCR: cannot decode {}: {}", video.path.display(), error);
                         self.activity
                             .ocr_failed(format!("Cannot decode {}: {}", video.path.display(), error));
                         videos.failed.insert(video.path.clone());
@@ -643,7 +657,6 @@ pub fn start_background_ocr(
             let db = match ScreenshotDatabase::new(root.join("screenshots.db")) {
                 Ok(db) => db,
                 Err(error) => {
-                    eprintln!("OCR: cannot open database: {}", error);
                     crate::diagnostics::error("ocr", format!("Cannot open database: {}", error)).record();
                     return;
                 }
@@ -658,7 +671,6 @@ pub fn start_background_ocr(
                 match source {
                     Ok(source) => Some(VideoReader::new(source, dir)),
                     Err(error) => {
-                        eprintln!("OCR: cannot read videos: {}", error);
                         crate::diagnostics::error("ocr", format!("Cannot read videos: {}", error)).record();
                         None
                     }
@@ -751,7 +763,6 @@ fn run_forever(worker: &mut OcrWorker, boost: &Boost) {
                 sleep(State::Idle, IDLE_SLEEP)
             }
             Err(error) => {
-                eprintln!("OCR pass failed: {}", error);
                 activity.ocr_failed(format!("Pass failed: {}", error));
                 sleep(State::Idle, IDLE_SLEEP);
             }
@@ -1227,6 +1238,13 @@ mod tests {
         // stops the pass.
         let summary = library.pass();
         assert_eq!(summary, PassSummary { failed: 1, stalled: true, ..Default::default() });
+        assert_eq!(library.done_through(DAY_1), Some(1));
+
+        // A second frame failing says the recognizer is broken, not the
+        // frame, so frame 2 is never passed over.
+        for _ in 0..RECOGNIZER_ATTEMPTS * 2 {
+            assert_eq!(library.pass(), PassSummary { stalled: true, ..Default::default() });
+        }
         assert_eq!(library.done_through(DAY_1), Some(1));
 
         broken.store(false, std::sync::atomic::Ordering::SeqCst);

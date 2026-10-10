@@ -19,7 +19,7 @@
 use chrono::{DateTime, Local};
 use serde::Serialize;
 use std::sync::{Condvar, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, SystemTime};
 use tokio::sync::watch;
 
 /// Longest boost the app accepts.
@@ -46,17 +46,20 @@ enum Kind {
 
 #[derive(Debug, Clone, Copy)]
 struct Active {
-    ends: Instant,
+    /// Wall-clock time, not `Instant`: on macOS an `Instant` stands still
+    /// while the Mac sleeps, which would stretch a boost by the time the lid
+    /// was closed.
+    ends: SystemTime,
     kind: Kind,
 }
 
 impl Active {
     fn left(&self) -> Duration {
-        self.ends.saturating_duration_since(Instant::now())
+        self.ends.duration_since(SystemTime::now()).unwrap_or_default()
     }
 
     fn until(&self) -> DateTime<Local> {
-        Local::now() + chrono::Duration::from_std(self.left()).unwrap_or_default()
+        self.ends.into()
     }
 }
 
@@ -100,7 +103,7 @@ impl Boost {
     }
 
     fn start_kind(&self, duration: Duration, kind: Kind) {
-        let ends = Instant::now() + duration.min(MAX_BOOST);
+        let ends = SystemTime::now() + duration.min(MAX_BOOST);
         self.set(Some(Active { ends, kind }));
     }
 
@@ -139,7 +142,7 @@ impl Boost {
     }
 
     fn active(&self) -> Option<Active> {
-        self.lock().active.filter(|active| active.ends > Instant::now())
+        self.lock().active.filter(|active| active.ends > SystemTime::now())
     }
 
     fn boost(&self) -> Option<Active> {
@@ -219,6 +222,7 @@ pub async fn wait(changes: &mut watch::Receiver<u64>, wait: Duration) {
 mod tests {
     use super::*;
     use std::sync::Arc;
+    use std::time::Instant;
 
     #[test]
     fn a_boost_is_on_until_it_ends_or_stops() {
