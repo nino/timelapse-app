@@ -1,3 +1,20 @@
+//! `screenshots.db`, next to the screenshots in the library root.
+//!
+//! Every migration runs in the one `IMMEDIATE` transaction of
+//! `run_migrations` (check applied, run, record), so a crash never leaves one
+//! half applied. The older ones exist for libraries written before them:
+//! `split_timestamps` split the legacy `creation_date` column into
+//! `created_at` (UTC) and `local_time`, and `compact_ocr_frames` replaced the
+//! `lines_json` column (every line's text again, with full-precision floats)
+//! by packed `boxes`, dropped rows repeating the previous row's text, and
+//! vacuums once.
+//!
+//! OCR rows are keyed by (day, frame number), because frame numbers restart
+//! in every day folder. A day read from video has no frame numbers, so there
+//! `ocr_progress.by_position` is set and `frame_number`/`last_frame` are
+//! 1-based positions in the day's videos; `ocr_done_through` ignores those
+//! rows so the converter never mistakes one for the other.
+
 use rusqlite::{Connection, OptionalExtension, Result, Transaction, TransactionBehavior};
 use serde::Serialize;
 use std::path::PathBuf;

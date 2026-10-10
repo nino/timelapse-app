@@ -1,3 +1,11 @@
+//! The Tauri app: commands, the `frames:` URI scheme, the menu, and `setup()`,
+//! which starts the photographer, OCR and the video converter.
+//!
+//! Each command that needs the photographer is a thin shim over a
+//! `*_impl(&PhotographerState, …)` function. `tauri::State` wraps a private
+//! reference with no public constructor, so that split is what lets the tests
+//! call the logic directly.
+
 mod activity;
 mod app_state;
 mod boost;
