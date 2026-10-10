@@ -4,6 +4,7 @@ mod boost;
 mod converter;
 mod timelapse;
 mod database;
+mod menu_app;
 mod diagnostics;
 mod ocr;
 mod ocr_tiles;
