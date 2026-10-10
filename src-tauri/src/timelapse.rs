@@ -14,7 +14,7 @@ use std::{
 use thiserror::Error;
 use tokio::time::{sleep, Duration};
 use crate::activity::{Activity, FAILURES_BEFORE_BACKOFF};
-use crate::database::ScreenshotDatabase;
+use crate::database::{FrontWindow, ScreenshotDatabase};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorLogEntry {
@@ -206,8 +206,9 @@ impl Photographer {
                 .ok_or(Error::UnableToConvertScreenshotPathToString)?,
         );
 
-        // Get the focused screen by finding which screen contains the active window
-        let screen = get_focused_screen().await?;
+        // Get the focused screen by finding which screen contains the active
+        // window, and note that window for the screenshot's row.
+        let (screen, window) = get_focused_screen().await?;
 
         // Capturing, resizing and encoding take tens of milliseconds, so they
         // run on the blocking pool rather than holding up a runtime worker.
@@ -235,7 +236,7 @@ impl Photographer {
             let created_at = Utc::now();
             let local_time = Local::now();
             if let Ok(db_guard) = db.lock() {
-                db_guard.insert_screenshot(&day, frame_number, created_at, local_time)?;
+                db_guard.insert_capture(&day, frame_number, created_at, local_time, window.as_ref())?;
             }
 
             Ok(Captured::Saved { day, number: frame_number })
@@ -447,11 +448,16 @@ static LAST_SCREEN_ID: AtomicU32 = AtomicU32::new(0);
 /// reason to skip a capture. It happens while one of our own modal dialogs is
 /// open, and for a moment when the focused window closes; the screen then is
 /// the one the last capture used, or the main one.
-async fn get_focused_screen() -> Result<Screen, Error> {
+///
+/// Also returns the app and window in front, which the screenshot's row
+/// records. It comes from the same lookup, so recording it costs nothing more
+/// per capture than a bundle id read once per app.
+async fn get_focused_screen() -> Result<(Screen, Option<FrontWindow>), Error> {
     let screens = Screen::all().map_err(|err| Error::UnableToCreateScreenshot {
         reason: err.to_string(),
     })?;
-    let window = get_active_window().ok().map(|window| {
+    let active = get_active_window().ok();
+    let window = active.as_ref().map(|window| {
         (
             window.position.x as i32,
             window.position.y as i32,
@@ -476,7 +482,44 @@ async fn get_focused_screen() -> Result<Screen, Error> {
         })?,
     };
     LAST_SCREEN_ID.store(screen.display_info.id, Ordering::Relaxed);
-    Ok(screen)
+    Ok((screen, active.map(front_window)))
+}
+
+fn front_window(window: active_win_pos_rs::ActiveWindow) -> FrontWindow {
+    let app_path = window.process_path.to_string_lossy().into_owned();
+    FrontWindow {
+        bundle_id: bundle_id(&app_path),
+        app_name: window.app_name,
+        app_path,
+        title: window.title,
+    }
+}
+
+/// The bundle identifier of the app bundle at `app_path`, read from its
+/// Info.plist the first time that app is in front and remembered after that.
+#[cfg(target_os = "macos")]
+fn bundle_id(app_path: &str) -> Option<String> {
+    use objc2_foundation::{NSBundle, NSString};
+    use std::collections::HashMap;
+    use std::sync::LazyLock;
+
+    static BUNDLE_IDS: LazyLock<Mutex<HashMap<String, Option<String>>>> =
+        LazyLock::new(Default::default);
+
+    let mut known = BUNDLE_IDS.lock().ok()?;
+    known
+        .entry(app_path.to_string())
+        .or_insert_with(|| {
+            NSBundle::bundleWithPath(&NSString::from_str(app_path))
+                .and_then(|bundle| bundle.bundleIdentifier())
+                .map(|id| id.to_string())
+        })
+        .clone()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn bundle_id(_app_path: &str) -> Option<String> {
+    None
 }
 
 /// Which of `screens` (id, rect) to capture: the one under the centre of the
