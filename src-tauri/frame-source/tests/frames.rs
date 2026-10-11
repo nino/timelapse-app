@@ -149,7 +149,7 @@ fn write_db(root: &Path, times: &[&str]) {
     for (n, time) in times.iter().enumerate() {
         conn.execute(
             "INSERT INTO screenshots (frame_number, local_time) VALUES (?1, ?2)",
-            rusqlite::params![n + 1, time],
+            rusqlite::params![n as i64 + 1, time],
         )
         .unwrap();
     }
@@ -360,7 +360,7 @@ fn record_video(root: &Path, video: &str, times: &[&str]) {
     for (index, time) in times.iter().enumerate() {
         conn.execute(
             "INSERT INTO video_frames VALUES (?1, ?2, substr(?1, 1, 10), ?2 + 1, ?3)",
-            rusqlite::params![video, index, time],
+            rusqlite::params![video, index as i64, time],
         )
         .unwrap();
     }
