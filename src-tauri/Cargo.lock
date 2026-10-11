@@ -4932,7 +4932,7 @@ dependencies = [
  "dirs 6.0.0",
  "fast_image_resize",
  "flate2",
- "foreign-types 0.3.2",
+ "foreign-types 0.5.0",
  "frame_source",
  "image",
  "libc",
