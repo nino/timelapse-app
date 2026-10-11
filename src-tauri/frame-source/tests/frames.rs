@@ -149,7 +149,7 @@ fn write_db(root: &Path, times: &[&str]) {
     for (n, time) in times.iter().enumerate() {
         conn.execute(
             "INSERT INTO screenshots (frame_number, local_time) VALUES (?1, ?2)",
-            rusqlite::params![n + 1, time],
+            rusqlite::params![n as i64 + 1, time],
         )
         .unwrap();
     }
@@ -202,6 +202,68 @@ fn skips_broken_and_duplicate_videos() {
     let source = lib.source(u64::MAX);
 
     assert_eq!(source.day("2024-12-29").unwrap().frame_count, 20);
+}
+
+/// An ffmpeg that notes, in `log`, how many of itself were running when it
+/// started, then does what the real one does.
+#[cfg(unix)]
+fn counting_ffmpeg(dir: &Path, log: &Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let script = dir.join("ffmpeg");
+    let running = dir.join("running");
+    fs::create_dir(&running).unwrap();
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nmkdir '{running}'/$$\nls '{running}' | wc -l >> '{log}'\nsleep 0.05\n\
+             ffmpeg \"$@\"\nstatus=$?\nrmdir '{running}'/$$\nexit $status\n",
+            running = running.display(),
+            log = log.display(),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    script
+}
+
+#[cfg(unix)]
+#[test]
+fn probes_each_video_once_and_only_two_at_a_time() {
+    let lib = Library::new();
+    let days: Vec<String> = (1..=12).map(|d| format!("2025-03-{d:02}")).collect();
+    let first = lib.root.path().join(format!("{}--09-00-00.mov", days[0]));
+    make_video(&first, 5, 0);
+    for day in &days[1..] {
+        fs::copy(&first, lib.root.path().join(format!("{day}--09-00-00.mov"))).unwrap();
+    }
+    let log = lib.scratch.path().join("started");
+    let source = FrameSource::new(
+        lib.root.path().to_path_buf(),
+        lib.cache.path().to_path_buf(),
+        u64::MAX,
+        Tools::new(counting_ffmpeg(lib.scratch.path(), &log)),
+    )
+    .unwrap();
+
+    // What holding Cmd+Right across a year does: every day asked about at
+    // once, and each by several commands.
+    std::thread::scope(|scope| {
+        for day in days.iter().cycle().take(days.len() * 4) {
+            let source = &source;
+            scope.spawn(move || assert_eq!(source.day(day).unwrap().frame_count, 5));
+        }
+    });
+
+    let running_at_start: Vec<usize> = fs::read_to_string(&log)
+        .unwrap()
+        .lines()
+        .map(|line| line.trim().parse().unwrap())
+        .collect();
+    assert_eq!(running_at_start.len(), days.len(), "one probe per video: {running_at_start:?}");
+    assert!(
+        running_at_start.iter().all(|&running| running <= 2),
+        "more than two probes ran at once: {running_at_start:?}"
+    );
 }
 
 #[test]
@@ -298,7 +360,7 @@ fn record_video(root: &Path, video: &str, times: &[&str]) {
     for (index, time) in times.iter().enumerate() {
         conn.execute(
             "INSERT INTO video_frames VALUES (?1, ?2, substr(?1, 1, 10), ?2 + 1, ?3)",
-            rusqlite::params![video, index, time],
+            rusqlite::params![video, index as i64, time],
         )
         .unwrap();
     }

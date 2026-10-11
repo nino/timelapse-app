@@ -637,7 +637,7 @@ impl ScreenshotDatabase {
             for (index, (frame_number, modified)) in frames.iter().enumerate() {
                 insert.execute(rusqlite::params![
                     video,
-                    index,
+                    index as i64,
                     day,
                     frame_number,
                     modified.to_rfc3339()

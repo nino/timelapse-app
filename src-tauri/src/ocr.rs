@@ -424,7 +424,9 @@ impl OcrWorker {
         let key = (day.to_string(), number);
         let error = match result {
             Ok(read) => {
-                self.attempts.remove(&key);
+                if self.attempts.remove(&key).is_some() {
+                    self.activity.ocr_retry_worked(&retry_message(what, number));
+                }
                 if read {
                     self.recognizer_broken = false;
                 }
@@ -440,10 +442,8 @@ impl OcrWorker {
                 let attempts = self.attempts.entry(key.clone()).or_insert(0);
                 *attempts += 1;
                 if *attempts < RECOGNIZER_ATTEMPTS || self.recognizer_broken {
-                    self.activity.ocr_failed(format!(
-                        "Could not read {} {}, will try again: {}",
-                        what, number, error
-                    ));
+                    self.activity
+                        .ocr_failed(format!("{}: {}", retry_message(what, number), error));
                     return None;
                 }
                 self.recognizer_broken = true;
@@ -667,6 +667,12 @@ fn write_png(path: &Path, frame: &RawFrame) -> Result<(), String> {
     PngEncoder::new_with_quality(writer, CompressionType::Fast, FilterType::Sub)
         .write_image(frame.rgb, frame.width, frame.height, image::ExtendedColorType::Rgb8)
         .map_err(|e| e.to_string())
+}
+
+/// The start of the error shown while frame `number` (`what` names it) waits
+/// to be tried again, which is cleared once it reads.
+fn retry_message(what: &str, number: u32) -> String {
+    format!("Could not read {} {}, will try again", what, number)
 }
 
 /// Start reading `root` on a background thread that runs for the life of the
@@ -1259,12 +1265,17 @@ mod tests {
         let summary = library.pass();
         assert_eq!(summary, PassSummary { stalled: true, ..Default::default() });
         assert_eq!(library.done_through(DAY_1), None);
+        let last_error = || library.worker.activity.snapshot(false, || true).ocr.last_error;
+        assert!(last_error().is_some());
 
         broken.store(false, std::sync::atomic::Ordering::SeqCst);
         let summary = library.pass();
         assert_eq!(summary, PassSummary { recognized: 2, ..Default::default() });
         assert_eq!(library.seen(), vec!["00001.png", "00002.png"]);
         assert_eq!(library.done_through(DAY_1), Some(2));
+        // Read on the retry, so the error saying it would be retried goes.
+        let last_error = library.worker.activity.snapshot(false, || true).ocr.last_error;
+        assert!(last_error.is_none());
     }
 
     #[test]

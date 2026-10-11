@@ -8,6 +8,12 @@
 //! the app runs Vision in a child process, its own executable started with
 //! `HELPER_ARG`, and replaces that process when a request fails.
 //!
+//! A new helper does not always work at once: right after a failure the
+//! system can spend minutes recompiling Vision's models, and the next
+//! helper's first request can fail the same way while one a minute later
+//! works. That is why the OCR worker retries a frame later instead of
+//! passing over it (`State::Retrying` in `ocr.rs`).
+//!
 //! The protocol is one JSON line each way per frame: a `Request` on the
 //! helper's stdin, a `Response` on its stdout. The helper exits when its stdin
 //! closes, so it never outlives the app.
