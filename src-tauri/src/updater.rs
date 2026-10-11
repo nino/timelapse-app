@@ -1,8 +1,9 @@
 //! Keeps release builds on the newest GitHub release.
 //!
 //! The endpoint in `tauri.conf.json` is the `latest.json` the release workflow
-//! uploads to the rolling `latest` release, and the plugin only installs an
-//! update whose signature checks out against the public key next to it.
+//! uploads with every release, fetched from whichever release is marked
+//! latest, and the plugin only installs an update whose signature checks out
+//! against the public key next to it.
 //!
 //! Two ways in:
 //! - In the background, while "Update automatically" is on in Settings: a check

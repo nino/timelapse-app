@@ -1,3 +1,23 @@
+//! The photographer: one screenshot a second of the screen holding the
+//! focused window.
+//!
+//! Each tick captures that screen (on macOS straight from Core Graphics as raw
+//! BGRA pixels, skipping the `screenshots` crate's PNG encode that would only
+//! be decoded again), box-filters it into a frame (`frame_size`: a
+//! letterboxed 1800×1124 frame, or a big screen's own shape at a density OCR
+//! can still read), drops it if it is all black, and otherwise writes it as
+//! the day folder's next `NNNNN.png` and records a row in `screenshots.db`.
+//!
+//! The active window only picks the screen. When there is none (one of the
+//! app's own modal dialogs is open, or the focused window just closed) the
+//! last screen is captured again, so a dialog never stops capture. The same
+//! lookup names the app and window in front (`FrontWindow`), so recording it
+//! costs no extra system call.
+//!
+//! A black frame makes the loop wait 10 s. A failed capture is retried on the
+//! next tick, and only from the `FAILURES_BEFORE_BACKOFF`th failure in a row
+//! does it wait 60 s. Errors also go to a bounded in-memory log.
+
 use active_win_pos_rs::get_active_window;
 use chrono::{DateTime, Utc, Local};
 use fast_image_resize::images::{CroppedImageMut, ImageRef};
