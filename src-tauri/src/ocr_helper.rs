@@ -14,6 +14,14 @@
 //! works. That is why the OCR worker retries a frame later instead of
 //! passing over it (`State::Retrying` in `ocr.rs`).
 //!
+//! A helper can also hang: it stops answering without exiting, and before
+//! answers had a time limit that stopped OCR until the app was restarted. So
+//! an answer that takes longer than `ANSWER_TIMEOUT` (`FIRST_ANSWER_TIMEOUT`
+//! for a new helper, whose first request can wait minutes on the model
+//! compiling) counts as a failure, and the helper is killed and replaced.
+//! Answers slower than `SLOW_ANSWER` are logged, to see how close to the
+//! limits real ones come.
+//!
 //! The protocol is one JSON line each way per frame: a `Request` on the
 //! helper's stdin, a `Response` on its stdout. The helper exits when its stdin
 //! closes, so it never outlives the app.
@@ -25,11 +33,25 @@ use crate::ocr::{OcrLine, TextRecognizer};
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 /// The argument that starts the app's executable as the recognizer helper.
 pub const HELPER_ARG: &str = "--ocr-helper";
+
+/// How long a helper that has answered before gets to answer. An ordinary
+/// frame takes well under a second and a big screen's, read in tiles, a few
+/// seconds, even at background priority.
+const ANSWER_TIMEOUT: Duration = Duration::from_secs(2 * 60);
+
+/// How long a new helper gets for its first answer. Right after a failure the
+/// system can recompile Vision's models first, which took 7 minutes once.
+const FIRST_ANSWER_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+/// An answer that takes longer than this is logged.
+const SLOW_ANSWER: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Request {
@@ -74,18 +96,45 @@ pub fn serve(
     Ok(())
 }
 
+/// How often a helper checks that the app that started it is still running.
+const PARENT_CHECK: Duration = Duration::from_secs(10);
+
+/// Exit the helper once the app that started it has gone. The helper also
+/// exits when its stdin closes, but only between requests: one stuck inside
+/// Vision never reads stdin again, and was left running after the app quit.
+#[cfg(unix)]
+pub fn exit_with_parent() {
+    // SAFETY: getppid has no preconditions.
+    let parent = unsafe { libc::getppid() };
+    let _ = std::thread::Builder::new().name("ocr-helper-parent".into()).spawn(move || loop {
+        std::thread::sleep(PARENT_CHECK);
+        // SAFETY: as above. An orphan is adopted by launchd, so its parent
+        // changes.
+        if unsafe { libc::getppid() } != parent {
+            std::process::exit(0);
+        }
+    });
+}
+
 /// The app's side: a `TextRecognizer` that hands each frame to a helper
 /// process, starting one when there is none and replacing it after a failure.
 pub struct HelperRecognizer {
     command: Box<dyn Fn() -> Command + Send + Sync>,
     boosted: Box<dyn Fn() -> bool + Send + Sync>,
     helper: Mutex<Option<Helper>>,
+    /// `ANSWER_TIMEOUT` and `FIRST_ANSWER_TIMEOUT`, shorter in tests.
+    timeouts: (Duration, Duration),
 }
 
 struct Helper {
     child: Child,
     stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    /// The helper's stdout, a line at a time, from a thread that reads it so
+    /// that waiting for an answer can time out. It ends when the helper
+    /// exits.
+    answers: Receiver<std::io::Result<String>>,
+    /// Whether it has answered a request yet.
+    answered: bool,
 }
 
 impl Drop for Helper {
@@ -106,7 +155,14 @@ impl HelperRecognizer {
             command: Box::new(command),
             boosted: Box::new(boosted),
             helper: Mutex::new(None),
+            timeouts: (ANSWER_TIMEOUT, FIRST_ANSWER_TIMEOUT),
         }
+    }
+
+    #[cfg(test)]
+    fn with_timeouts(mut self, answer: Duration, first_answer: Duration) -> Self {
+        self.timeouts = (answer, first_answer);
+        self
     }
 
     fn start(&self) -> Result<Helper, String> {
@@ -117,7 +173,21 @@ impl HelperRecognizer {
             .map_err(|e| format!("Cannot start the text recognizer: {}", e))?;
         let stdin = child.stdin.take().ok_or("The text recognizer has no stdin")?;
         let stdout = child.stdout.take().ok_or("The text recognizer has no stdout")?;
-        Ok(Helper { child, stdin, stdout: BufReader::new(stdout) })
+        let (send, answers) = mpsc::channel();
+        let reader = std::thread::Builder::new().name("ocr-helper-reader".into()).spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                let failed = line.is_err();
+                if send.send(line).is_err() || failed {
+                    break;
+                }
+            }
+        });
+        if let Err(error) = reader {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("Cannot read from the text recognizer: {}", error));
+        }
+        Ok(Helper { child, stdin, answers, answered: false })
     }
 
     /// One request to `helper`. An error is the recognizer's answer or a
@@ -132,11 +202,28 @@ impl HelperRecognizer {
             .and_then(|_| helper.stdin.flush())
             .map_err(|e| format!("The text recognizer stopped: {}", e))?;
 
-        let mut answer = String::new();
-        match helper.stdout.read_line(&mut answer) {
-            Ok(0) => return Err("The text recognizer stopped".into()),
-            Ok(_) => {}
-            Err(error) => return Err(format!("The text recognizer stopped: {}", error)),
+        let first = !helper.answered;
+        let timeout = if first { self.timeouts.1 } else { self.timeouts.0 };
+        let asked = Instant::now();
+        let answer = match helper.answers.recv_timeout(timeout) {
+            Ok(Ok(answer)) => answer,
+            Ok(Err(error)) => return Err(format!("The text recognizer stopped: {}", error)),
+            Err(RecvTimeoutError::Disconnected) => return Err("The text recognizer stopped".into()),
+            Err(RecvTimeoutError::Timeout) => {
+                return Err(format!(
+                    "The text recognizer did not answer within {} s{}",
+                    timeout.as_secs(),
+                    if first { " of starting" } else { "" }
+                ))
+            }
+        };
+        helper.answered = true;
+        let took = asked.elapsed();
+        if took >= SLOW_ANSWER {
+            crate::diagnostics::warn("ocr", "The text recognizer was slow to answer")
+                .took(took)
+                .data(serde_json::json!({ "first": first, "boosted": request.boosted }))
+                .record();
         }
         match serde_json::from_str(&answer) {
             Ok(Response::Lines(lines)) => Ok(lines),
@@ -309,6 +396,64 @@ mod tests {
         recognizer.recognize(Path::new("/a.png")).unwrap();
         assert!(recognizer.recognize(Path::new("/b.png")).is_err());
         assert_eq!(fake.starts(), 2);
+    }
+
+    /// A recognizer whose helpers run `script` in `sh`, numbered by `$n`
+    /// (1 for the first helper started), with short timeouts.
+    fn numbered_helpers(dir: &Path, script: &str) -> HelperRecognizer {
+        let dir = dir.to_path_buf();
+        let script = format!("echo started >> starts; n=$(wc -l < starts); {}", script);
+        HelperRecognizer::new(
+            move || {
+                let mut command = Command::new("sh");
+                command.current_dir(&dir).arg("-c").arg(&script);
+                command
+            },
+            || false,
+        )
+        .with_timeouts(Duration::from_millis(300), Duration::from_secs(5))
+    }
+
+    #[test]
+    fn a_helper_that_stops_answering_is_replaced() {
+        let dir = TempDir::new().unwrap();
+        // The first helper answers once, then hangs without exiting.
+        let script = format!(
+            "if [ $n -eq 1 ]; then read r; echo '{OK}'; read r; sleep 600; fi; \
+             while read r; do echo '{OK}'; done"
+        );
+        let recognizer = numbered_helpers(dir.path(), &script);
+        recognizer.recognize(Path::new("/a.png")).unwrap();
+        let started = Instant::now();
+        assert_eq!(recognizer.recognize(Path::new("/b.png")).unwrap().len(), 1);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let starts = std::fs::read_to_string(dir.path().join("starts")).unwrap();
+        assert_eq!(starts.lines().count(), 2);
+    }
+
+    #[test]
+    fn a_new_helper_gets_longer_for_its_first_answer() {
+        let dir = TempDir::new().unwrap();
+        // Each answer takes longer than a helper that has answered may take,
+        // but within a new helper's limit.
+        let script = format!("while read r; do sleep 1; echo '{OK}'; done");
+        let recognizer = numbered_helpers(dir.path(), &script);
+        assert_eq!(recognizer.recognize(Path::new("/a.png")).unwrap().len(), 1);
+        // The second answer is too slow, so a new helper reads the frame.
+        assert_eq!(recognizer.recognize(Path::new("/b.png")).unwrap().len(), 1);
+        let starts = std::fs::read_to_string(dir.path().join("starts")).unwrap();
+        assert_eq!(starts.lines().count(), 2);
+    }
+
+    #[test]
+    fn a_new_helper_that_never_answers_is_reported() {
+        let dir = TempDir::new().unwrap();
+        let recognizer = numbered_helpers(dir.path(), "sleep 600")
+            .with_timeouts(Duration::from_millis(100), Duration::from_millis(300));
+        let error = recognizer.recognize(Path::new("/a.png")).unwrap_err();
+        assert!(error.contains("did not answer"), "{}", error);
+        let starts = std::fs::read_to_string(dir.path().join("starts")).unwrap();
+        assert_eq!(starts.lines().count(), 1);
     }
 
     #[test]
