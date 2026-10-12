@@ -136,6 +136,7 @@ pub fn system_recognizer() -> Option<Box<dyn TextRecognizer>> {
 pub fn run_helper() {
     #[cfg(target_os = "macos")]
     {
+        crate::ocr_helper::exit_with_parent();
         let stdin = std::io::stdin();
         if let Err(error) = crate::ocr_helper::serve(
             &vision::VisionRecognizer,
