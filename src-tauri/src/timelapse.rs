@@ -360,10 +360,11 @@ fn with_capture<R>(
     use core_graphics::base::{kCGBitmapByteOrder32Little, kCGImageAlphaNoneSkipFirst};
     use core_graphics::color_space::CGColorSpace;
     use core_graphics::context::CGContext;
-    use core_graphics::display::{
-        kCGNullWindowID, kCGWindowImageDefault, kCGWindowListOptionOnScreenOnly, CGDisplay,
-    };
+    use core_graphics::display::CGDisplay;
     use core_graphics::geometry::{CGPoint, CGRect, CGSize};
+    use core_graphics::window::{
+        kCGNullWindowID, kCGWindowImageDefault, kCGWindowListOptionOnScreenOnly,
+    };
 
     let image = CGDisplay::screenshot(
         CGDisplay::new(screen.display_info.id).bounds(),
@@ -428,7 +429,7 @@ fn is_bgra(image: &core_graphics::image::CGImage) -> bool {
 
     #[link(name = "CoreGraphics", kind = "framework")]
     extern "C" {
-        // core-graphics 0.22 has no wrapper for it.
+        // core-graphics has no wrapper for it.
         fn CGImageGetBitmapInfo(image: core_graphics::sys::CGImageRef) -> u32;
     }
     const ALPHA_INFO_MASK: u32 = 0x1F;
