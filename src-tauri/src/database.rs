@@ -705,6 +705,21 @@ impl ScreenshotDatabase {
         )
     }
 
+    /// How many frames of `day` above `done` its hourly videos hold, as the
+    /// converter recorded them, or for videos made before it recorded that,
+    /// how many the capture loop recorded. Both read an index.
+    pub fn video_frames_after(&self, day: &str, done: u32) -> Result<u64> {
+        // The videos' names start with the day.
+        self.conn.query_row(
+            "SELECT CASE WHEN EXISTS (SELECT 1 FROM video_frames WHERE video >= ?1 AND video < ?1 || '~')
+                 THEN (SELECT COUNT(*) FROM video_frames
+                       WHERE video >= ?1 AND video < ?1 || '~' AND frame_number > ?2)
+                 ELSE (SELECT COUNT(*) FROM screenshots WHERE day = ?1 AND frame_number > ?2) END",
+            rusqlite::params![day, done],
+            |row| row.get::<_, i64>(0).map(|n| n as u64),
+        )
+    }
+
     /// The frame numbers recorded for `video`, in video order.
     pub fn video_frame_numbers(&self, video: &str) -> Result<Vec<u32>> {
         let mut statement = self

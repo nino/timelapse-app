@@ -581,6 +581,20 @@ async fn get_activity(
     .await
 }
 
+/// What OCR and video conversion have left to do, for the Activity window.
+/// Lists the library and reads an index or two, so the window asks for it
+/// far less often than `get_activity`. See `day_status::remaining_work`.
+#[tauri::command]
+async fn get_remaining_work(activity: State<'_, ActivityState>) -> Result<day_status::RemainingWork, String> {
+    let timelapse_root = paths::timelapse_root().ok_or("Unable to find home directory")?;
+    let video_frames_left = activity.ocr_video_frames_left();
+    run_blocking(move || {
+        let db = library_db(&timelapse_root).unwrap_or(None);
+        day_status::remaining_work(&timelapse_root, db.as_ref(), video_frames_left.as_ref()).map_err(|e| e.to_string())
+    })
+    .await
+}
+
 /// Clear a "Last error" line of the Activity window: the error from `source`
 /// that happened `at` (RFC 3339, as `get_activity` reported it). A newer
 /// error from the same source stays.
@@ -1228,6 +1242,7 @@ pub fn run() {
             count_ocr_matches,
             get_ocr_version,
             get_activity,
+            get_remaining_work,
             dismiss_error,
             start_boost,
             stop_boost,

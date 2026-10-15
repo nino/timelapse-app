@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'bun:test';
 
-import { ago, count, encodeProgress, encodeSeconds, formatDuration, until, type Encoding } from './activity';
+import { ago, backlogLabel, count, encodeProgress, encodeSeconds, formatDuration, until, type Encoding } from './activity';
 
 describe('formatDuration', () => {
   it('reads to the second under an hour and to the minute after', () => {
@@ -61,5 +61,16 @@ describe('encodeProgress', () => {
   it('gives no estimate before there is a rate', () => {
     expect(encodeProgress(encoding(0, '2026-10-07T19:58:00+02:00'), now).secondsLeft).toBeNull();
     expect(encodeProgress(encoding(30, '2026-10-07T19:59:55+02:00'), now).secondsLeft).toBeNull();
+  });
+});
+
+describe('backlogLabel', () => {
+  it('counts days and frames, and says which days are not counted yet', () => {
+    expect(backlogLabel({ days: 0, frames: 0, uncountedDays: 0 })).toBe('Nothing left');
+    expect(backlogLabel({ days: 1, frames: 3600, uncountedDays: 0 })).toBe('1 day (3,600 frames)');
+    expect(backlogLabel({ days: 3, frames: 0, uncountedDays: 3 })).toBe('3 days (frames not counted yet)');
+    expect(backlogLabel({ days: 5, frames: 1200, uncountedDays: 2 })).toBe(
+      '5 days (1,200 frames, plus 2 days of old video not counted yet)',
+    );
   });
 });

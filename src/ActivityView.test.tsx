@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, mock } from 'bun:test';
 import { invoke } from '@tauri-apps/api/core';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 
-import type { Activity } from './activity';
+import type { Activity, RemainingWork } from './activity';
 import { ActivityView } from './ActivityView';
 import { mocked } from './test/mocked';
 
@@ -46,10 +46,21 @@ function activity(overrides: Partial<Activity> = {}): Activity {
       nextCheckAt: null,
       lastError: null,
       readingVideo: false,
-      videoDaysLeft: null,
     },
     ...overrides,
   };
+}
+
+const REMAINING: RemainingWork = {
+  ocr: { days: 2, frames: 4321, uncountedDays: 0 },
+  video: { days: 1, frames: 3600, uncountedDays: 0 },
+};
+
+/** Answers `get_activity` with `current`, and `get_remaining_work` with `remaining`. */
+function answer(current: Activity, remaining: RemainingWork = REMAINING): void {
+  mocked(invoke).mockImplementation(<T,>(command: string): Promise<T> =>
+    Promise.resolve(command === 'get_remaining_work' ? remaining : current) as Promise<T>,
+  );
 }
 
 let realNow: () => number;
@@ -67,7 +78,7 @@ afterEach(() => {
 
 describe('ActivityView', () => {
   it('shows what each background job is doing', async () => {
-    mocked(invoke).mockResolvedValue(activity());
+    answer(activity());
     render(<ActivityView />);
 
     await waitFor(() => expect(screen.getByTestId('Capture-headline')).toHaveTextContent('Capturing every second'));
@@ -82,7 +93,7 @@ describe('ActivityView', () => {
 
   it('names the encode in progress and how long it has run', async () => {
     const base = activity();
-    mocked(invoke).mockResolvedValue(
+    answer(
       activity({
         conversion: {
           ...base.conversion,
@@ -114,7 +125,7 @@ describe('ActivityView', () => {
 
   it('says when an encode is paused on battery', async () => {
     const base = activity();
-    mocked(invoke).mockResolvedValue(
+    answer(
       activity({
         conversion: {
           ...base.conversion,
@@ -144,7 +155,7 @@ describe('ActivityView', () => {
 
   it('says when work waits for AC power', async () => {
     const base = activity();
-    mocked(invoke).mockResolvedValue(
+    answer(
       activity({
         onAcPower: false,
         conversion: { ...base.conversion, state: 'onBattery', nextCheckAt: secondsAhead(45) },
@@ -158,15 +169,14 @@ describe('ActivityView', () => {
     expect(screen.getByTestId('OCR-headline')).toHaveTextContent('Paused on battery; next check in 3m 20s');
   });
 
-  it('shows OCR reading old videos and how many days are left', async () => {
+  it('shows OCR reading old videos', async () => {
     const base = activity();
-    mocked(invoke).mockResolvedValue(
+    answer(
       activity({
         ocr: {
           ...base.ocr,
           readingVideo: true,
           current: { day: '2024-12-20', number: 1234, at: secondsAgo(0) },
-          videoDaysLeft: 212,
         },
       }),
     );
@@ -175,13 +185,22 @@ describe('ActivityView', () => {
     await waitFor(() =>
       expect(screen.getByTestId('OCR-headline')).toHaveTextContent('Reading the 2024-12-20 video, frame 1,234'),
     );
-    expect(screen.getByText('212 days left to read')).toBeInTheDocument();
     expect(screen.queryByText(/in this pass/)).not.toBeInTheDocument();
+  });
+
+  it('shows what is left to do', async () => {
+    answer(activity());
+    render(<ActivityView />);
+
+    const section = await screen.findByRole('region', { name: 'Left to do' });
+    expect(invoke).toHaveBeenCalledWith('get_remaining_work');
+    expect(section).toHaveTextContent('OCR2 days (4,321 frames)');
+    expect(section).toHaveTextContent('Video1 day (3,600 frames)');
   });
 
   it('treats a single failed capture as a retry, not a failure', async () => {
     const base = activity();
-    mocked(invoke).mockResolvedValue(
+    answer(
       activity({
         capture: {
           ...base.capture,
@@ -200,7 +219,7 @@ describe('ActivityView', () => {
 
   it('flags a capture that keeps failing', async () => {
     const base = activity();
-    mocked(invoke).mockResolvedValue(
+    answer(
       activity({
         capture: {
           ...base.capture,
@@ -220,7 +239,7 @@ describe('ActivityView', () => {
 
   it('goes back to capturing once a capture works after a failure', async () => {
     const base = activity();
-    mocked(invoke).mockResolvedValue(
+    answer(
       activity({ capture: { ...base.capture, lastError: { at: secondsAgo(5), message: "Can't get active window" } } }),
     );
     render(<ActivityView />);
@@ -246,10 +265,11 @@ describe('ActivityView', () => {
   });
 
   describe('boost', () => {
-    /** Answers `get_activity` with `current()` and records the other commands. */
+    /** Answers `get_activity` with `current()`, `get_remaining_work` with `REMAINING`, and records the other commands. */
     function respond(current: () => Activity, answer?: (command: string) => Promise<unknown>): void {
       const reply = answer ?? (async (command: string): Promise<unknown> => {
         if (command === 'get_activity') return current();
+        if (command === 'get_remaining_work') return REMAINING;
         if (command === 'stop_boost') return undefined;
         return current().boost;
       });
