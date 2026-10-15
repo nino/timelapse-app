@@ -81,8 +81,7 @@ pub fn spawn(app: AppHandle) {
         while window_is_focused(&app) {
             tokio::time::sleep(RELAUNCH_POLL).await;
         }
-        crate::before_quit(&app);
-        app.restart();
+        relaunch(&app);
     });
 }
 
@@ -270,8 +269,7 @@ pub fn check_from_menu(app: AppHandle) {
         match install(&update).await {
             Ok(()) => {
                 *installed = Some(version);
-                crate::before_quit(&app);
-                app.restart();
+                relaunch(&app);
             }
             Err(e) if cancelled(&e) => {}
             Err(e) => warn(&app, "Couldn't install the update", &e),
@@ -293,9 +291,62 @@ fn offer_relaunch(app: &AppHandle, version: &str) {
         ))
         .blocking_show();
     if relaunch {
-        crate::before_quit(app);
-        app.restart();
+        self::relaunch(app);
     }
+}
+
+/// Quits, and opens the app again once this process has gone.
+///
+/// Tauri's `restart` opens the new copy with `open -n` before this one exits,
+/// and macOS gives a second copy of a running app a Dock icon of its own,
+/// which it keeps after the first copy quits: a new Dock icon next to the kept
+/// one after every update. Opened only after this process has gone, the new
+/// copy is the app's only copy and takes the kept icon.
+fn relaunch(app: &AppHandle) {
+    #[cfg(target_os = "macos")]
+    if let Some(bundle) = current_bundle() {
+        let reopen = after_exit(std::process::id(), "/usr/bin/open", &[bundle.as_os_str()]).spawn();
+        match reopen {
+            // Quitting runs `before_quit` on the way out.
+            Ok(_) => return app.exit(0),
+            Err(e) => eprintln!("Couldn't relaunch through open: {}", e),
+        }
+    }
+    crate::before_quit(app);
+    app.restart();
+}
+
+/// How long `after_exit` waits for the process to go before running the
+/// program anyway.
+#[cfg(unix)]
+const EXIT_WAIT_SECONDS: u32 = 60;
+
+/// A command that waits in the background until process `pid` has exited and
+/// then runs `program`. It is in a process group of its own, with no stdio, so
+/// nothing that happens to this process reaches it.
+#[cfg(unix)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn after_exit(pid: u32, program: &str, args: &[&std::ffi::OsStr]) -> std::process::Command {
+    use std::os::unix::process::CommandExt;
+    let script = format!(
+        "pid=$1; shift; i=0; \
+         while kill -0 \"$pid\" 2>/dev/null && [ $i -lt {} ]; do sleep 0.2; i=$((i + 1)); done; \
+         exec \"$@\"",
+        EXIT_WAIT_SECONDS * 5
+    );
+    let mut command = std::process::Command::new("/bin/sh");
+    command
+        .arg("-c")
+        .arg(script)
+        .arg("sh")
+        .arg(pid.to_string())
+        .arg(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .process_group(0);
+    command
 }
 
 fn tell(app: &AppHandle, title: &str, message: &str) {
@@ -392,6 +443,31 @@ mod tests {
     fn recognises_a_cancelled_password_prompt() {
         assert!(cancelled("execution error: User canceled. (-128)"));
         assert!(!cancelled("execution error: rm: Permission denied (1)"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn after_exit_runs_the_program_once_the_process_has_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("relaunched");
+        let mut running = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        after_exit(running.id(), "touch", &[marker.as_os_str()])
+            .spawn()
+            .unwrap();
+
+        std::thread::sleep(Duration::from_millis(600));
+        assert!(!marker.exists(), "ran while the process was still running");
+
+        running.kill().unwrap();
+        running.wait().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !marker.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(marker.exists(), "didn't run after the process exited");
     }
 
     #[test]
