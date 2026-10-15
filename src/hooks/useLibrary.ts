@@ -40,34 +40,54 @@ export function useDays(): {
   return { days, daysError };
 }
 
+/** How often the day picker's marks are asked for again while it is open. */
+const DAY_STATUS_INTERVAL_MS = 5000;
+
 /**
  * Each day's OCR and video status by date, while `open` (the day picker is
- * open): asked for on opening and again whenever the library root changes,
- * where OCR's database and new videos are written. Kept from the last
- * answer while closed, and after a failure.
+ * open): asked for on opening and every few seconds after. Not on library
+ * changes, which come every second while capturing. Kept from the last
+ * answer while closed, after a failure, and when nothing changed, so the
+ * options don't re-render.
  */
 export function useDayStatuses(open: boolean): Map<string, DayStatus> {
   const [statuses, setStatuses] = React.useState<Map<string, DayStatus>>(() => new Map());
 
-  const load = React.useCallback(
-    async (isCurrent: () => boolean): Promise<void> => {
-      if (!open) return;
+  React.useEffect(() => {
+    if (!open) return;
+    let current = true;
+    const load = async (): Promise<void> => {
       try {
         const list = await getDayStatuses();
-        if (isCurrent()) {
-          setStatuses(new Map(list.map((status): [string, DayStatus] => [status.date, status])));
-        }
+        if (!current) return;
+        setStatuses((previous) => (sameStatuses(previous, list) ? previous : byDate(list)));
       } catch (error) {
         console.warn("Could not read day statuses:", error);
       }
-    },
-    [open],
-  );
-
-  const reload = useLatestLoad(load);
-  useDirectoryChanges(open ? timelapseRoot() : null, reload);
+    };
+    void load();
+    const timer = setInterval(() => void load(), DAY_STATUS_INTERVAL_MS);
+    return (): void => {
+      current = false;
+      clearInterval(timer);
+    };
+  }, [open]);
 
   return statuses;
+}
+
+function byDate(list: Array<DayStatus>): Map<string, DayStatus> {
+  return new Map(list.map((status): [string, DayStatus] => [status.date, status]));
+}
+
+function sameStatuses(previous: Map<string, DayStatus>, list: Array<DayStatus>): boolean {
+  return (
+    previous.size === list.length &&
+    list.every((status) => {
+      const old = previous.get(status.date);
+      return old?.ocrDone === status.ocrDone && old.videoDone === status.videoDone;
+    })
+  );
 }
 
 /**

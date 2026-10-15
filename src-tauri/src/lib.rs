@@ -221,15 +221,12 @@ async fn list_days(source: State<'_, FrameSourceState>) -> Result<Vec<String>, S
 /// Whether OCR and video conversion have finished each day, oldest first.
 /// See `day_status`.
 #[tauri::command]
-async fn get_day_statuses(
-    source: State<'_, FrameSourceState>,
-) -> Result<Vec<day_status::DayStatus>, String> {
+async fn get_day_statuses() -> Result<Vec<day_status::DayStatus>, String> {
     let timelapse_root = paths::timelapse_root().ok_or("Unable to find home directory")?;
-    let source = Arc::clone(source.inner());
     run_blocking(move || {
-        let days = source.days().map_err(|e| e.to_string())?;
-        let db = library_db(&timelapse_root)?;
-        day_status::day_statuses(&timelapse_root, db.as_ref(), &days)
+        // A database that can't be opened reads as one OCR hasn't touched.
+        let db = library_db(&timelapse_root).unwrap_or(None);
+        day_status::day_statuses(&timelapse_root, db.as_ref()).map_err(|e| e.to_string())
     })
     .await
 }

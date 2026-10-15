@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, mock } from 'bun:test';
+import { beforeEach, describe, expect, it, mock, spyOn } from 'bun:test';
 import { invoke } from '@tauri-apps/api/core';
 import { watch } from '@tauri-apps/plugin-fs';
 import { act, renderHook, waitFor } from '@testing-library/react';
@@ -159,14 +159,21 @@ describe('useDayStatuses', () => {
     await waitFor(() => expect(result.current.get('2026-10-04')?.ocrDone).toBe(true));
   });
 
-  it('stays live while the picker is open', async () => {
-    mocked(invoke).mockResolvedValueOnce([{ date: '2026-10-04', ocrDone: false, videoDone: false }]);
+  it('asks again every few seconds while open, keeping the map when nothing changed', async () => {
+    const intervals = spyOn(globalThis, 'setInterval');
+    mocked(invoke).mockResolvedValue([{ date: '2026-10-04', ocrDone: false, videoDone: false }]);
     const { result } = renderHook(() => useDayStatuses(true));
     await waitFor(() => expect(result.current.get('2026-10-04')?.videoDone).toBe(false));
+    const first = result.current;
+    const [[tick, ms]] = intervals.mock.calls;
+    expect(ms).toBe(5000);
 
-    mocked(invoke).mockResolvedValueOnce([{ date: '2026-10-04', ocrDone: true, videoDone: true }]);
-    await waitFor(() => expect(watchers.has(TEST_ROOT)).toBe(true));
-    fireChange(TEST_ROOT);
+    await act(async () => (tick as () => void)());
+    expect(result.current).toBe(first);
+
+    mocked(invoke).mockResolvedValue([{ date: '2026-10-04', ocrDone: true, videoDone: true }]);
+    await act(async () => (tick as () => void)());
     await waitFor(() => expect(result.current.get('2026-10-04')?.videoDone).toBe(true));
+    intervals.mockRestore();
   });
 });

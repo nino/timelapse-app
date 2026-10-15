@@ -690,6 +690,20 @@ impl ScreenshotDatabase {
         tx.commit()
     }
 
+    /// The highest frame number `day`'s hourly videos were made from, as the
+    /// converter recorded it, or for videos made before it recorded that,
+    /// the highest the capture loop recorded for the day. Both read an index.
+    pub fn last_video_frame(&self, day: &str) -> Result<Option<u32>> {
+        // The videos' names start with the day.
+        self.conn.query_row(
+            "SELECT COALESCE(
+                 (SELECT MAX(frame_number) FROM video_frames WHERE video >= ?1 AND video < ?1 || '~'),
+                 (SELECT MAX(frame_number) FROM screenshots WHERE day = ?1))",
+            [day],
+            |row| row.get(0),
+        )
+    }
+
     /// The frame numbers recorded for `video`, in video order.
     pub fn video_frame_numbers(&self, video: &str) -> Result<Vec<u32>> {
         let mut statement = self

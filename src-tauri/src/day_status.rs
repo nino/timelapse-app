@@ -1,27 +1,29 @@
-//! Whether OCR and video conversion have finished each day, for the dots in
-//! the day picker.
+//! Whether OCR and video conversion have finished each day, for the marks
+//! in the day picker.
 //!
 //! Built from what is cheap to read: the library's directory listings (file
 //! names only, no stats) and the `ocr_progress` table. Nothing is probed or
-//! decoded, so it can be asked every time the picker opens.
+//! decoded, so the picker can ask every few seconds while it is open.
 //!
 //! - **Video** is done once a day has no screenshots left: the converter
 //!   deletes an hour's PNGs only after encoding it, and the old script's
 //!   days never had any left.
 //! - **OCR** is done once the day's progress mark covers its highest
-//!   remaining screenshot. A day without screenshots is done if OCR read it
-//!   from screenshots before they went (the converter waits for OCR), or, if
-//!   it is read from video, once OCR has marked it complete
+//!   remaining screenshot. A day without screenshots is done if the mark
+//!   covers the frames its hourly videos were made from (`video_frames`),
+//!   or, if it is read from video, once OCR has marked it complete
 //!   (`ScreenshotDatabase::set_video_day_complete`).
 //!
 //! A day with neither screenshots nor videos (an empty folder while the
 //! screen is locked) gets no status, and nor does a day whose folder can't
-//! be read.
+//! be read. If the database can't be read, every day shows OCR as not done
+//! rather than the picker showing nothing.
 
+use crate::converter::is_day_folder_name;
 use crate::database::{OcrProgress, ScreenshotDatabase};
 use frame_source::{parse_screenshot_name, parse_video_name};
 use serde::Serialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -32,36 +34,59 @@ pub struct DayStatus {
     pub video_done: bool,
 }
 
-/// The status of each of `days` (`YYYY-MM-DD`) in `root` that has frames,
-/// in the same order. `db` is `None` before the library has a database, when
-/// OCR has done nothing.
-pub fn day_statuses(
-    root: &Path,
-    db: Option<&ScreenshotDatabase>,
-    days: &[String],
-) -> Result<Vec<DayStatus>, String> {
-    let progress: HashMap<String, (OcrProgress, bool)> = match db {
-        Some(db) => db
-            .all_ocr_progress()
-            .map_err(|e| e.to_string())?
+/// The status of every day in `root` that has frames, oldest first. `db` is
+/// `None` before the library has a database, when OCR has done nothing.
+pub fn day_statuses(root: &Path, db: Option<&ScreenshotDatabase>) -> std::io::Result<Vec<DayStatus>> {
+    let progress: HashMap<String, (OcrProgress, bool)> = match db.map(|db| db.all_ocr_progress()) {
+        Some(Ok(rows)) => rows
             .into_iter()
             .map(|(day, progress, complete)| (day, (progress, complete)))
             .collect(),
+        Some(Err(error)) => {
+            eprintln!("Day statuses: cannot read OCR progress: {}", error);
+            HashMap::new()
+        }
         None => HashMap::new(),
     };
-    let video_days = video_days(root).map_err(|e| e.to_string())?;
 
+    // One listing of the root gives both the day folders and the days with
+    // a video there.
+    let mut folders = BTreeSet::new();
+    let mut video_days = BTreeSet::new();
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    for entry in entries.filter_map(|entry| entry.ok()) {
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if is_day_folder_name(&name) {
+            folders.insert(name);
+        } else if let Some(day) = video_day(&name) {
+            video_days.insert(day);
+        }
+    }
+
+    let days: BTreeSet<&String> = folders.iter().chain(&video_days).collect();
     Ok(days
-        .iter()
+        .into_iter()
         .filter_map(|date| {
-            let folder = read_day_folder(&root.join(date)).ok()?;
-            let has_videos = folder.has_videos || video_days.contains(date.as_str());
+            let folder = if folders.contains(date) {
+                read_day_folder(&root.join(date), date).ok()?
+            } else {
+                DayFolder::default()
+            };
+            let has_videos = folder.has_videos || video_days.contains(date);
             if folder.last_screenshot.is_none() && !has_videos {
                 return None;
             }
             let ocr_done = match (folder.last_screenshot, progress.get(date)) {
                 (Some(last), Some((OcrProgress::FrameNumber(done), _))) => *done >= last,
-                (None, Some((OcrProgress::FrameNumber(_), _))) => true,
+                (None, Some((OcrProgress::FrameNumber(done), _))) => db
+                    .and_then(|db| db.last_video_frame(date).ok())
+                    .is_some_and(|last| last.is_some_and(|last| *done >= last)),
                 (None, Some((OcrProgress::VideoPosition(_), complete))) => *complete,
                 _ => false,
             };
@@ -74,48 +99,30 @@ pub fn day_statuses(
         .collect())
 }
 
-/// The days with a video in the library root.
-fn video_days(root: &Path) -> std::io::Result<HashSet<String>> {
-    let entries = match std::fs::read_dir(root) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HashSet::new()),
-        Err(e) => return Err(e),
-    };
-    Ok(entries
-        .filter_map(|entry| entry.ok())
-        .filter_map(|entry| {
-            let (start, _) = parse_video_name(entry.file_name().to_str()?)?;
-            Some(start.date().format("%Y-%m-%d").to_string())
-        })
-        .collect())
+/// The day of a video named `name`.
+fn video_day(name: &str) -> Option<String> {
+    let (start, _) = parse_video_name(name)?;
+    Some(start.date().format("%Y-%m-%d").to_string())
 }
 
+#[derive(Default)]
 struct DayFolder {
     /// The highest `NNNNN.png` number.
     last_screenshot: Option<u32>,
-    /// Whether a video sits in the folder rather than the library root.
+    /// Whether a video of this day sits in the folder rather than the root.
     has_videos: bool,
 }
 
-/// What a day folder holds, from its file names alone. A missing folder is
-/// empty.
-fn read_day_folder(day_dir: &Path) -> std::io::Result<DayFolder> {
-    let mut folder = DayFolder {
-        last_screenshot: None,
-        has_videos: false,
-    };
-    let entries = match std::fs::read_dir(day_dir) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(folder),
-        Err(e) => return Err(e),
-    };
-    for entry in entries.filter_map(|entry| entry.ok()) {
-        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+/// What day folder `day_dir` (of `date`) holds, from its file names alone.
+fn read_day_folder(day_dir: &Path, date: &str) -> std::io::Result<DayFolder> {
+    let mut folder = DayFolder::default();
+    for entry in std::fs::read_dir(day_dir)?.filter_map(|entry| entry.ok()) {
+        let Ok(name) = entry.file_name().into_string() else {
             continue;
         };
         if let Some(number) = parse_screenshot_name(&name) {
             folder.last_screenshot = folder.last_screenshot.max(Some(number));
-        } else if parse_video_name(&name).is_some() {
+        } else if video_day(&name).as_deref() == Some(date) {
             folder.has_videos = true;
         }
     }
@@ -125,6 +132,7 @@ fn read_day_folder(day_dir: &Path) -> std::io::Result<DayFolder> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Local;
     use tempfile::TempDir;
 
     fn touch(path: &Path) {
@@ -157,7 +165,14 @@ mod tests {
         touch(&root.join("2024-01-03--20-00-00.mov"));
         // Converted hour by hour; the PNGs went after OCR.
         touch(&root.join("2026-10-01--09-00-00--hourly.mov"));
+        let frames = [(3599, Local::now()), (3600, Local::now())];
+        db.record_video_frames("2026-10-01--09-00-00--hourly.mov", "2026-10-01", &frames).unwrap();
         db.record_ocr_frame("2026-10-01", 3600, None).unwrap();
+        // Converted, but its progress was reset after Vision failed, so its
+        // text is missing.
+        touch(&root.join("2026-10-08--09-00-00--hourly.mov"));
+        db.record_video_frames("2026-10-08--09-00-00--hourly.mov", "2026-10-08", &frames).unwrap();
+        db.record_ocr_frame("2026-10-08", 0, None).unwrap();
         // One hour converted, the rest OCR'd but not converted yet.
         touch(&root.join("2026-10-02--09-00-00--hourly.mov"));
         touch(&root.join("2026-10-02/03601.png"));
@@ -169,13 +184,8 @@ mod tests {
         touch(&root.join("2026-10-03/.00003.png.tmp"));
         db.record_ocr_frame("2026-10-03", 1, None).unwrap();
 
-        let days: Vec<String> = [
-            "2024-01-01", "2024-01-02", "2024-01-03", "2026-10-01", "2026-10-02", "2026-10-03",
-        ]
-        .map(String::from)
-        .into();
         assert_eq!(
-            day_statuses(root, Some(&db), &days).unwrap(),
+            day_statuses(root, Some(&db)).unwrap(),
             vec![
                 status("2024-01-01", true, true),
                 status("2024-01-02", false, true),
@@ -183,6 +193,7 @@ mod tests {
                 status("2026-10-01", true, true),
                 status("2026-10-02", true, false),
                 status("2026-10-03", false, false),
+                status("2026-10-08", false, true),
             ]
         );
     }
@@ -192,12 +203,13 @@ mod tests {
         let dir = TempDir::new().unwrap();
         std::fs::create_dir(dir.path().join("2026-10-03")).unwrap();
         touch(&dir.path().join("2026-10-04/00001.png"));
-        // A video in its day's folder, rather than the root, counts too.
+        // A video in its day's folder, rather than the root, counts too,
+        // but only for its own day.
         touch(&dir.path().join("2026-10-05/2026-10-05--09-00-00--hourly.mov"));
+        touch(&dir.path().join("2026-10-06/2026-10-05--10-00-00--hourly.mov"));
 
-        let days: Vec<String> = ["2026-10-03", "2026-10-04", "2026-10-05"].map(String::from).into();
         assert_eq!(
-            day_statuses(dir.path(), None, &days).unwrap(),
+            day_statuses(dir.path(), None).unwrap(),
             vec![status("2026-10-04", false, false), status("2026-10-05", false, true)]
         );
     }
@@ -208,7 +220,7 @@ mod tests {
         touch(&dir.path().join("2026-10-03/00001.png"));
 
         assert_eq!(
-            day_statuses(dir.path(), None, &["2026-10-03".into()]).unwrap(),
+            day_statuses(dir.path(), None).unwrap(),
             vec![status("2026-10-03", false, false)]
         );
     }
@@ -229,7 +241,7 @@ mod tests {
         assert_eq!(db.ocr_done_through("2026-10-03").unwrap(), Some(1));
         assert_eq!(db.ocr_progress("2026-10-04").unwrap(), None);
         assert_eq!(
-            day_statuses(root, Some(&db), &["2026-10-03".into()]).unwrap(),
+            day_statuses(root, Some(&db)).unwrap(),
             vec![status("2026-10-03", false, false)]
         );
     }

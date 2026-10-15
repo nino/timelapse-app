@@ -549,9 +549,10 @@ impl OcrWorker {
             .map(|(day, progress, complete)| (day, (progress, complete)))
             .collect();
         for day in days {
+            // None until OCR has started on the day.
             let (done, marked_complete) = match progress.get(&day) {
-                None => (0, false),
-                Some((OcrProgress::VideoPosition(last), complete)) => (*last as usize, *complete),
+                None => (0, None),
+                Some((OcrProgress::VideoPosition(last), complete)) => (*last as usize, Some(*complete)),
                 Some((OcrProgress::FrameNumber(_), _)) => continue,
             };
             let Some(day_videos) = videos.source.video_only_day(&day).map_err(|e| e.to_string())?
@@ -568,10 +569,8 @@ impl OcrWorker {
             // For the day picker. Kept in step every pass, so a video that
             // turns up later, or one that can be read again, clears it.
             let complete = unread.is_empty() && !any_failed;
-            if complete != marked_complete {
-                self.db
-                    .set_video_day_complete(&day, complete)
-                    .map_err(|e| e.to_string())?;
+            if marked_complete.is_some_and(|marked| marked != complete) {
+                self.mark_complete(&day, complete);
             }
             unread.retain(|video| !videos.failed.contains(&video.path));
             if !unread.is_empty() {
@@ -650,13 +649,19 @@ impl OcrWorker {
                 }
             }
             if finished {
-                self.db
-                    .set_video_day_complete(&day, true)
-                    .map_err(|e| e.to_string())?;
+                self.mark_complete(&day, true);
             }
         }
 
         Ok(summary)
+    }
+
+    /// Set `day`'s complete flag for the day picker. Only the picker reads
+    /// it, so failing to write it doesn't stop OCR.
+    fn mark_complete(&self, day: &str, complete: bool) {
+        if let Err(error) = self.db.set_video_day_complete(day, complete) {
+            eprintln!("OCR: could not mark {} as read to the end: {}", day, error);
+        }
     }
 
     fn handle_video_frame(
@@ -1576,7 +1581,9 @@ mod tests {
         assert!(library.complete(DAY_1));
 
         write_video(&library.root.join("2024-01-01--23-00-00.mov"), &[0]);
-        // The pass that finds it unmarks the day, and reads it.
+        // Finding it unmarks the day before anything is read.
+        assert_eq!(library.video_pass(0).handled(), 0);
+        assert!(!library.complete(DAY_1));
         assert_eq!(library.video_pass(usize::MAX).handled(), 1);
         assert!(library.complete(DAY_1));
         assert_eq!(library.progress(DAY_1), Some(OcrProgress::VideoPosition(3)));
