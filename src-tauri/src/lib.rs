@@ -13,6 +13,7 @@ mod converter;
 mod day_status;
 mod timelapse;
 mod database;
+mod day_apps;
 mod menu_app;
 mod diagnostics;
 mod ocr;
@@ -404,6 +405,21 @@ async fn search_ocr_day(
     let timelapse_root = paths::timelapse_root().ok_or("Unable to find home directory")?;
     let source = Arc::clone(source.inner());
     run_blocking(move || search_ocr_day_impl(&timelapse_root, &source, &date, &query)).await
+}
+
+/// Which app was in front across `date`, for the viewer's app filter.
+#[tauri::command]
+async fn get_day_apps(
+    source: State<'_, FrameSourceState>,
+    date: String,
+) -> Result<day_apps::DayApps, String> {
+    let timelapse_root = paths::timelapse_root().ok_or("Unable to find home directory")?;
+    let source = Arc::clone(source.inner());
+    run_blocking(move || {
+        let db = library_db(&timelapse_root)?;
+        day_apps::day_apps(db.as_ref(), &source, &date)
+    })
+    .await
 }
 
 /// A line of recognized text, normalized to the frame's size with the origin
@@ -1188,6 +1204,7 @@ pub fn run() {
             get_pending_frames,
             search_ocr,
             search_ocr_day,
+            get_day_apps,
             get_match_lines,
             count_ocr_matches,
             get_ocr_version,

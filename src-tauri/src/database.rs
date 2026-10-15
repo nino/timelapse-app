@@ -17,6 +17,7 @@
 
 use rusqlite::{Connection, OptionalExtension, Result, Transaction, TransactionBehavior};
 use serde::Serialize;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 use chrono::{DateTime, Utc, Local};
@@ -818,6 +819,47 @@ impl ScreenshotDatabase {
             .query_map([fts_query], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect();
         counts
+    }
+
+    /// The window in front for each screenshot of `day` that recorded one, as
+    /// (frame number, `windows` id), in frame order. Where a number repeats
+    /// (the day's numbering restarted), the newest row comes last.
+    pub fn front_windows_in_day(&self, day: &str) -> Result<Vec<(u32, i64)>> {
+        let mut statement = self.conn.prepare(
+            "SELECT frame_number, window_id FROM screenshots
+             WHERE day = ?1 AND window_id IS NOT NULL
+             ORDER BY frame_number, id",
+        )?;
+        let rows = statement.query_map([day], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect()
+    }
+
+    /// The app name of each window in front at some point on `day`, by
+    /// `windows` id.
+    pub fn front_apps_of_day(&self, day: &str) -> Result<HashMap<i64, String>> {
+        let mut statement = self.conn.prepare(
+            "SELECT id, app_name FROM windows
+             WHERE id IN (SELECT DISTINCT window_id FROM screenshots WHERE day = ?1)",
+        )?;
+        let rows = statement.query_map([day], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect()
+    }
+
+    /// Each OCR row of `day` as (frame number, the app its menu bar named),
+    /// in frame order. A row stands for every frame up to the next one.
+    pub fn menu_apps_in_day(&self, day: &str) -> Result<Vec<(u32, Option<String>)>> {
+        let mut statement = self.conn.prepare(
+            "SELECT frame_number, menu_app FROM ocr_frames WHERE day = ?1 ORDER BY frame_number",
+        )?;
+        let rows = statement.query_map([day], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect()
+    }
+
+    /// Every app name the capture loop has seen in front, on any day.
+    pub fn front_app_names(&self) -> Result<Vec<String>> {
+        let mut statement = self.conn.prepare("SELECT DISTINCT app_name FROM windows")?;
+        let rows = statement.query_map([], |row| row.get(0))?;
+        rows.collect()
     }
 
     /// The recognized text of frame `frame_number` of `day` and the box of

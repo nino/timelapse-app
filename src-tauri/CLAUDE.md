@@ -11,6 +11,7 @@ Each module's `//!` doc comment says how it works; this file is the map and the 
 - `converter.rs` — encodes each finished hour of PNGs into `<root>/YYYY-MM-DD--HH-MM-SS--hourly.mov` with ffmpeg, then deletes the PNGs.
 - `frame-source/` — **a separate crate** (no Tauri dependency) that answers "frame N of day D" whether the frame is a PNG, an hourly video or one of the old script's whole-day videos, with a chunked LRU cache of decoded video frames and read-ahead.
 - `day_status.rs` — whether OCR and video conversion have finished each day, for the day picker, from directory listings and `ocr_progress` only.
+- `day_apps.rs` — which app was in front across a day (recorded window, else the OCR'd menu bar), as scrubber stretches for the app filter.
 - `activity.rs`, `boost.rs` — what the Activity window shows, and Boost / Low power mode, which change how hard conversion and OCR may work.
 - `diagnostics.rs` — `<library>/diagnostics.db`, a log for Nino to upload when something looks wrong (there are no analytics).
 - `app_state.rs`, `settings.rs`, `updater.rs`, `paths.rs` — remembered window and viewer state, preferences, auto-update, library and ffmpeg paths.
