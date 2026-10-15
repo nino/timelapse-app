@@ -294,6 +294,20 @@ impl ScreenshotDatabase {
             )?;
         }
 
+        // Migration 9: mark days read from video once OCR has read every
+        // one of their videos, so the day picker can tell without probing
+        // the videos for their length.
+        if !Self::migration_applied(&tx, "ocr_video_days_complete")? {
+            tx.execute(
+                "ALTER TABLE ocr_progress ADD COLUMN complete INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+            tx.execute(
+                "INSERT INTO migrations (migration_name, applied_at) VALUES (?1, ?2)",
+                rusqlite::params!["ocr_video_days_complete", Utc::now().to_rfc3339()],
+            )?;
+        }
+
         tx.commit()?;
 
         Ok(vacuum)
@@ -613,6 +627,35 @@ impl ScreenshotDatabase {
             .optional()
     }
 
+    /// Mark `day`, a day read from video, as read to the end of its videos
+    /// or not. Does nothing for a day OCR hasn't started on or reads from
+    /// screenshots.
+    pub fn set_video_day_complete(&self, day: &str, complete: bool) -> Result<()> {
+        self.conn.execute(
+            "UPDATE ocr_progress SET complete = ?2 WHERE day = ?1 AND by_position",
+            rusqlite::params![day, complete],
+        )?;
+        Ok(())
+    }
+
+    /// Every day's OCR progress, and for days read from video whether OCR
+    /// has finished them, in day order.
+    pub fn all_ocr_progress(&self) -> Result<Vec<(String, OcrProgress, bool)>> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT day, last_frame, by_position, complete FROM ocr_progress ORDER BY day")?;
+        let rows = statement.query_map([], |row| {
+            let last: u32 = row.get(1)?;
+            let progress = if row.get(2)? {
+                OcrProgress::VideoPosition(last)
+            } else {
+                OcrProgress::FrameNumber(last)
+            };
+            Ok((row.get(0)?, progress, row.get(3)?))
+        })?;
+        rows.collect()
+    }
+
     /// Record the screenshots `video` was encoded from, in video order, as
     /// (frame number, mtime) in day folder `day`. Replaces whatever was
     /// recorded for `video` before. Each frame's time is its `screenshots`
@@ -646,6 +689,20 @@ impl ScreenshotDatabase {
             }
         }
         tx.commit()
+    }
+
+    /// The highest frame number `day`'s hourly videos were made from, as the
+    /// converter recorded it, or for videos made before it recorded that,
+    /// the highest the capture loop recorded for the day. Both read an index.
+    pub fn last_video_frame(&self, day: &str) -> Result<Option<u32>> {
+        // The videos' names start with the day.
+        self.conn.query_row(
+            "SELECT COALESCE(
+                 (SELECT MAX(frame_number) FROM video_frames WHERE video >= ?1 AND video < ?1 || '~'),
+                 (SELECT MAX(frame_number) FROM screenshots WHERE day = ?1))",
+            [day],
+            |row| row.get(0),
+        )
     }
 
     /// The frame numbers recorded for `video`, in video order.

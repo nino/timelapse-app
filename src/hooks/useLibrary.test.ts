@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, mock } from 'bun:test';
+import { beforeEach, describe, expect, it, mock, spyOn } from 'bun:test';
 import { invoke } from '@tauri-apps/api/core';
 import { watch } from '@tauri-apps/plugin-fs';
 import { act, renderHook, waitFor } from '@testing-library/react';
@@ -6,7 +6,7 @@ import { act, renderHook, waitFor } from '@testing-library/react';
 import type { Day } from '../frames';
 import { mocked } from '../test/mocked';
 import { TEST_ROOT } from '../test/setup';
-import { useDay, useDays } from './useLibrary';
+import { useDay, useDayStatuses, useDays } from './useLibrary';
 
 // invoke and watch are replaced with mocks in src/test/setup.ts.
 
@@ -137,5 +137,43 @@ describe('useDay', () => {
 
     await act(async () => resolveOld(day('2026-10-03', 5)));
     expect(result.current.day?.date).toBe('2026-10-04');
+  });
+});
+
+describe('useDayStatuses', () => {
+  it('asks each time the picker opens and keeps the last answer while closed', async () => {
+    mocked(invoke).mockResolvedValueOnce([{ date: '2026-10-04', ocrDone: false, videoDone: false }]);
+    const { result, rerender } = renderHook(({ open }) => useDayStatuses(open), {
+      initialProps: { open: false },
+    });
+    expect(invoke).not.toHaveBeenCalled();
+
+    rerender({ open: true });
+    await waitFor(() => expect(result.current.get('2026-10-04')?.ocrDone).toBe(false));
+    expect(invoke).toHaveBeenCalledWith('get_day_statuses');
+
+    mocked(invoke).mockResolvedValueOnce([{ date: '2026-10-04', ocrDone: true, videoDone: false }]);
+    rerender({ open: false });
+    expect(result.current.get('2026-10-04')?.ocrDone).toBe(false);
+    rerender({ open: true });
+    await waitFor(() => expect(result.current.get('2026-10-04')?.ocrDone).toBe(true));
+  });
+
+  it('asks again every few seconds while open, keeping the map when nothing changed', async () => {
+    const intervals = spyOn(globalThis, 'setInterval');
+    mocked(invoke).mockResolvedValue([{ date: '2026-10-04', ocrDone: false, videoDone: false }]);
+    const { result } = renderHook(() => useDayStatuses(true));
+    await waitFor(() => expect(result.current.get('2026-10-04')?.videoDone).toBe(false));
+    const first = result.current;
+    const [[tick, ms]] = intervals.mock.calls;
+    expect(ms).toBe(5000);
+
+    await act(async () => (tick as () => void)());
+    expect(result.current).toBe(first);
+
+    mocked(invoke).mockResolvedValue([{ date: '2026-10-04', ocrDone: true, videoDone: true }]);
+    await act(async () => (tick as () => void)());
+    await waitFor(() => expect(result.current.get('2026-10-04')?.videoDone).toBe(true));
+    intervals.mockRestore();
   });
 });
