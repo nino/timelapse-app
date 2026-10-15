@@ -7,7 +7,7 @@ Each module's `//!` doc comment says how it works; this file is the map and the 
 - `lib.rs` — the Tauri commands, the `frames://localhost/<YYYY-MM-DD>/<index>` URI scheme (`http://frames.localhost/…` on Windows), the menu, and `setup()`, which creates the library directory, evicts cache folders over 15 days old, and starts the photographer (after a 1 s delay), OCR and the converter. State-backed commands are thin shims over `*_impl(&PhotographerState, …)` functions, which is what the tests call.
 - `timelapse.rs` — the `Photographer` capture loop.
 - `database.rs` — `ScreenshotDatabase` over `<library>/screenshots.db`, and its migrations.
-- `ocr.rs`, `ocr_helper.rs`, `ocr_tiles.rs`, `menu_app.rs` — background OCR with Apple Vision (macOS only), run in a helper process because Vision can break for the rest of a process's life.
+- `ocr.rs`, `ocr_helper.rs`, `ocr_tiles.rs`, `ocr_readahead.rs`, `menu_app.rs` — background OCR with Apple Vision (macOS only), run in a helper process because Vision can break for the rest of a process's life; during a boost, screenshots are read ahead by four helpers at once.
 - `converter.rs` — encodes each finished hour of PNGs into `<root>/YYYY-MM-DD--HH-MM-SS--hourly.mov` with ffmpeg, then deletes the PNGs.
 - `frame-source/` — **a separate crate** (no Tauri dependency) that answers "frame N of day D" whether the frame is a PNG, an hourly video or one of the old script's whole-day videos, with a chunked LRU cache of decoded video frames and read-ahead.
 - `day_status.rs` — whether OCR and video conversion have finished each day, for the day picker, from directory listings and `ocr_progress` only.
