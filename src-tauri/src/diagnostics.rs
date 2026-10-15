@@ -308,10 +308,19 @@ impl Tally {
     }
 
     pub fn time(&mut self, name: &'static str, took: Duration) {
+        self.time_many(name, 1, took, took);
+    }
+
+    /// Like `time`, for `count` occurrences that took `total` in all, the
+    /// longest of them `max`.
+    pub fn time_many(&mut self, name: &'static str, count: u64, total: Duration, max: Duration) {
+        if count == 0 {
+            return;
+        }
         let timing = self.timings.entry(name).or_default();
-        timing.count += 1;
-        timing.total += took;
-        timing.max = timing.max.max(took);
+        timing.count += count;
+        timing.total += total;
+        timing.max = timing.max.max(max);
     }
 
     /// Record the summary and start a new one, once `TALLY_PERIOD` has gone
