@@ -1,5 +1,5 @@
 //! Whether OCR and video conversion have finished each day, for the marks
-//! in the day picker.
+//! in the day picker, and how much of each is left, for the Activity window.
 //!
 //! Built from what is cheap to read: the library's directory listings (file
 //! names only, no stats) and the `ocr_progress` table. Nothing is probed or
@@ -34,10 +34,91 @@ pub struct DayStatus {
     pub video_done: bool,
 }
 
+/// What OCR and video conversion have left to do across the library, for the
+/// Activity window.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemainingWork {
+    pub ocr: Backlog,
+    pub video: Backlog,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Backlog {
+    /// Days with work left.
+    pub days: usize,
+    /// Frames left in those days, except `uncounted_days`.
+    pub frames: u64,
+    /// Days among `days` whose frames aren't counted: days that only exist
+    /// as video, before OCR's first pass over them has counted their frames.
+    pub uncounted_days: usize,
+}
+
+type Progress = HashMap<String, (OcrProgress, bool)>;
+
 /// The status of every day in `root` that has frames, oldest first. `db` is
 /// `None` before the library has a database, when OCR has done nothing.
 pub fn day_statuses(root: &Path, db: Option<&ScreenshotDatabase>) -> std::io::Result<Vec<DayStatus>> {
-    let progress: HashMap<String, (OcrProgress, bool)> = match db.map(|db| db.all_ocr_progress()) {
+    let (progress, days) = scan(root, db)?;
+    Ok(days
+        .into_iter()
+        .map(|(date, folder)| DayStatus {
+            ocr_done: ocr_done(&date, &folder, &progress, db),
+            video_done: folder.screenshots.is_empty(),
+            date,
+        })
+        .collect())
+}
+
+/// What is left to do, by the same rules as `day_statuses`.
+///
+/// - **Video**: every screenshot still in a day folder, today's included.
+/// - **OCR**: screenshots above the day's progress mark; for a day whose
+///   screenshots are gone, the frames its hourly videos were made from above
+///   the mark (an index count); and for a day read from video,
+///   `video_frames_left`, which OCR counts at the start of each pass over
+///   them (`Activity::ocr_video_frames_left`). Probing those videos here
+///   would mean ffmpeg reading each one, so a day OCR hasn't counted yet is
+///   left as an uncounted day.
+pub fn remaining_work(
+    root: &Path,
+    db: Option<&ScreenshotDatabase>,
+    video_frames_left: Option<&HashMap<String, u64>>,
+) -> std::io::Result<RemainingWork> {
+    let (progress, days) = scan(root, db)?;
+    let mut work = RemainingWork::default();
+    for (date, folder) in &days {
+        if !folder.screenshots.is_empty() {
+            work.video.days += 1;
+            work.video.frames += folder.screenshots.len() as u64;
+        }
+        if ocr_done(date, folder, &progress, db) {
+            continue;
+        }
+        work.ocr.days += 1;
+        let frames = match (folder.last_screenshot(), progress.get(date)) {
+            (Some(_), Some((OcrProgress::FrameNumber(done), _))) => {
+                Some(folder.screenshots.iter().filter(|&&n| n > *done).count() as u64)
+            }
+            (Some(_), _) => Some(folder.screenshots.len() as u64),
+            (None, Some((OcrProgress::FrameNumber(done), _))) => {
+                db.and_then(|db| db.video_frames_after(date, *done).ok())
+            }
+            (None, _) => video_frames_left.and_then(|left| left.get(date).copied()),
+        };
+        match frames {
+            Some(frames) => work.ocr.frames += frames,
+            None => work.ocr.uncounted_days += 1,
+        }
+    }
+    Ok(work)
+}
+
+/// Every day in `root` that has frames, oldest first, with what its folder
+/// holds, and every day's OCR progress.
+fn scan(root: &Path, db: Option<&ScreenshotDatabase>) -> std::io::Result<(Progress, Vec<(String, DayFolder)>)> {
+    let progress: Progress = match db.map(|db| db.all_ocr_progress()) {
         Some(Ok(rows)) => rows
             .into_iter()
             .map(|(day, progress, complete)| (day, (progress, complete)))
@@ -55,7 +136,7 @@ pub fn day_statuses(root: &Path, db: Option<&ScreenshotDatabase>) -> std::io::Re
     let mut video_days = BTreeSet::new();
     let entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((progress, Vec::new())),
         Err(e) => return Err(e),
     };
     for entry in entries.filter_map(|entry| entry.ok()) {
@@ -69,34 +150,35 @@ pub fn day_statuses(root: &Path, db: Option<&ScreenshotDatabase>) -> std::io::Re
         }
     }
 
-    let days: BTreeSet<&String> = folders.iter().chain(&video_days).collect();
-    Ok(days
+    let dates: BTreeSet<&String> = folders.iter().chain(&video_days).collect();
+    let days = dates
         .into_iter()
         .filter_map(|date| {
-            let folder = if folders.contains(date) {
+            let mut folder = if folders.contains(date) {
                 read_day_folder(&root.join(date), date).ok()?
             } else {
                 DayFolder::default()
             };
-            let has_videos = folder.has_videos || video_days.contains(date);
-            if folder.last_screenshot.is_none() && !has_videos {
+            folder.has_videos |= video_days.contains(date);
+            if folder.screenshots.is_empty() && !folder.has_videos {
                 return None;
             }
-            let ocr_done = match (folder.last_screenshot, progress.get(date)) {
-                (Some(last), Some((OcrProgress::FrameNumber(done), _))) => *done >= last,
-                (None, Some((OcrProgress::FrameNumber(done), _))) => db
-                    .and_then(|db| db.last_video_frame(date).ok())
-                    .is_some_and(|last| last.is_some_and(|last| *done >= last)),
-                (None, Some((OcrProgress::VideoPosition(_), complete))) => *complete,
-                _ => false,
-            };
-            Some(DayStatus {
-                date: date.clone(),
-                ocr_done,
-                video_done: folder.last_screenshot.is_none(),
-            })
+            Some((date.clone(), folder))
         })
-        .collect())
+        .collect();
+    Ok((progress, days))
+}
+
+/// Whether OCR has read all of `date`.
+fn ocr_done(date: &str, folder: &DayFolder, progress: &Progress, db: Option<&ScreenshotDatabase>) -> bool {
+    match (folder.last_screenshot(), progress.get(date)) {
+        (Some(last), Some((OcrProgress::FrameNumber(done), _))) => *done >= last,
+        (None, Some((OcrProgress::FrameNumber(done), _))) => db
+            .and_then(|db| db.last_video_frame(date).ok())
+            .is_some_and(|last| last.is_some_and(|last| *done >= last)),
+        (None, Some((OcrProgress::VideoPosition(_), complete))) => *complete,
+        _ => false,
+    }
 }
 
 /// The day of a video named `name`.
@@ -107,10 +189,16 @@ fn video_day(name: &str) -> Option<String> {
 
 #[derive(Default)]
 struct DayFolder {
-    /// The highest `NNNNN.png` number.
-    last_screenshot: Option<u32>,
-    /// Whether a video of this day sits in the folder rather than the root.
+    /// The `NNNNN.png` numbers, in no particular order.
+    screenshots: Vec<u32>,
+    /// Whether the day has a video, in the folder or the root.
     has_videos: bool,
+}
+
+impl DayFolder {
+    fn last_screenshot(&self) -> Option<u32> {
+        self.screenshots.iter().copied().max()
+    }
 }
 
 /// What day folder `day_dir` (of `date`) holds, from its file names alone.
@@ -121,7 +209,7 @@ fn read_day_folder(day_dir: &Path, date: &str) -> std::io::Result<DayFolder> {
             continue;
         };
         if let Some(number) = parse_screenshot_name(&name) {
-            folder.last_screenshot = folder.last_screenshot.max(Some(number));
+            folder.screenshots.push(number);
         } else if video_day(&name).as_deref() == Some(date) {
             folder.has_videos = true;
         }
@@ -196,6 +284,49 @@ mod tests {
                 status("2026-10-08", false, true),
             ]
         );
+    }
+
+    #[test]
+    fn test_remaining_work() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let db = ScreenshotDatabase::new(root.join("screenshots.db")).unwrap();
+
+        // Old script's days: one read to the end, one part way (OCR counted
+        // its frames), one OCR hasn't counted yet.
+        touch(&root.join("2024-01-01--20-00-00.mov"));
+        db.record_video_ocr_frame("2024-01-01", 500, None).unwrap();
+        db.set_video_day_complete("2024-01-01", true).unwrap();
+        touch(&root.join("2024-01-02--20-00-00.mov"));
+        db.record_video_ocr_frame("2024-01-02", 10, None).unwrap();
+        touch(&root.join("2024-01-03--20-00-00.mov"));
+        // Converted, but its progress was reset, so two frames are unread.
+        touch(&root.join("2026-10-08--09-00-00--hourly.mov"));
+        let frames = [(3599, Local::now()), (3600, Local::now())];
+        db.record_video_frames("2026-10-08--09-00-00--hourly.mov", "2026-10-08", &frames).unwrap();
+        db.record_ocr_frame("2026-10-08", 0, None).unwrap();
+        // OCR'd, not converted yet.
+        touch(&root.join("2026-10-02/03601.png"));
+        touch(&root.join("2026-10-02/03602.png"));
+        db.record_ocr_frame("2026-10-02", 3602, None).unwrap();
+        // Today: OCR behind by two, and 3 screenshots to convert.
+        touch(&root.join("2026-10-03/00001.png"));
+        touch(&root.join("2026-10-03/00002.png"));
+        touch(&root.join("2026-10-03/00004.png"));
+        db.record_ocr_frame("2026-10-03", 1, None).unwrap();
+        // A day OCR hasn't started.
+        touch(&root.join("2026-10-04/00001.png"));
+
+        let counted = HashMap::from([("2024-01-02".to_string(), 90)]);
+        assert_eq!(
+            remaining_work(root, Some(&db), Some(&counted)).unwrap(),
+            RemainingWork {
+                ocr: Backlog { days: 5, frames: 90 + 2 + 2 + 1, uncounted_days: 1 },
+                video: Backlog { days: 3, frames: 6, uncounted_days: 0 },
+            }
+        );
+        // Before OCR has counted any old video.
+        assert_eq!(remaining_work(root, Some(&db), None).unwrap().ocr.uncounted_days, 2);
     }
 
     #[test]

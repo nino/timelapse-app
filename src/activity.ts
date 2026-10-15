@@ -71,13 +71,37 @@ export type Activity = {
     lastError: Failure | null;
     /** The current pass reads days that only exist as video; `current.number` is then a position in the day's videos. */
     readingVideo: boolean;
-    /** Video-only days still to read, as of the last pass over them; null until OCR first gets to them. */
-    videoDaysLeft: number | null;
   };
 };
 
 export function getActivity(): Promise<Activity> {
   return invoke<Activity>("get_activity");
+}
+
+/** Work left in one job. Mirrors `Backlog` in `day_status.rs`. */
+export type Backlog = {
+  days: number;
+  /** Frames left in those days, except `uncountedDays`. */
+  frames: number;
+  /** Days that only exist as video, whose frames OCR hasn't counted yet. */
+  uncountedDays: number;
+};
+
+/** What OCR and video conversion have left to do. Mirrors `RemainingWork` in `day_status.rs`. */
+export type RemainingWork = { ocr: Backlog; video: Backlog };
+
+/** Lists the library, so ask for it far less often than `getActivity`. */
+export function getRemainingWork(): Promise<RemainingWork> {
+  return invoke<RemainingWork>("get_remaining_work");
+}
+
+/** "3 days (12,345 frames)", saying which days' frames aren't counted yet. */
+export function backlogLabel({ days, frames, uncountedDays }: Backlog): string {
+  if (days === 0) return "Nothing left";
+  const dayCount = count(days, "day");
+  if (uncountedDays === 0) return `${dayCount} (${count(frames, "frame")})`;
+  if (uncountedDays === days) return `${dayCount} (frames not counted yet)`;
+  return `${dayCount} (${count(frames, "frame")}, plus ${count(uncountedDays, "day")} of old video not counted yet)`;
 }
 
 /** Which "Last error" line. Mirrors `ErrorSource` in `activity.rs`. */

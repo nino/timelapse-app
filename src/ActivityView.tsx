@@ -3,6 +3,7 @@ import React from "react";
 import "./App.css";
 import {
   ago,
+  backlogLabel,
   count,
   dismissError,
   encodeProgress,
@@ -18,13 +19,16 @@ import {
   type Encoding,
   type ErrorSource,
   type Failure,
+  type RemainingWork,
 } from "./activity";
 import { useActivity } from "./hooks/useActivity";
+import { useRemainingWork } from "./hooks/useRemainingWork";
 import { focusRing, segmentButton } from "./ui";
 
 /** The Activity window (Window → Activity): what capture, video conversion and OCR are doing. */
 export function ActivityView(): React.ReactNode {
   const { activity, now, error, refresh } = useActivity();
+  const work = useRemainingWork();
 
   return (
     <main className="min-h-screen bg-page p-4 text-sm flex flex-col gap-3">
@@ -43,6 +47,7 @@ export function ActivityView(): React.ReactNode {
             now={now}
             onChange={refresh}
           />
+          {work && <LeftToDo work={work} />}
           <Capture capture={activity.capture} now={now} />
           <Conversion conversion={activity.conversion} now={now} />
           <Ocr ocr={activity.ocr} now={now} />
@@ -71,8 +76,8 @@ function Section({
   footer,
 }: {
   title: string;
-  tone: Tone;
-  headline: string;
+  tone?: Tone;
+  headline?: string;
   children?: React.ReactNode;
   /** Shown below the rows. */
   footer?: React.ReactNode;
@@ -80,10 +85,12 @@ function Section({
   return (
     <section aria-label={title} className="rounded-xl border border-border bg-card px-4 py-3">
       <h2 className="text-xs font-semibold uppercase tracking-wide text-muted-fg">{title}</h2>
-      <p className="mt-1 flex items-center gap-2 font-medium">
-        <span aria-hidden className={`size-2 shrink-0 rounded-full ${dotColour[tone]}`} />
-        <span data-testid={`${title}-headline`}>{headline}</span>
-      </p>
+      {headline !== undefined && (
+        <p className="mt-1 flex items-center gap-2 font-medium">
+          <span aria-hidden className={`size-2 shrink-0 rounded-full ${dotColour[tone ?? "quiet"]}`} />
+          <span data-testid={`${title}-headline`}>{headline}</span>
+        </p>
+      )}
       {children && <dl className="mt-2 grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 tabular-nums">{children}</dl>}
       {footer}
     </section>
@@ -278,6 +285,16 @@ function Speed({
   );
 }
 
+/** What OCR and video conversion have left to do, across every day. */
+function LeftToDo({ work }: { work: RemainingWork }): React.ReactNode {
+  return (
+    <Section title="Left to do">
+      <Row label="OCR">{backlogLabel(work.ocr)}</Row>
+      <Row label="Video">{backlogLabel(work.video)}</Row>
+    </Section>
+  );
+}
+
 function Capture({ capture, now }: { capture: Activity["capture"]; now: number }): React.ReactNode {
   const { running, lastFrame, framesSaved, lastBlackAt, lastError, failuresInARow, failuresBeforeBackoff } = capture;
   const lastSaved = lastFrame ? Date.parse(lastFrame.at) : 0;
@@ -422,8 +439,7 @@ function EncodeProgress({ encoding, now }: { encoding: Encoding; now: number }):
 }
 
 function Ocr({ ocr, now }: { ocr: Activity["ocr"]; now: number }): React.ReactNode {
-  const { state, current, remaining, recognized, skipped, failed, nextCheckAt, lastError, readingVideo, videoDaysLeft } =
-    ocr;
+  const { state, current, remaining, recognized, skipped, failed, nextCheckAt, lastError, readingVideo } = ocr;
   const next = nextCheckAt ? until(nextCheckAt, now) : "soon";
   let tone: Tone = "quiet";
   let headline: string;
@@ -467,9 +483,6 @@ function Ocr({ ocr, now }: { ocr: Activity["ocr"]; now: number }): React.ReactNo
   return (
     <Section title="OCR" tone={tone} headline={headline}>
       {state === "working" && !readingVideo && <Row label="Left">{count(remaining, "frame")} in this pass</Row>}
-      {videoDaysLeft !== null && (
-        <Row label="Old videos">{videoDaysLeft === 0 ? "All read" : `${count(videoDaysLeft, "day")} left to read`}</Row>
-      )}
       <Row label="Since launch">
         {count(recognized, "frame")} read, {skipped.toLocaleString("en-US")} unchanged
         {failed > 0 && `, ${failed.toLocaleString("en-US")} could not be read`}

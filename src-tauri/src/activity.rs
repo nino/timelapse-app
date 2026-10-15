@@ -10,6 +10,7 @@ use crate::diagnostics;
 use chrono::{DateTime, FixedOffset, Local};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -181,9 +182,6 @@ pub struct OcrStatus {
     /// Whether the current pass reads days that only exist as video. Their
     /// `current.number` is a 1-based position in the day's videos.
     pub reading_video: bool,
-    /// Days that only exist as video and still have frames to read, as of the
-    /// last pass over them. `None` until OCR first gets to them.
-    pub video_days_left: Option<usize>,
 }
 
 /// The shared report. Every method takes the lock briefly and never blocks on
@@ -195,6 +193,10 @@ pub struct OcrStatus {
 #[derive(Default)]
 pub struct Activity {
     snapshot: Mutex<Snapshot>,
+    /// Frames left to read in each day that only exists as video, counted at
+    /// the start of OCR's last pass over them and counted down as it reads.
+    /// `None` until OCR first gets to them. For `day_status::remaining_work`.
+    video_frames_left: Mutex<Option<HashMap<String, u64>>>,
     power_read_at: Mutex<Option<Instant>>,
     log: Mutex<Logged>,
 }
@@ -411,20 +413,31 @@ impl Activity {
         });
     }
 
-    /// A pass over days that only exist as video starts, with `days_left`
-    /// of them still unread.
-    pub fn ocr_video_pass_started(&self, days_left: usize) {
+    /// A pass over days that only exist as video starts, with `frames_left`
+    /// to read in each day that still has some.
+    pub fn ocr_video_pass_started(&self, frames_left: HashMap<String, u64>) {
+        if let Ok(mut left) = self.video_frames_left.lock() {
+            *left = Some(frames_left);
+        }
         self.update(|s| {
             s.ocr.state = State::Working;
             s.ocr.remaining = 0;
             s.ocr.next_check_at = None;
             s.ocr.reading_video = true;
-            s.ocr.video_days_left = Some(days_left);
         });
     }
 
+    /// Frames left to read in each day that only exists as video, as of
+    /// OCR's last pass over them. Days missing from it have none left or
+    /// haven't been counted. `None` until OCR first gets to them.
+    pub fn ocr_video_frames_left(&self) -> Option<HashMap<String, u64>> {
+        self.video_frames_left.lock().ok().and_then(|left| left.clone())
+    }
+
     pub fn ocr_frame_handled(&self, day: &str, number: u32, outcome: crate::ocr::Outcome) {
+        let mut reading_video = false;
         self.update(|s| {
+            reading_video = s.ocr.reading_video;
             s.ocr.current = Some(FrameRef { day: day.to_string(), number, at: Local::now() });
             s.ocr.remaining = s.ocr.remaining.saturating_sub(1);
             match outcome {
@@ -433,6 +446,13 @@ impl Activity {
                 crate::ocr::Outcome::Failed => s.ocr.failed += 1,
             }
         });
+        if reading_video {
+            if let Ok(mut left) = self.video_frames_left.lock() {
+                if let Some(frames) = left.as_mut().and_then(|left| left.get_mut(day)) {
+                    *frames = frames.saturating_sub(1);
+                }
+            }
+        }
     }
 
     pub fn ocr_failed(&self, message: String) {
@@ -576,16 +596,19 @@ mod tests {
     #[test]
     fn tells_video_passes_from_screenshot_passes() {
         let activity = Activity::default();
-        assert_eq!(activity.snapshot(false, || true).ocr.video_days_left, None);
-        activity.ocr_video_pass_started(12);
-        let ocr = activity.snapshot(false, || true).ocr;
-        assert!(ocr.reading_video);
-        assert_eq!(ocr.video_days_left, Some(12));
+        assert_eq!(activity.ocr_video_frames_left(), None);
+        activity.ocr_video_pass_started(HashMap::from([("2024-01-01".to_string(), 3)]));
+        assert!(activity.snapshot(false, || true).ocr.reading_video);
+        activity.ocr_frame_handled("2024-01-01", 1, crate::ocr::Outcome::Read);
+        let left = activity.ocr_video_frames_left().unwrap();
+        assert_eq!(left["2024-01-01"], 2, "counted down as frames are read");
+
         activity.ocr_pass_started(3);
-        let ocr = activity.snapshot(false, || true).ocr;
-        assert!(!ocr.reading_video);
+        assert!(!activity.snapshot(false, || true).ocr.reading_video);
+        // A screenshot of the same day isn't one of its video frames.
+        activity.ocr_frame_handled("2024-01-01", 1, crate::ocr::Outcome::Read);
         // Still the last count, until the next video pass.
-        assert_eq!(ocr.video_days_left, Some(12));
+        assert_eq!(activity.ocr_video_frames_left().unwrap()["2024-01-01"], 2);
     }
 
     #[test]

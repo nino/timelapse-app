@@ -795,7 +795,17 @@ impl OcrWorker {
                 pending.push((day, done, unread, !any_failed));
             }
         }
-        self.activity.ocr_video_pass_started(pending.len());
+        let frames_left = pending
+            .iter()
+            .map(|(day, done, day_videos, _)| {
+                let left = day_videos
+                    .iter()
+                    .map(|video| (video.first_index + video.frame_count - video.first_index.max(*done)) as u64)
+                    .sum();
+                (day.clone(), left)
+            })
+            .collect();
+        self.activity.ocr_video_pass_started(frames_left);
 
         for (day, done, day_videos, whole) in pending {
             let mut finished = whole;
@@ -1868,6 +1878,9 @@ mod tests {
         assert_eq!(library.video_pass(2).handled(), 2);
         assert_eq!(library.progress(DAY_1), Some(OcrProgress::VideoPosition(2)));
         assert!(!library.complete(DAY_1));
+        // Counted at the start of the pass, and down as frames are read.
+        let left = library.worker.activity.ocr_video_frames_left().unwrap();
+        assert_eq!(left.get(DAY_1), Some(&3));
 
         assert_eq!(library.video_pass(usize::MAX).handled(), 3);
         assert_eq!(library.progress(DAY_1), Some(OcrProgress::VideoPosition(5)));
