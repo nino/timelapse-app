@@ -25,7 +25,7 @@ use crate::database::{LineBox, OcrProgress, ScreenshotDatabase};
 use frame_source::{FrameSource, RawFrame};
 use image::{imageops, GrayImage};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -85,6 +85,14 @@ const PIXEL_CHANGE: u8 = 24;
 /// Because the comparison is against the last frame *read*, not the previous
 /// frame, slow changes such as typing add up until they cross the threshold.
 const CHANGED_PIXELS: usize = 60;
+
+/// How many of the latest screenshots read the parallel read test times
+/// (`parallel_read_test`), and how few it needs to be worth running.
+const PARALLEL_TEST_FRAMES: usize = 16;
+const PARALLEL_TEST_MIN_FRAMES: usize = 8;
+
+/// How many recognizers the parallel read test runs at once, in turn.
+const PARALLEL_TEST_RECOGNIZERS: [usize; 4] = [1, 2, 3, 4];
 
 /// One line of recognized text. The box is normalized to the image size, with
 /// the origin at the bottom-left corner, as Vision reports it.
@@ -261,6 +269,30 @@ impl PassSummary {
     }
 }
 
+/// Where the time went in the frames handled since `take_timings` was last
+/// called, for diagnostics: to see what a faster OCR would have to speed up.
+#[derive(Debug, Default, Clone)]
+pub struct StepTimings {
+    /// Making thumbnails to see whether the screen changed (decoding a PNG,
+    /// or shrinking a decoded video frame).
+    pub compare: Duration,
+    /// Getting the image to the recognizer: writing a video frame out as a
+    /// PNG (nothing for a screenshot).
+    pub prepare: Duration,
+    /// Waiting on the recognizer, in all and for the slowest frame.
+    pub recognize: Duration,
+    pub slowest_read: Duration,
+    /// Frames the recognizer read.
+    pub reads: u64,
+    /// Storing text and progress.
+    pub store: Duration,
+    /// The size of the last frame read, in pixels.
+    pub frame_size: Option<(u32, u32)>,
+}
+
+/// The screenshots read last, newest at the back, for the parallel read test.
+type RecentReads = Arc<Mutex<VecDeque<PathBuf>>>;
+
 /// What became of one frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
@@ -303,6 +335,8 @@ pub struct OcrWorker {
     /// itself is broken, even in a new helper process, so no more frames are
     /// passed over until one reads.
     recognizer_broken: bool,
+    timings: StepTimings,
+    recent_reads: RecentReads,
 }
 
 /// What the worker needs to read days that only exist as video.
@@ -340,7 +374,20 @@ impl OcrWorker {
             videos: None,
             attempts: HashMap::new(),
             recognizer_broken: false,
+            timings: StepTimings::default(),
+            recent_reads: RecentReads::default(),
         }
+    }
+
+    /// Where the time went since the last call (see `StepTimings`).
+    pub fn take_timings(&mut self) -> StepTimings {
+        std::mem::take(&mut self.timings)
+    }
+
+    /// The screenshots read last, which other threads may read while the
+    /// worker runs.
+    fn recent_reads(&self) -> RecentReads {
+        Arc::clone(&self.recent_reads)
     }
 
     /// Also read days that only exist as video (`run_video_pass`).
@@ -459,10 +506,20 @@ impl OcrWorker {
 
     /// Read one frame if the screen changed. Returns whether it was read.
     fn handle_frame(&mut self, day: &str, frame_number: u32, path: &Path) -> Result<bool, FrameError> {
+        let started = Instant::now();
         let thumbnail = Thumbnail::of(path).map_err(FrameError::Unreadable)?;
-        self.read_if_changed(day, thumbnail, &|| Ok(path.to_path_buf()), &|db, result| {
+        self.timings.compare += started.elapsed();
+        let read = self.read_if_changed(day, thumbnail, &|| Ok(path.to_path_buf()), &|db, result| {
             db.record_ocr_frame(day, frame_number, result)
-        })
+        })?;
+        if read {
+            let mut recent = self.recent_reads.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            if recent.len() == PARALLEL_TEST_FRAMES {
+                recent.pop_front();
+            }
+            recent.push_back(path.to_path_buf());
+        }
+        Ok(read)
     }
 
     /// Run the image `image` gives through the recognizer if `thumbnail`
@@ -481,12 +538,24 @@ impl OcrWorker {
             .map_or(true, |last| thumbnail.differs_from(last));
 
         if !changed {
+            let started = Instant::now();
             record(&self.db, None).map_err(|e| FrameError::Database(e.to_string()))?;
+            self.timings.store += started.elapsed();
             return Ok(false);
         }
 
+        let started = Instant::now();
         let image = image().map_err(FrameError::Recognizer)?;
+        self.timings.prepare += started.elapsed();
+        let started = Instant::now();
         let lines = self.recognizer.recognize(&image).map_err(FrameError::Recognizer)?;
+        let took = started.elapsed();
+        self.timings.recognize += took;
+        self.timings.slowest_read = self.timings.slowest_read.max(took);
+        self.timings.reads += 1;
+        if let Ok(size) = image::image_dimensions(&image) {
+            self.timings.frame_size = Some(size);
+        }
         // One line of text per box, so a line's own newlines go.
         let text = lines
             .iter()
@@ -502,8 +571,10 @@ impl OcrWorker {
         } else {
             Some(lines.iter().map(|l| [l.x, l.y, l.width, l.height]).collect::<Vec<_>>())
         };
+        let started = Instant::now();
         record(&self.db, result.as_deref().map(|boxes| (text.as_str(), boxes)))
             .map_err(|e| FrameError::Database(e.to_string()))?;
+        self.timings.store += started.elapsed();
         self.last_read.insert(day.to_string(), thumbnail);
         self.last_text.insert(day.to_string(), text);
         Ok(true)
@@ -671,7 +742,9 @@ impl OcrWorker {
         frame: &RawFrame,
         scratch: &Path,
     ) -> Result<bool, FrameError> {
+        let started = Instant::now();
         let thumbnail = Thumbnail::of_rgb(frame).map_err(FrameError::Unreadable)?;
+        self.timings.compare += started.elapsed();
         // Written only when it is going to be read.
         let image = || {
             let path = scratch.join("video-frame.png");
@@ -754,7 +827,7 @@ pub fn start_background_ocr(
             if let Some(videos) = videos {
                 worker = worker.with_videos(videos);
             }
-            run_forever(&mut worker, &boost);
+            run_forever(&mut worker, &boost, system_recognizer);
         })
         .is_ok()
 }
@@ -784,8 +857,11 @@ fn set_thread_priority(boosted: bool) {
     let _ = boosted;
 }
 
-fn run_forever(worker: &mut OcrWorker, boost: &Boost) {
+fn run_forever(worker: &mut OcrWorker, boost: &Boost, make_recognizer: fn() -> Option<Box<dyn TextRecognizer>>) {
     let activity = Arc::clone(&worker.activity);
+    let recent_reads = worker.recent_reads();
+    // Whether the parallel read test has run in this boost.
+    let mut tested = false;
     // A boost starting or stopping ends the sleep early.
     let sleep = |state: State, wait: Duration| {
         activity.ocr_sleeps(state, wait);
@@ -799,8 +875,23 @@ fn run_forever(worker: &mut OcrWorker, boost: &Boost) {
         if boost.is_on() != boosted {
             boosted = !boosted;
             set_thread_priority(boosted);
+            tested = false;
         }
-        boost.may_work(on_ac_power)
+        let may_work = boost.may_work(on_ac_power);
+        if may_work && boosted && !tested {
+            let frames: Vec<PathBuf> = recent_reads
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .iter()
+                .filter(|path| path.exists())
+                .cloned()
+                .collect();
+            if frames.len() >= PARALLEL_TEST_MIN_FRAMES {
+                tested = true;
+                log_parallel_read_test(&frames, &make_recognizer);
+            }
+        }
+        may_work
     };
     loop {
         if !keep_going() {
@@ -830,8 +921,9 @@ fn run_forever(worker: &mut OcrWorker, boost: &Boost) {
                     "OCR: read {} {}, skipped {} unchanged, {} failed",
                     summary.recognized, kind, summary.skipped, summary.failed
                 );
+                let timings = worker.take_timings();
                 if summary.handled() > 0 {
-                    log_pass(&mut tally, kind, &summary, took, boost.is_on());
+                    log_pass(&mut tally, kind, &summary, &timings, took, boost.is_on());
                 }
                 if summary.stalled {
                     sleep(State::Retrying, RETRY_SLEEP);
@@ -852,9 +944,18 @@ fn run_forever(worker: &mut OcrWorker, boost: &Boost) {
 /// Passes that keep up with new screenshots go into the hourly summary; a
 /// pass long enough to be a backlog, and every pass over video, is logged on
 /// its own.
-fn log_pass(tally: &mut crate::diagnostics::Tally, kind: &str, summary: &PassSummary, took: Duration, boosted: bool) {
+fn log_pass(
+    tally: &mut crate::diagnostics::Tally,
+    kind: &str,
+    summary: &PassSummary,
+    timings: &StepTimings,
+    took: Duration,
+    boosted: bool,
+) {
     let video = kind == "video frames";
+    let ms = |duration: Duration| duration.as_millis() as u64;
     if video || took >= LONG_PASS {
+        let average_read = timings.recognize.checked_div(timings.reads as u32).unwrap_or_default();
         crate::diagnostics::info("ocr", format!("Read {}", kind))
             .took(took)
             .data(serde_json::json!({
@@ -862,15 +963,107 @@ fn log_pass(tally: &mut crate::diagnostics::Tally, kind: &str, summary: &PassSum
                 "skipped": summary.skipped,
                 "failed": summary.failed,
                 "boosted": boosted,
+                "compareMs": ms(timings.compare),
+                "prepareMs": ms(timings.prepare),
+                "recognizeMs": ms(timings.recognize),
+                "averageReadMs": ms(average_read),
+                "slowestReadMs": ms(timings.slowest_read),
+                "storeMs": ms(timings.store),
+                "frameSize": timings.frame_size,
             }))
             .record();
     } else {
         tally.count("recognized", summary.recognized as u64);
         tally.count("skipped", summary.skipped as u64);
         tally.count("failed", summary.failed as u64);
+        tally.count("compareMs", ms(timings.compare));
+        tally.count("prepareMs", ms(timings.prepare));
+        tally.count("storeMs", ms(timings.store));
+        tally.time_many("read", timings.reads, timings.recognize, timings.slowest_read);
         tally.time("pass", took);
     }
     tally.report_if_due();
+}
+
+/// One run of the parallel read test: `frames` frames read by `recognizers`
+/// recognizers at once took `took`, and `failed` of them failed.
+#[derive(Debug)]
+pub struct ParallelRun {
+    pub recognizers: usize,
+    pub frames: usize,
+    pub took: Duration,
+    pub failed: usize,
+}
+
+/// Time reading `frames` with 1, 2, 3 and 4 recognizers from `make` at once,
+/// each taking every nth frame, to see whether reading in parallel would
+/// make OCR faster on this Mac. Each recognizer reads one frame before the
+/// clock starts, so a new helper's start-up isn't counted. Stops early if
+/// `make` can't make enough recognizers.
+pub fn parallel_read_test(
+    frames: &[PathBuf],
+    make: &dyn Fn() -> Option<Box<dyn TextRecognizer>>,
+) -> Vec<ParallelRun> {
+    let mut runs = Vec::new();
+    let Some(first) = frames.first() else {
+        return runs;
+    };
+    for count in PARALLEL_TEST_RECOGNIZERS {
+        let Some(recognizers) = (0..count).map(|_| make()).collect::<Option<Vec<_>>>() else {
+            break;
+        };
+        let ready = std::sync::Barrier::new(count + 1);
+        let (took, failed) = std::thread::scope(|scope| {
+            let threads: Vec<_> = recognizers
+                .into_iter()
+                .enumerate()
+                .map(|(index, recognizer)| {
+                    let ready = &ready;
+                    scope.spawn(move || {
+                        let warmed = recognizer.recognize(first).is_ok();
+                        ready.wait();
+                        let failed = frames
+                            .iter()
+                            .skip(index)
+                            .step_by(count)
+                            .filter(|frame| recognizer.recognize(frame).is_err())
+                            .count();
+                        failed + usize::from(!warmed)
+                    })
+                })
+                .collect();
+            ready.wait();
+            let started = Instant::now();
+            let failed: usize = threads.into_iter().map(|thread| thread.join().unwrap_or(frames.len())).sum();
+            (started.elapsed(), failed)
+        });
+        runs.push(ParallelRun { recognizers: count, frames: frames.len(), took, failed });
+    }
+    runs
+}
+
+/// Run `parallel_read_test` on `frames` with the system's recognizer and log
+/// the result for diagnostics.
+fn log_parallel_read_test(frames: &[PathBuf], make: &dyn Fn() -> Option<Box<dyn TextRecognizer>>) {
+    let started = Instant::now();
+    let runs = parallel_read_test(frames, make);
+    let frame_size = frames.first().and_then(|frame| image::image_dimensions(frame).ok());
+    let runs: Vec<_> = runs
+        .iter()
+        .map(|run| {
+            serde_json::json!({
+                "recognizers": run.recognizers,
+                "ms": run.took.as_millis() as u64,
+                "framesPerSecond": (run.frames as f64 / run.took.as_secs_f64() * 100.0).round() / 100.0,
+                "failed": run.failed,
+            })
+        })
+        .collect();
+    println!("OCR: parallel read test: {}", serde_json::Value::from(runs.clone()));
+    crate::diagnostics::info("ocr", "Parallel read test")
+        .took(started.elapsed())
+        .data(serde_json::json!({ "frames": frames.len(), "frameSize": frame_size, "runs": runs }))
+        .record();
 }
 
 /// Day folder names under `root`, oldest first.
@@ -1165,6 +1358,14 @@ mod tests {
         assert_eq!(library.seen(), vec!["00001.png", "00003.png"]);
         assert_eq!(library.done_through(DAY_1), Some(4));
 
+        // Timed for diagnostics, and kept for the parallel read test.
+        let timings = library.worker.take_timings();
+        assert_eq!(timings.reads, 2);
+        assert_eq!(timings.frame_size, Some((1800, 1124)));
+        assert_eq!(library.worker.take_timings().reads, 0);
+        let recent: Vec<_> = library.worker.recent_reads().lock().unwrap().iter().cloned().collect();
+        assert_eq!(recent, vec![library.root.join(DAY_1).join("00001.png"), library.root.join(DAY_1).join("00003.png")]);
+
         let hits = library.worker.db.search_ocr("00003", 10).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!((hits[0].day.as_str(), hits[0].frame_number), (DAY_1, 3));
@@ -1187,6 +1388,27 @@ mod tests {
                 height: 1.0,
             }])
         }
+    }
+
+    #[test]
+    fn the_parallel_read_test_reads_every_frame_with_each_number_of_recognizers() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let frames: Vec<PathBuf> = (1..=10).map(|n| PathBuf::from(format!("{:05}.png", n))).collect();
+        let make = || -> Option<Box<dyn TextRecognizer>> { Some(Box::new(FakeRecognizer { seen: seen.clone() })) };
+
+        let runs = parallel_read_test(&frames, &make);
+
+        let counts: Vec<_> = runs.iter().map(|run| (run.recognizers, run.frames, run.failed)).collect();
+        assert_eq!(counts, vec![(1, 10, 0), (2, 10, 0), (3, 10, 0), (4, 10, 0)]);
+        // Every frame once per run, plus one warm-up read per recognizer.
+        assert_eq!(seen.lock().unwrap().len(), 4 * 10 + (1 + 2 + 3 + 4));
+
+        // Without enough recognizers, it stops.
+        let made = std::sync::atomic::AtomicUsize::new(0);
+        let make_three = || -> Option<Box<dyn TextRecognizer>> {
+            (made.fetch_add(1, Ordering::Relaxed) < 6).then(|| Box::new(FakeRecognizer { seen: seen.clone() }) as _)
+        };
+        assert_eq!(parallel_read_test(&frames, &make_three).len(), 3);
     }
 
     #[test]
