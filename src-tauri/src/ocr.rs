@@ -541,45 +541,41 @@ impl OcrWorker {
         let mut pending = Vec::new();
         let mut days = videos.source.days().map_err(|e| e.to_string())?;
         days.reverse();
-        let complete: HashSet<String> = self
+        let progress: HashMap<String, (OcrProgress, bool)> = self
             .db
             .all_ocr_progress()
             .map_err(|e| e.to_string())?
             .into_iter()
-            .filter_map(|(day, _, complete)| complete.then_some(day))
+            .map(|(day, progress, complete)| (day, (progress, complete)))
             .collect();
         for day in days {
-            if complete.contains(&day) {
-                continue;
-            }
-            let done = match self.db.ocr_progress(&day).map_err(|e| e.to_string())? {
-                None => 0,
-                Some(OcrProgress::VideoPosition(last)) => last as usize,
-                Some(OcrProgress::FrameNumber(_)) => continue,
+            let (done, marked_complete) = match progress.get(&day) {
+                None => (0, false),
+                Some((OcrProgress::VideoPosition(last), complete)) => (*last as usize, *complete),
+                Some((OcrProgress::FrameNumber(_), _)) => continue,
             };
             let Some(day_videos) = videos.source.video_only_day(&day).map_err(|e| e.to_string())?
             else {
                 continue;
             };
-            let unread: Vec<_> = day_videos
+            // A video that failed to decode may lie behind the mark, once
+            // later videos moved it on.
+            let any_failed = day_videos.iter().any(|video| videos.failed.contains(&video.path));
+            let mut unread: Vec<_> = day_videos
                 .into_iter()
                 .filter(|video| video.first_index + video.frame_count > done)
                 .collect();
-            if unread.is_empty() {
-                // For the day picker, and so later passes skip the day.
+            // For the day picker. Kept in step every pass, so a video that
+            // turns up later, or one that can be read again, clears it.
+            let complete = unread.is_empty() && !any_failed;
+            if complete != marked_complete {
                 self.db
-                    .record_video_day_complete(&day)
+                    .set_video_day_complete(&day, complete)
                     .map_err(|e| e.to_string())?;
-                continue;
             }
-            let count = unread.len();
-            let unread: Vec<_> = unread
-                .into_iter()
-                .filter(|video| !videos.failed.contains(&video.path))
-                .collect();
+            unread.retain(|video| !videos.failed.contains(&video.path));
             if !unread.is_empty() {
-                let whole = unread.len() == count;
-                pending.push((day, done, unread, whole));
+                pending.push((day, done, unread, !any_failed));
             }
         }
         self.activity.ocr_video_pass_started(pending.len());
@@ -655,7 +651,7 @@ impl OcrWorker {
             }
             if finished {
                 self.db
-                    .record_video_day_complete(&day)
+                    .set_video_day_complete(&day, true)
                     .map_err(|e| e.to_string())?;
             }
         }
@@ -1553,6 +1549,54 @@ mod tests {
         assert_eq!(library.video_pass(usize::MAX), PassSummary::default());
         assert_eq!(library.progress(DAY_1), Some(OcrProgress::FrameNumber(2)));
         assert_eq!(library.progress(DAY_2), None);
+    }
+
+    #[test]
+    fn an_empty_day_folder_stays_a_screenshot_day() {
+        // Today's folder before its first frame (the screen is locked).
+        let mut library = Library::new().with_videos();
+        std::fs::create_dir(library.root.join(DAY_1)).unwrap();
+
+        library.video_pass(usize::MAX);
+        assert_eq!(library.progress(DAY_1), None);
+
+        frame(&library.root, DAY_1, 1, 0, false);
+        library.pass();
+        assert_eq!(library.progress(DAY_1), Some(OcrProgress::FrameNumber(1)));
+    }
+
+    #[test]
+    fn a_new_video_unmarks_a_finished_day() {
+        let mut library = Library::new().with_videos();
+        if !write_video(&library.root.join("2024-01-01--18-00-00.mov"), &[0, 200]) {
+            eprintln!("skipping: ffmpeg with libx264 is not available");
+            return;
+        }
+        library.video_pass(usize::MAX);
+        assert!(library.complete(DAY_1));
+
+        write_video(&library.root.join("2024-01-01--23-00-00.mov"), &[0]);
+        // The pass that finds it unmarks the day, and reads it.
+        assert_eq!(library.video_pass(usize::MAX).handled(), 1);
+        assert!(library.complete(DAY_1));
+        assert_eq!(library.progress(DAY_1), Some(OcrProgress::VideoPosition(3)));
+    }
+
+    #[test]
+    fn a_day_with_a_failed_video_is_not_finished() {
+        let mut library = Library::new().with_videos();
+        let path = library.root.join("2024-01-01--18-00-00.mov");
+        if !write_video(&path, &[0, 200]) {
+            eprintln!("skipping: ffmpeg with libx264 is not available");
+            return;
+        }
+        library.video_pass(usize::MAX);
+        assert!(library.complete(DAY_1));
+
+        // As if decoding it had failed this session.
+        library.worker.videos.as_mut().unwrap().failed.insert(path);
+        library.video_pass(usize::MAX);
+        assert!(!library.complete(DAY_1));
     }
 
     /// Runs the real Vision recognizer on a capture named by `OCR_TEST_IMAGE`:

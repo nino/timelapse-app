@@ -626,14 +626,13 @@ impl ScreenshotDatabase {
             .optional()
     }
 
-    /// Record that OCR has read every video of `day`, a day read from video.
-    /// `ocr_progress` says which days are; a day whose screenshots OCR read
-    /// is left alone.
-    pub fn record_video_day_complete(&self, day: &str) -> Result<()> {
+    /// Mark `day`, a day read from video, as read to the end of its videos
+    /// or not. Does nothing for a day OCR hasn't started on or reads from
+    /// screenshots.
+    pub fn set_video_day_complete(&self, day: &str, complete: bool) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO ocr_progress (day, last_frame, by_position, complete) VALUES (?1, 0, 1, 1)
-             ON CONFLICT (day) DO UPDATE SET complete = 1 WHERE by_position AND NOT complete",
-            [day],
+            "UPDATE ocr_progress SET complete = ?2 WHERE day = ?1 AND by_position",
+            rusqlite::params![day, complete],
         )?;
         Ok(())
     }

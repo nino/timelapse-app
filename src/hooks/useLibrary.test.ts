@@ -158,4 +158,15 @@ describe('useDayStatuses', () => {
     rerender({ open: true });
     await waitFor(() => expect(result.current.get('2026-10-04')?.ocrDone).toBe(true));
   });
+
+  it('stays live while the picker is open', async () => {
+    mocked(invoke).mockResolvedValueOnce([{ date: '2026-10-04', ocrDone: false, videoDone: false }]);
+    const { result } = renderHook(() => useDayStatuses(true));
+    await waitFor(() => expect(result.current.get('2026-10-04')?.videoDone).toBe(false));
+
+    mocked(invoke).mockResolvedValueOnce([{ date: '2026-10-04', ocrDone: true, videoDone: true }]);
+    await waitFor(() => expect(watchers.has(TEST_ROOT)).toBe(true));
+    fireChange(TEST_ROOT);
+    await waitFor(() => expect(result.current.get('2026-10-04')?.videoDone).toBe(true));
+  });
 });

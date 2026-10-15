@@ -41,26 +41,31 @@ export function useDays(): {
 }
 
 /**
- * Each day's OCR and video status by date, asked for again every time `open`
- * turns true (the day picker opening), and kept from the last time meanwhile.
- * Empty until the first answer; a failure keeps the last answer.
+ * Each day's OCR and video status by date, while `open` (the day picker is
+ * open): asked for on opening and again whenever the library root changes,
+ * where OCR's database and new videos are written. Kept from the last
+ * answer while closed, and after a failure.
  */
 export function useDayStatuses(open: boolean): Map<string, DayStatus> {
   const [statuses, setStatuses] = React.useState<Map<string, DayStatus>>(() => new Map());
 
-  React.useEffect(() => {
-    if (!open) return;
-    let current = true;
-    getDayStatuses().then(
-      (list) => {
-        if (current) setStatuses(new Map(list.map((status) => [status.date, status])));
-      },
-      (error: unknown) => console.warn("Could not read day statuses:", error),
-    );
-    return (): void => {
-      current = false;
-    };
-  }, [open]);
+  const load = React.useCallback(
+    async (isCurrent: () => boolean): Promise<void> => {
+      if (!open) return;
+      try {
+        const list = await getDayStatuses();
+        if (isCurrent()) {
+          setStatuses(new Map(list.map((status): [string, DayStatus] => [status.date, status])));
+        }
+      } catch (error) {
+        console.warn("Could not read day statuses:", error);
+      }
+    },
+    [open],
+  );
+
+  const reload = useLatestLoad(load);
+  useDirectoryChanges(open ? timelapseRoot() : null, reload);
 
   return statuses;
 }
