@@ -18,6 +18,7 @@ mod menu_app;
 mod diagnostics;
 mod ocr;
 mod ocr_helper;
+mod ocr_readahead;
 mod ocr_tiles;
 mod paths;
 mod settings;
