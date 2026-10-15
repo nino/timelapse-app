@@ -46,7 +46,7 @@ type Answer<T> = { key: string; value: T | null; error: Error | null };
  * nothing new keeps the old value, and one that fails keeps the last good
  * answer rather than wiping it.
  */
-function useAnswer<T>(
+export function useAnswer<T>(
   key: string | null,
   version: string | null,
   ask: () => Promise<T>,

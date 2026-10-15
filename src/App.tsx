@@ -1,8 +1,11 @@
 import React from "react";
 
 import "./App.css";
+import { AppPicker } from "./AppPicker";
+import { mergeCloseRanges, nextInRanges } from "./apps";
 import { DayPicker } from "./DayPicker";
-import { frameUrl, getFrameTime, type FrameTime } from "./frames";
+import { frameUrl, getFrameTime, type FrameRange, type FrameTime } from "./frames";
+import { useDayApps } from "./hooks/useDayApps";
 import { useDay, useDays } from "./hooks/useLibrary";
 import {
   useDayMatches,
@@ -68,6 +71,18 @@ export function App({
   // day's matches have loaded.
   const [jumpToFirstMatch, setJumpToFirstMatch] = React.useState<string | null>(null);
   const findInput = React.useRef<HTMLInputElement>(null);
+
+  // App filter: playback keeps to the stretches where this app was in front.
+  // It stays picked across days.
+  const [appFilter, setAppFilter] = React.useState<string | null>(null);
+  const dayApps = useDayApps(selectedDay, frameCount, ocrVersion);
+  const appRanges = React.useMemo(
+    (): Array<FrameRange> | null =>
+      appFilter === null
+        ? null
+        : (dayApps?.apps.find((app) => app.name === appFilter)?.ranges ?? []),
+    [appFilter, dayApps],
+  );
 
   // Today's day name. Recomputed whenever the day list changes so the
   // "(Today)" label moves over at midnight instead of sticking to launch day.
@@ -211,6 +226,7 @@ export function App({
     selectedDay,
     frameCount,
     currentIndex,
+    ranges: appRanges,
     // The next frame is asked for only once this one is on screen (or has
     // failed), so playback slows down rather than queueing decodes when
     // frames come from video faster than they can be decoded.
@@ -281,7 +297,19 @@ export function App({
           <DayPicker days={days} today={today} value={selectedDay} onChange={setSelectedDay} />
 
 
-          <div data-tauri-drag-region className="ml-auto flex items-center gap-1.5">
+          <div data-tauri-drag-region className="ml-auto flex min-w-0 items-center gap-1.5">
+            <AppPicker
+              dayApps={dayApps}
+              value={appFilter}
+              onChange={(app) => {
+                setAppFilter(app);
+                // Picking an app moves to its next stretch, unless already in one.
+                const ranges = app === null ? null : dayApps?.apps.find((a) => a.name === app)?.ranges;
+                if (!ranges || ranges.length === 0) return;
+                const next = nextInRanges(ranges, currentIndex) ?? ranges[0].start;
+                if (next !== currentIndex) goTo(next);
+              }}
+            />
             <label className={`${fieldFrame} flex items-center gap-2 w-72 h-7.5 px-2.5`}>
               <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true" className="shrink-0 text-muted-fg">
                 <circle cx="11" cy="11" r="7" />
@@ -422,7 +450,7 @@ export function App({
               type="button"
               aria-label={playing ? "Pause" : "Play"}
               title={playing ? "Pause (Space)" : "Play (Space)"}
-              disabled={frameCount === 0}
+              disabled={frameCount === 0 || appRanges?.length === 0}
               onClick={togglePlaying}
               className={`inline-flex w-8.5 items-center justify-center rounded-l-full pl-0.5 transition-colors hover:bg-muted disabled:pointer-events-none disabled:opacity-50 ${focusRing}`}
             >
@@ -449,6 +477,7 @@ export function App({
           <div className="relative flex-1 scrub-track p-1 pt-0 rounded-full">
             <PendingStretches pending={pendingFrames} />
             <MatchMarks stops={stops} frameCount={frameCount} currentIndex={currentIndex} />
+            {appRanges && <AppMarks ranges={appRanges} frameCount={frameCount} />}
             <input
               type="range"
               aria-label="Position in day"
@@ -526,6 +555,46 @@ function MatchMarks({
   );
 }
 
+/**
+ * Where the filtered app was in front, drawn as a strip just under the
+ * scrubber. Memoised, and gaps under a pixel or so closed up, so a day of
+ * app switching neither re-renders nor draws thousands of bars per frame of
+ * a scrub.
+ */
+const AppMarks = React.memo(function AppMarks({
+  ranges,
+  frameCount,
+}: {
+  ranges: Array<FrameRange>;
+  frameCount: number;
+}): React.ReactNode {
+  const merged = React.useMemo(
+    () => mergeCloseRanges(ranges, Math.ceil(frameCount / 1000)),
+    [ranges, frameCount],
+  );
+  if (merged.length === 0 || frameCount === 0) return null;
+  // Same mapping as MatchMarks: where the playhead's centre sits for `index`.
+  const at = (index: number): number => (Math.min(index, frameCount - 1) / Math.max(frameCount - 1, 1)) * 100;
+  return (
+    <div
+      data-testid="app-marks"
+      className="absolute left-[7px] right-[7px] -bottom-2 h-1 pointer-events-none"
+      aria-hidden="true"
+    >
+      {merged.map((range) => (
+        <span
+          key={range.start}
+          className="absolute inset-y-0 min-w-[2px] rounded-full bg-primary"
+          style={{
+            left: `${at(range.start)}%`,
+            width: `${at(range.end - 1) - at(range.start)}%`,
+          }}
+        />
+      ))}
+    </div>
+  );
+});
+
 /** The other days the searched text appears on, as links to them. */
 function OtherDays({
   counts,
@@ -580,13 +649,15 @@ function useDebounced<T>(value: T, delayMs: number): T {
  * Play the selected day forward at `frameMs` a frame, one frame
  * after the other, until its last frame. Space toggles it too. Switching
  * days or hiding the window pauses; scrubbing while playing carries on from
- * wherever the scrubber was moved to.
+ * wherever the scrubber was moved to. With `ranges`, only the frames in them
+ * play: playback jumps over the gaps and stops after the last range.
  */
 function usePlayback({
   frameMs,
   selectedDay,
   frameCount,
   currentIndex,
+  ranges,
   frameShown,
   goTo,
 }: {
@@ -594,13 +665,24 @@ function usePlayback({
   selectedDay: string | null;
   frameCount: number;
   currentIndex: number;
+  /** The only frames to play, in order, end exclusive; null for all of them. */
+  ranges: Array<FrameRange> | null;
   /** Whether the frame at `currentIndex` has finished loading. */
   frameShown: boolean;
   goTo: (index: number) => void;
 }): { playing: boolean; togglePlaying: () => void } {
   // The day being played, so that opening another day stops playback.
   const [playingDay, setPlayingDay] = React.useState<string | null>(null);
-  const atEnd = currentIndex >= frameCount - 1;
+  // The frame playback shows after `index`, or null at the end.
+  const nextFrame = React.useCallback(
+    (index: number): number | null => {
+      const next = ranges === null ? index + 1 : nextInRanges(ranges, index + 1);
+      return next !== null && next < frameCount ? next : null;
+    },
+    [ranges, frameCount],
+  );
+  const next = nextFrame(currentIndex);
+  const atEnd = next === null;
   const playing = playingDay !== null && playingDay === selectedDay && !atEnd;
   const lastStepAt = React.useRef(0);
 
@@ -610,22 +692,26 @@ function usePlayback({
       return;
     }
     if (selectedDay === null || frameCount === 0) return;
-    // Playing from the last frame starts the day over.
-    if (atEnd) goTo(0);
+    // Playing from the end starts the day (or the app's first stretch) over.
+    if (atEnd) {
+      const first = ranges === null ? 0 : ranges[0]?.start;
+      if (first === undefined || first >= frameCount) return;
+      goTo(first);
+    }
     lastStepAt.current = 0;
     setPlayingDay(selectedDay);
-  }, [playing, selectedDay, frameCount, atEnd, goTo]);
+  }, [playing, selectedDay, frameCount, atEnd, ranges, goTo]);
 
   React.useEffect(() => {
-    if (!playing || !frameShown) return;
+    if (!playing || !frameShown || next === null) return;
     const wait = Math.max(0, lastStepAt.current + frameMs - performance.now());
     const timer = setTimeout((): void => {
       lastStepAt.current = performance.now();
-      goTo(currentIndex + 1);
-      if (currentIndex + 1 >= frameCount - 1) setPlayingDay(null);
+      goTo(next);
+      if (nextFrame(next) === null) setPlayingDay(null);
     }, wait);
     return (): void => clearTimeout(timer);
-  }, [playing, frameShown, currentIndex, frameCount, frameMs, goTo]);
+  }, [playing, frameShown, next, nextFrame, frameMs, goTo]);
 
   // Nobody is watching a hidden or minimised window: stop rather than keep
   // loading frames.

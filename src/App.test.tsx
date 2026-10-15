@@ -2,8 +2,10 @@ import { afterAll, beforeEach, describe, expect, it, mock, spyOn } from 'bun:tes
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 
 import { App } from './App';
+import type { DayApps } from './apps';
 import * as frames from './frames';
 import { frameUrl, type Day } from './frames';
+import * as dayAppsHook from './hooks/useDayApps';
 import * as library from './hooks/useLibrary';
 import * as ocrSearch from './hooks/useOcrSearch';
 import type { DayCount, DayMatch, LineBox } from './search';
@@ -21,6 +23,7 @@ const useMatchLines = spyOn(ocrSearch, 'useMatchLines');
 const useOcrVersion = spyOn(ocrSearch, 'useOcrVersion');
 const getPendingFrames = spyOn(frames, 'getPendingFrames');
 const setViewerPosition = spyOn(viewerPosition, 'setViewerPosition');
+const useDayApps = spyOn(dayAppsHook, 'useDayApps');
 
 afterAll(() => {
   setViewerPosition.mockRestore();
@@ -32,6 +35,7 @@ afterAll(() => {
   useMatchLines.mockRestore();
   useOcrVersion.mockRestore();
   getPendingFrames.mockRestore();
+  useDayApps.mockRestore();
 });
 
 /**
@@ -139,6 +143,7 @@ describe('App', () => {
     mockSearch('', {});
     getPendingFrames.mockResolvedValue({ frameCount: 0, ranges: [] });
     setViewerPosition.mockResolvedValue(undefined);
+    useDayApps.mockReturnValue(null);
   });
 
   describe('Library states', () => {
@@ -713,6 +718,90 @@ describe('App', () => {
       expect(screen.queryByRole('button', { name: /2026-09-02/ })).not.toBeInTheDocument();
       fireEvent.click(screen.getByRole('button', { name: '2 more days' }));
       expect(screen.getByRole('button', { name: /2026-09-02/ })).toBeInTheDocument();
+      await settleFrameTime();
+    });
+  });
+
+  describe('App filter', () => {
+    const apps: DayApps = {
+      frameCount: 100,
+      apps: [
+        { name: 'Blender', frames: 7200, ranges: [{ start: 20, end: 22 }, { start: 50, end: 52 }] },
+        { name: 'Safari', frames: 90, ranges: [{ start: 0, end: 20 }] },
+      ],
+    };
+
+    function playButton(): HTMLElement {
+      return screen.getByRole('button', { name: /^(Play|Pause)$/ });
+    }
+
+    async function pickApp(name: string): Promise<void> {
+      fireEvent.click(screen.getByRole('button', { name: 'App' }));
+      fireEvent.click(await screen.findByRole('option', { name: new RegExp(`^${name}`) }));
+    }
+
+    it("lists the day's apps with how long each was in front", async () => {
+      mockLibrary({ '2026-10-04': 100 });
+      useDayApps.mockReturnValue(apps);
+      render(<App initialPosition={{ day: '2026-10-04', index: 10 }} />);
+      expect(screen.getByRole('button', { name: 'App' })).toHaveTextContent('All apps');
+      fireEvent.click(screen.getByRole('button', { name: 'App' }));
+      const options = await screen.findAllByRole('option');
+      expect(options.map((o) => o.textContent)).toEqual(['All apps', 'Blender2h 00m', 'Safari1m']);
+      await settleFrameTime();
+    });
+
+    it("plays only the app's stretches, jumping over the gaps", async () => {
+      mockLibrary({ '2026-10-04': 100 });
+      useDayApps.mockReturnValue(apps);
+      render(<App initialPosition={{ day: '2026-10-04', index: 10 }} />);
+      await waitFor(() => expect(shownFrame()).toBe(frameUrl('2026-10-04', 10)));
+      finishLoading();
+
+      // Picking it moves to its next stretch and marks them all.
+      await pickApp('Blender');
+      expect(screen.getByRole('button', { name: 'App' })).toHaveTextContent('Blender');
+      await waitFor(() => expect(shownFrame()).toBe(frameUrl('2026-10-04', 20)));
+      expect(screen.getByTestId('app-marks').children).toHaveLength(2);
+      finishLoading();
+
+      fireEvent.click(playButton());
+      await waitFor(() => expect(shownFrame()).toBe(frameUrl('2026-10-04', 21)));
+      finishLoading();
+      await waitFor(() => expect(shownFrame()).toBe(frameUrl('2026-10-04', 50)));
+      finishLoading();
+      await waitFor(() => expect(shownFrame()).toBe(frameUrl('2026-10-04', 51)));
+      finishLoading();
+      // That was its last stretch.
+      await waitFor(() => expect(playButton()).toHaveAccessibleName('Play'));
+      expect(position()).toBe('52 / 100');
+
+      // Playing again starts over from its first stretch.
+      fireEvent.click(playButton());
+      await waitFor(() => expect(shownFrame()).toBe(frameUrl('2026-10-04', 20)));
+      expect(playButton()).toHaveAccessibleName('Pause');
+
+      // "All apps" plays everything again.
+      fireEvent.click(playButton());
+      await pickApp('All apps');
+      expect(screen.queryByTestId('app-marks')).toBeNull();
+      await settleFrameTime();
+    });
+
+    it('keeps the app picked on a day it is not on, with nothing to play', async () => {
+      mockLibrary({ '2026-10-03': 50, '2026-10-04': 100 });
+      useDayApps.mockImplementation((date) =>
+        date === '2026-10-04' ? apps : { frameCount: 50, apps: [] },
+      );
+      render(<App initialPosition={{ day: '2026-10-04', index: 10 }} />);
+      await pickApp('Blender');
+      await pickDay('2026-10-03');
+
+      expect(screen.getByRole('button', { name: 'App' })).toHaveTextContent('Blender');
+      expect(playButton()).toBeDisabled();
+      fireEvent.click(screen.getByRole('button', { name: 'App' }));
+      expect(await screen.findByRole('option', { name: /Not on this day/ })).toBeInTheDocument();
+      expect(screen.getByText('No app was recorded on this day.')).toBeInTheDocument();
       await settleFrameTime();
     });
   });

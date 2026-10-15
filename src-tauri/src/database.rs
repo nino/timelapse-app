@@ -763,6 +763,36 @@ impl ScreenshotDatabase {
         counts
     }
 
+    /// The app in front for each screenshot of `day` that recorded one, as
+    /// (frame number, app name), in frame order.
+    pub fn front_apps_in_day(&self, day: &str) -> Result<Vec<(u32, String)>> {
+        let mut statement = self.conn.prepare(
+            "SELECT s.frame_number, w.app_name
+             FROM screenshots s JOIN windows w ON w.id = s.window_id
+             WHERE s.day = ?1
+             ORDER BY s.frame_number",
+        )?;
+        let rows = statement.query_map([day], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect()
+    }
+
+    /// Each OCR row of `day` as (frame number, the app its menu bar named),
+    /// in frame order. A row stands for every frame up to the next one.
+    pub fn menu_apps_in_day(&self, day: &str) -> Result<Vec<(u32, Option<String>)>> {
+        let mut statement = self.conn.prepare(
+            "SELECT frame_number, menu_app FROM ocr_frames WHERE day = ?1 ORDER BY frame_number",
+        )?;
+        let rows = statement.query_map([day], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect()
+    }
+
+    /// Every app name the capture loop has seen in front, on any day.
+    pub fn front_app_names(&self) -> Result<Vec<String>> {
+        let mut statement = self.conn.prepare("SELECT DISTINCT app_name FROM windows")?;
+        let rows = statement.query_map([], |row| row.get(0))?;
+        rows.collect()
+    }
+
     /// The recognized text of frame `frame_number` of `day` and the box of
     /// each of its lines, or `None` if OCR has no row for it.
     pub fn ocr_lines(&self, day: &str, frame_number: u32) -> Result<Option<(String, Vec<LineBox>)>> {
