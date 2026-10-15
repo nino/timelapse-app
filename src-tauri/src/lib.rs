@@ -839,8 +839,8 @@ pub(crate) fn before_quit<R: Runtime>(app: &AppHandle<R>) {
 
 /// The standard menu bar, with "Check for Updates…" and "Settings…" (⌘,)
 /// under About in the app menu, and "Activity" (⌥⌘A) added to the Window
-/// menu. About opens the app's own About window, which has the change log, instead
-/// of the standard About panel.
+/// menu. About opens the app's own About window, which has the change log,
+/// instead of the standard About panel.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn app_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     let menu = Menu::default(app)?;
