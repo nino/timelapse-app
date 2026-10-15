@@ -839,9 +839,9 @@ pub(crate) fn before_quit<R: Runtime>(app: &AppHandle<R>) {
 }
 
 /// The standard menu bar, with "Check for Updates…" and "Settings…" (⌘,)
-/// under About in the app menu, and "Activity" added to the Window menu.
-/// About opens the app's own About window, which has the change log, instead
-/// of the standard About panel.
+/// under About in the app menu, and "Activity" (⌥⌘A) added to the Window
+/// menu. About opens the app's own About window, which has the change log,
+/// instead of the standard About panel.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn app_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     let menu = Menu::default(app)?;
@@ -868,7 +868,13 @@ fn app_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     }
     if let Some(MenuItemKind::Submenu(window)) = menu.get(WINDOW_SUBMENU_ID) {
         window.append(&PredefinedMenuItem::separator(app)?)?;
-        window.append(&MenuItem::with_id(app, ACTIVITY_WINDOW, "Activity", true, None::<&str>)?)?;
+        window.append(&MenuItem::with_id(
+            app,
+            ACTIVITY_WINDOW,
+            "Activity",
+            true,
+            Some("CmdOrCtrl+Alt+A"),
+        )?)?;
     }
     Ok(menu)
 }
@@ -942,6 +948,18 @@ fn grow_settings_window(by: f64, window: tauri::WebviewWindow) -> Result<(), Str
         Ok(())
     };
     resize().map_err(|e| e.to_string())
+}
+
+/// What the Activity menu item (⌥⌘A) does: closes the Activity window when
+/// it is the focused window, and otherwise brings it to the front, opening it
+/// if it isn't open.
+fn toggle_activity_window<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
+    if let Some(window) = app.get_webview_window(ACTIVITY_WINDOW) {
+        if window.is_focused()? {
+            return window.close();
+        }
+    }
+    show_activity_window(app, Opening::Asked)
 }
 
 /// Bring the Activity window to the front, opening it if it isn't open. It
@@ -1027,7 +1045,7 @@ pub fn run() {
         .manage(UpdaterState::default())
         .on_menu_event(|app, event| {
             let opened = match event.id().as_ref() {
-                ACTIVITY_WINDOW => show_activity_window(app, Opening::Asked),
+                ACTIVITY_WINDOW => toggle_activity_window(app),
                 SETTINGS_WINDOW => show_settings_window(app, Opening::Asked),
                 ABOUT_WINDOW => show_about_window(app),
                 CHECK_FOR_UPDATES => {
