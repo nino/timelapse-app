@@ -541,7 +541,17 @@ impl OcrWorker {
         let mut pending = Vec::new();
         let mut days = videos.source.days().map_err(|e| e.to_string())?;
         days.reverse();
+        let complete: HashSet<String> = self
+            .db
+            .all_ocr_progress()
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .filter_map(|(day, _, complete)| complete.then_some(day))
+            .collect();
         for day in days {
+            if complete.contains(&day) {
+                continue;
+            }
             let done = match self.db.ocr_progress(&day).map_err(|e| e.to_string())? {
                 None => 0,
                 Some(OcrProgress::VideoPosition(last)) => last as usize,
@@ -554,15 +564,28 @@ impl OcrWorker {
             let unread: Vec<_> = day_videos
                 .into_iter()
                 .filter(|video| video.first_index + video.frame_count > done)
+                .collect();
+            if unread.is_empty() {
+                // For the day picker, and so later passes skip the day.
+                self.db
+                    .record_video_day_complete(&day)
+                    .map_err(|e| e.to_string())?;
+                continue;
+            }
+            let count = unread.len();
+            let unread: Vec<_> = unread
+                .into_iter()
                 .filter(|video| !videos.failed.contains(&video.path))
                 .collect();
             if !unread.is_empty() {
-                pending.push((day, done, unread));
+                let whole = unread.len() == count;
+                pending.push((day, done, unread, whole));
             }
         }
         self.activity.ocr_video_pass_started(pending.len());
 
-        for (day, done, day_videos) in pending {
+        for (day, done, day_videos, whole) in pending {
+            let mut finished = whole;
             for video in day_videos {
                 let end = video.first_index + video.frame_count;
                 let mut stopped = false;
@@ -625,9 +648,15 @@ impl OcrWorker {
                         videos.failed.insert(video.path.clone());
                         // Later videos would move the mark past this one's
                         // unread frames.
+                        finished = false;
                         break;
                     }
                 }
+            }
+            if finished {
+                self.db
+                    .record_video_day_complete(&day)
+                    .map_err(|e| e.to_string())?;
             }
         }
 
@@ -1421,6 +1450,16 @@ mod tests {
         fn progress(&self, day: &str) -> Option<OcrProgress> {
             self.worker.db.ocr_progress(day).unwrap()
         }
+
+        /// Whether `day` is marked as read to the end of its videos.
+        fn complete(&self, day: &str) -> bool {
+            self.worker
+                .db
+                .all_ocr_progress()
+                .unwrap()
+                .into_iter()
+                .any(|(d, _, complete)| d == day && complete)
+        }
     }
 
     #[test]
@@ -1442,6 +1481,7 @@ mod tests {
         assert_eq!(library.seen().len(), 5);
         assert_eq!(library.progress(DAY_1), Some(OcrProgress::VideoPosition(5)));
         assert_eq!(library.progress(DAY_2), Some(OcrProgress::VideoPosition(2)));
+        assert!(library.complete(DAY_1) && library.complete(DAY_2));
         let mut hits: Vec<_> = library
             .worker
             .db
@@ -1472,9 +1512,11 @@ mod tests {
 
         assert_eq!(library.video_pass(2).handled(), 2);
         assert_eq!(library.progress(DAY_1), Some(OcrProgress::VideoPosition(2)));
+        assert!(!library.complete(DAY_1));
 
         assert_eq!(library.video_pass(usize::MAX).handled(), 3);
         assert_eq!(library.progress(DAY_1), Some(OcrProgress::VideoPosition(5)));
+        assert!(library.complete(DAY_1));
         // Every frame differs from the one before it, so all are read.
         assert_eq!(library.seen().len(), 5);
     }

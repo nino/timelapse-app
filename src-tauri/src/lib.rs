@@ -10,6 +10,7 @@ mod activity;
 mod app_state;
 mod boost;
 mod converter;
+mod day_status;
 mod timelapse;
 mod database;
 mod menu_app;
@@ -215,6 +216,22 @@ async fn with_frame_source<T: Send + 'static>(
 #[tauri::command]
 async fn list_days(source: State<'_, FrameSourceState>) -> Result<Vec<String>, String> {
     with_frame_source(source.inner(), |s| s.days()).await
+}
+
+/// Whether OCR and video conversion have finished each day, oldest first.
+/// See `day_status`.
+#[tauri::command]
+async fn get_day_statuses(
+    source: State<'_, FrameSourceState>,
+) -> Result<Vec<day_status::DayStatus>, String> {
+    let timelapse_root = paths::timelapse_root().ok_or("Unable to find home directory")?;
+    let source = Arc::clone(source.inner());
+    run_blocking(move || {
+        let days = source.days().map_err(|e| e.to_string())?;
+        let db = library_db(&timelapse_root)?;
+        day_status::day_statuses(&timelapse_root, db.as_ref(), &days)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -1169,6 +1186,7 @@ pub fn run() {
             get_screenshot_metadata,
             list_days,
             get_day,
+            get_day_statuses,
             get_frame_time,
             get_pending_frames,
             search_ocr,

@@ -293,6 +293,20 @@ impl ScreenshotDatabase {
             )?;
         }
 
+        // Migration 9: mark days read from video once OCR has read every
+        // one of their videos, so the day picker can tell without probing
+        // the videos for their length.
+        if !Self::migration_applied(&tx, "ocr_video_days_complete")? {
+            tx.execute(
+                "ALTER TABLE ocr_progress ADD COLUMN complete INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+            tx.execute(
+                "INSERT INTO migrations (migration_name, applied_at) VALUES (?1, ?2)",
+                rusqlite::params!["ocr_video_days_complete", Utc::now().to_rfc3339()],
+            )?;
+        }
+
         tx.commit()?;
 
         Ok(vacuum)
@@ -610,6 +624,36 @@ impl ScreenshotDatabase {
                 },
             )
             .optional()
+    }
+
+    /// Record that OCR has read every video of `day`, a day read from video.
+    /// `ocr_progress` says which days are; a day whose screenshots OCR read
+    /// is left alone.
+    pub fn record_video_day_complete(&self, day: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO ocr_progress (day, last_frame, by_position, complete) VALUES (?1, 0, 1, 1)
+             ON CONFLICT (day) DO UPDATE SET complete = 1 WHERE by_position AND NOT complete",
+            [day],
+        )?;
+        Ok(())
+    }
+
+    /// Every day's OCR progress, and for days read from video whether OCR
+    /// has finished them, in day order.
+    pub fn all_ocr_progress(&self) -> Result<Vec<(String, OcrProgress, bool)>> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT day, last_frame, by_position, complete FROM ocr_progress ORDER BY day")?;
+        let rows = statement.query_map([], |row| {
+            let last: u32 = row.get(1)?;
+            let progress = if row.get(2)? {
+                OcrProgress::VideoPosition(last)
+            } else {
+                OcrProgress::FrameNumber(last)
+            };
+            Ok((row.get(0)?, progress, row.get(3)?))
+        })?;
+        rows.collect()
     }
 
     /// Record the screenshots `video` was encoded from, in video order, as

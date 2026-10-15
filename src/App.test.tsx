@@ -3,7 +3,7 @@ import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 
 import { App } from './App';
 import * as frames from './frames';
-import { frameUrl, type Day } from './frames';
+import { frameUrl, type Day, type DayStatus } from './frames';
 import * as library from './hooks/useLibrary';
 import * as ocrSearch from './hooks/useOcrSearch';
 import type { DayCount, DayMatch, LineBox } from './search';
@@ -14,6 +14,7 @@ import * as viewerPosition from './viewerPosition';
 // helpers that useLibrary.test.ts and frames.test.ts are testing.
 const useDays = spyOn(library, 'useDays');
 const useDay = spyOn(library, 'useDay');
+const useDayStatuses = spyOn(library, 'useDayStatuses');
 const getFrameTime = spyOn(frames, 'getFrameTime');
 const useDayMatches = spyOn(ocrSearch, 'useDayMatches');
 const useMatchCounts = spyOn(ocrSearch, 'useMatchCounts');
@@ -26,6 +27,7 @@ afterAll(() => {
   setViewerPosition.mockRestore();
   useDays.mockRestore();
   useDay.mockRestore();
+  useDayStatuses.mockRestore();
   getFrameTime.mockRestore();
   useDayMatches.mockRestore();
   useMatchCounts.mockRestore();
@@ -139,6 +141,7 @@ describe('App', () => {
     mockSearch('', {});
     getPendingFrames.mockResolvedValue({ frameCount: 0, ranges: [] });
     setViewerPosition.mockResolvedValue(undefined);
+    useDayStatuses.mockReturnValue(new Map());
   });
 
   describe('Library states', () => {
@@ -518,6 +521,27 @@ describe('App', () => {
       expect(screen.getByRole('option', { name: /2026-10-05/ })).toBeInTheDocument();
       expect(dayPicker()).toHaveTextContent('2026-10-03');
     });
+  });
+
+  it('shows whether OCR and video conversion are done for each day in the picker', async () => {
+    mockLibrary({ '2026-10-03': 3, '2026-10-04': 3 });
+    useDayStatuses.mockImplementation((open: boolean): Map<string, DayStatus> =>
+      open
+        ? new Map([
+            ['2026-10-03', { date: '2026-10-03', ocrDone: true, videoDone: true }],
+            ['2026-10-04', { date: '2026-10-04', ocrDone: true, videoDone: false }],
+          ])
+        : new Map(),
+    );
+    render(<App />);
+    await openDayPicker();
+
+    expect(screen.getByRole('option', { name: /2026-10-03/ })).toHaveTextContent(
+      'OCR done, video done',
+    );
+    expect(screen.getByRole('option', { name: /2026-10-04/ })).toHaveTextContent(
+      'OCR done, video not done',
+    );
   });
 
   describe('Find in timeline', () => {

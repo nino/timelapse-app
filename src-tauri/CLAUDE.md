@@ -10,6 +10,7 @@ Each module's `//!` doc comment says how it works; this file is the map and the 
 - `ocr.rs`, `ocr_helper.rs`, `ocr_tiles.rs`, `menu_app.rs` — background OCR with Apple Vision (macOS only), run in a helper process because Vision can break for the rest of a process's life.
 - `converter.rs` — encodes each finished hour of PNGs into `<root>/YYYY-MM-DD--HH-MM-SS--hourly.mov` with ffmpeg, then deletes the PNGs.
 - `frame-source/` — **a separate crate** (no Tauri dependency) that answers "frame N of day D" whether the frame is a PNG, an hourly video or one of the old script's whole-day videos, with a chunked LRU cache of decoded video frames and read-ahead.
+- `day_status.rs` — whether OCR and video conversion have finished each day, for the day picker, from directory listings and `ocr_progress` only.
 - `activity.rs`, `boost.rs` — what the Activity window shows, and Boost / Low power mode, which change how hard conversion and OCR may work.
 - `diagnostics.rs` — `<library>/diagnostics.db`, a log for Nino to upload when something looks wrong (there are no analytics).
 - `app_state.rs`, `settings.rs`, `updater.rs`, `paths.rs` — remembered window and viewer state, preferences, auto-update, library and ffmpeg paths.
@@ -20,7 +21,7 @@ All in `screenshots.db`, keyed by `(day, frame_number)`:
 - `screenshots` — one row per stored PNG, with its capture time (`created_at` UTC, `local_time`), `day` folder name, and `window_id` (the app and window in front, NULL when unknown).
 - `windows` — one row per distinct app path, app name and window title.
 - `ocr_frames` — OCR text, one line per box, boxes packed by `pack_boxes`; one row per frame whose text differs from the day's previous row, so a row stands for every frame up to the next one. `menu_app` is the front app read from the menu bar text, a guess for frames without `window_id`. Searched through the FTS5 index `ocr_fts`.
-- `ocr_progress` — per day, the highest frame OCR has handled, with every frame below it handled too. For a day read from video (`by_position`) the numbers are positions in the day's videos instead.
+- `ocr_progress` — per day, the highest frame OCR has handled, with every frame below it handled too. For a day read from video (`by_position`) the numbers are positions in the day's videos instead, and `complete` is set once OCR has read all of them.
 - `video_frames` — for each hourly video, which screenshot each of its frames came from and its capture time, so frames keep their time once the PNGs are gone.
 
 ## Things to know before changing behaviour

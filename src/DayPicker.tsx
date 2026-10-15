@@ -1,6 +1,8 @@
 import { Listbox, ListboxButton, ListboxOption, ListboxOptions } from "@headlessui/react";
 import React from "react";
 
+import type { DayStatus } from "./frames";
+import { useDayStatuses } from "./hooks/useLibrary";
 import { focusRing } from "./ui";
 
 /**
@@ -24,31 +26,96 @@ export function DayPicker({
   const label = (date: string): string => (date === today ? `${date} (Today)` : date);
   return (
     <Listbox value={value} onChange={(date: string | null) => date && onChange(date)}>
-      <ListboxButton
-        aria-label="Day"
-        className={`flex h-7.5 items-center gap-3 rounded-full border border-input bg-field pr-3.5 pl-4 text-sm font-medium tabular-nums ${focusRing}`}
-      >
-        {value === null ? <span className="text-muted-fg">Select a day…</span> : label(value)}
-        <Chevron />
-      </ListboxButton>
-      <ListboxOptions
-        anchor={{ to: "bottom start", gap: 4 }}
-        className="z-10 max-h-96 min-w-(--button-width) overflow-y-auto rounded-2xl border border-border bg-card p-1 text-sm text-fg tabular-nums shadow-md outline-none"
-      >
-        {/* Options are concentric with the list: 16px minus the 1px border
-            and 4px padding. */}
-        {[...days].reverse().map((date) => (
-          <ListboxOption
-            key={date}
-            value={date}
-            className="flex h-7 cursor-default items-center justify-between gap-3 rounded-[11px] px-2.5 select-none data-focus:bg-muted data-selected:font-semibold"
+      {({ open }): React.ReactElement => (
+        <>
+          <ListboxButton
+            aria-label="Day"
+            className={`flex h-7.5 items-center gap-3 rounded-full border border-input bg-field pr-3.5 pl-4 text-sm font-medium tabular-nums ${focusRing}`}
           >
-            {label(date)}
-            <Check />
-          </ListboxOption>
-        ))}
-      </ListboxOptions>
+            {value === null ? <span className="text-muted-fg">Select a day…</span> : label(value)}
+            <Chevron />
+          </ListboxButton>
+          <DayOptions days={days} label={label} open={open} />
+        </>
+      )}
     </Listbox>
+  );
+}
+
+function DayOptions({
+  days,
+  label,
+  open,
+}: {
+  days: Array<string>;
+  label: (date: string) => string;
+  open: boolean;
+}): React.ReactNode {
+  // Asked for on every opening, so a closed picker costs nothing.
+  const statuses = useDayStatuses(open);
+  return (
+    <ListboxOptions
+      anchor={{ to: "bottom start", gap: 4 }}
+      className="z-10 max-h-96 min-w-(--button-width) overflow-y-auto rounded-2xl border border-border bg-card p-1 text-sm text-fg tabular-nums shadow-md outline-none"
+    >
+      {/* Options are concentric with the list: 16px minus the 1px border
+          and 4px padding. */}
+      {[...days].reverse().map((date) => (
+        <ListboxOption
+          key={date}
+          value={date}
+          className="flex h-7 cursor-default items-center justify-between gap-3 rounded-[11px] px-2.5 select-none data-focus:bg-muted data-selected:font-semibold"
+        >
+          {label(date)}
+          <span className="flex items-center gap-2">
+            <Status status={statuses.get(date)} />
+            <Check />
+          </span>
+        </ListboxOption>
+      ))}
+    </ListboxOptions>
+  );
+}
+
+/**
+ * Two marks: the text glyph for OCR, the film glyph for video conversion,
+ * each in the success colour once done and faint while still to do. Nothing
+ * until the status is known.
+ */
+function Status({ status }: { status: DayStatus | undefined }): React.ReactNode {
+  if (!status) return <span className="w-7" />;
+  const ocr = status.ocrDone ? "OCR done" : "OCR not done";
+  const video = status.videoDone ? "video done" : "video not done";
+  const tone = (done: boolean): string => (done ? "text-success" : "text-faint-fg opacity-50");
+  return (
+    <span className="flex w-7 items-center gap-1" title={`${ocr}, ${video}`}>
+      <span className="sr-only">{`${ocr}, ${video}`}</span>
+      <TextGlyph className={tone(status.ocrDone)} />
+      <FilmGlyph className={tone(status.videoDone)} />
+    </span>
+  );
+}
+
+function TextGlyph({ className }: { className: string }): React.ReactNode {
+  return (
+    <svg viewBox="0 0 12 12" aria-hidden="true" className={`size-3 ${className}`}>
+      <path
+        d="M2 3h8M2 6h8M2 9h5"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.5"
+        strokeLinecap="round"
+      />
+    </svg>
+  );
+}
+
+function FilmGlyph({ className }: { className: string }): React.ReactNode {
+  return (
+    <svg viewBox="0 0 12 12" aria-hidden="true" className={`size-3 ${className}`}>
+      <rect x="1.5" y="2.5" width="9" height="7" rx="1.5" fill="none" stroke="currentColor" strokeWidth="1.5" />
+      <path d="M5 4.5v3l2.5-1.5z" fill="currentColor" />
+    </svg>
   );
 }
 

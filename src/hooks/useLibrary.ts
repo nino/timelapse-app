@@ -1,6 +1,6 @@
 import React from "react";
 
-import { getDay, listDays, type Day } from "../frames";
+import { getDay, getDayStatuses, listDays, type Day, type DayStatus } from "../frames";
 import { timelapseRoot } from "../timelapseRoot";
 import { useDirectoryChanges, useLatestLoad } from "./useDirectoryChanges";
 
@@ -38,6 +38,31 @@ export function useDays(): {
   useDirectoryChanges(timelapseRoot(), reload);
 
   return { days, daysError };
+}
+
+/**
+ * Each day's OCR and video status by date, asked for again every time `open`
+ * turns true (the day picker opening), and kept from the last time meanwhile.
+ * Empty until the first answer; a failure keeps the last answer.
+ */
+export function useDayStatuses(open: boolean): Map<string, DayStatus> {
+  const [statuses, setStatuses] = React.useState<Map<string, DayStatus>>(() => new Map());
+
+  React.useEffect(() => {
+    if (!open) return;
+    let current = true;
+    getDayStatuses().then(
+      (list) => {
+        if (current) setStatuses(new Map(list.map((status) => [status.date, status])));
+      },
+      (error: unknown) => console.warn("Could not read day statuses:", error),
+    );
+    return (): void => {
+      current = false;
+    };
+  }, [open]);
+
+  return statuses;
 }
 
 /**

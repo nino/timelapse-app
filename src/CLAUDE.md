@@ -6,6 +6,7 @@
 - `main.tsx` resolves the library root name (`get_timelapse_root_name`) and the saved viewer position before the first render, then renders `App`, `ActivityView`, `SettingsView` or `AboutView` by window label.
 - Rust commands are wrapped in small modules (`frames.ts`, `search.ts`, `activity.ts`, `settings.ts`, `diagnostics.ts`, `viewerPosition.ts`). Build library paths with `timelapseRoot()` from `timelapseRoot.ts`.
 - `hooks/useLibrary.ts` (`useDays`, `useDay`) re-asks Rust whenever `useDirectoryChanges` reports a change in the library root or the day folder (the fs plugin's `watch`, falling back to polling every 3 s). `useDay` returns `null` while a newly selected day loads, never the previous day's answer, and reloads that find nothing new keep the old value so effects don't re-run.
+- `DayPicker.tsx` marks each day with whether OCR and video conversion are done (`useDayStatuses`), asked for only when the list opens.
 - `hooks/useOcrSearch.ts` drives the find bar; `hooks/usePendingFrames.ts` marks the video stretches not decoded yet, which the scrubber draws paler.
 - Don't call `get_screenshot_metadata`: it looks frames up by number alone, which collides across days.
 
