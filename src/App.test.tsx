@@ -724,7 +724,6 @@ describe('App', () => {
 
   describe('App filter', () => {
     const apps: DayApps = {
-      frameCount: 100,
       apps: [
         { name: 'Blender', frames: 7200, ranges: [{ start: 20, end: 22 }, { start: 50, end: 52 }] },
         { name: 'Safari', frames: 90, ranges: [{ start: 0, end: 20 }] },
@@ -788,10 +787,33 @@ describe('App', () => {
       await settleFrameTime();
     });
 
+    it('stays paused after scrubbing past the last stretch, even once the filter is cleared', async () => {
+      mockLibrary({ '2026-10-04': 100 });
+      useDayApps.mockReturnValue(apps);
+      render(<App initialPosition={{ day: '2026-10-04', index: 10 }} />);
+      await waitFor(() => expect(shownFrame()).toBe(frameUrl('2026-10-04', 10)));
+      finishLoading();
+      await pickApp('Blender');
+      await waitFor(() => expect(shownFrame()).toBe(frameUrl('2026-10-04', 20)));
+      finishLoading();
+
+      fireEvent.click(playButton());
+      expect(playButton()).toHaveAccessibleName('Pause');
+      fireEvent.change(screen.getByRole('slider'), { target: { value: '80' } });
+      await waitFor(() => expect(playButton()).toHaveAccessibleName('Play'));
+
+      await pickApp('All apps');
+      finishLoading();
+      await act(() => new Promise((resolve) => setTimeout(resolve, 150)));
+      expect(playButton()).toHaveAccessibleName('Play');
+      expect(position()).toBe('81 / 100');
+      await settleFrameTime();
+    });
+
     it('keeps the app picked on a day it is not on, with nothing to play', async () => {
       mockLibrary({ '2026-10-03': 50, '2026-10-04': 100 });
       useDayApps.mockImplementation((date) =>
-        date === '2026-10-04' ? apps : { frameCount: 50, apps: [] },
+        date === '2026-10-04' ? apps : { apps: [] },
       );
       render(<App initialPosition={{ day: '2026-10-04', index: 10 }} />);
       await pickApp('Blender');

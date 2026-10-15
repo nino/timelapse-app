@@ -13,8 +13,6 @@ export type AppStretches = {
 
 /** Mirrors `DayApps` in Rust. */
 export type DayApps = {
-  /** The day's frame count when the stretches were found. */
-  frameCount: number;
   /** Most-used first. Empty for a day with no app data. */
   apps: Array<AppStretches>;
 };

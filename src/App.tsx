@@ -75,7 +75,7 @@ export function App({
   // App filter: playback keeps to the stretches where this app was in front.
   // It stays picked across days.
   const [appFilter, setAppFilter] = React.useState<string | null>(null);
-  const dayApps = useDayApps(selectedDay, frameCount, ocrVersion);
+  const dayApps = useDayApps(selectedDay, frameCount, ocrVersion, appFilter !== null);
   const appRanges = React.useMemo(
     (): Array<FrameRange> | null =>
       appFilter === null
@@ -301,7 +301,7 @@ export function App({
             <AppPicker
               dayApps={dayApps}
               value={appFilter}
-              onChange={(app) => {
+              onChange={(app: string | null): void => {
                 setAppFilter(app);
                 // Picking an app moves to its next stretch, unless already in one.
                 const ranges = app === null ? null : dayApps?.apps.find((a) => a.name === app)?.ranges;
@@ -569,7 +569,7 @@ const AppMarks = React.memo(function AppMarks({
   frameCount: number;
 }): React.ReactNode {
   const merged = React.useMemo(
-    () => mergeCloseRanges(ranges, Math.ceil(frameCount / 1000)),
+    (): Array<FrameRange> => mergeCloseRanges(ranges, Math.ceil(frameCount / 1000)),
     [ranges, frameCount],
   );
   if (merged.length === 0 || frameCount === 0) return null;
@@ -685,6 +685,10 @@ function usePlayback({
   const atEnd = next === null;
   const playing = playingDay !== null && playingDay === selectedDay && !atEnd;
   const lastStepAt = React.useRef(0);
+  // Scrubbed past the end (or the filter's last stretch): stop for good, so
+  // nothing starts playing by itself if the end moves later on. Set during
+  // render, as React allows for state derived from earlier renders.
+  if (playingDay !== null && atEnd) setPlayingDay(null);
 
   const togglePlaying = React.useCallback((): void => {
     if (playing) {

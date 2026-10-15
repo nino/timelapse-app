@@ -17,6 +17,7 @@
 
 use rusqlite::{Connection, OptionalExtension, Result, Transaction, TransactionBehavior};
 use serde::Serialize;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 use chrono::{DateTime, Utc, Local};
@@ -763,14 +764,25 @@ impl ScreenshotDatabase {
         counts
     }
 
-    /// The app in front for each screenshot of `day` that recorded one, as
-    /// (frame number, app name), in frame order.
-    pub fn front_apps_in_day(&self, day: &str) -> Result<Vec<(u32, String)>> {
+    /// The window in front for each screenshot of `day` that recorded one, as
+    /// (frame number, `windows` id), in frame order. Where a number repeats
+    /// (the day's numbering restarted), the newest row comes last.
+    pub fn front_windows_in_day(&self, day: &str) -> Result<Vec<(u32, i64)>> {
         let mut statement = self.conn.prepare(
-            "SELECT s.frame_number, w.app_name
-             FROM screenshots s JOIN windows w ON w.id = s.window_id
-             WHERE s.day = ?1
-             ORDER BY s.frame_number",
+            "SELECT frame_number, window_id FROM screenshots
+             WHERE day = ?1 AND window_id IS NOT NULL
+             ORDER BY frame_number, id",
+        )?;
+        let rows = statement.query_map([day], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect()
+    }
+
+    /// The app name of each window in front at some point on `day`, by
+    /// `windows` id.
+    pub fn front_apps_of_day(&self, day: &str) -> Result<HashMap<i64, String>> {
+        let mut statement = self.conn.prepare(
+            "SELECT id, app_name FROM windows
+             WHERE id IN (SELECT DISTINCT window_id FROM screenshots WHERE day = ?1)",
         )?;
         let rows = statement.query_map([day], |row| Ok((row.get(0)?, row.get(1)?)))?;
         rows.collect()

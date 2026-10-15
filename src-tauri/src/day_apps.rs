@@ -11,17 +11,14 @@
 
 use std::collections::HashMap;
 
-use frame_source::FrameSource;
+use frame_source::{FrameRange, FrameSource};
 use serde::Serialize;
 
 use crate::database::{OcrProgress, ScreenshotDatabase};
 
 /// The apps in front on one day, most-used first.
 #[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct DayApps {
-    /// The day's frame count when the stretches were found.
-    pub frame_count: usize,
     pub apps: Vec<AppStretches>,
 }
 
@@ -31,14 +28,8 @@ pub struct AppStretches {
     pub name: String,
     /// How many frames it was in front for.
     pub frames: usize,
-    /// Day-wide frame indices `start..end` (end exclusive), in order.
-    pub ranges: Vec<Stretch>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-pub struct Stretch {
-    pub start: usize,
-    pub end: usize,
+    /// Day-wide frame indices, in order.
+    pub ranges: Vec<FrameRange>,
 }
 
 /// Which app was in front for each frame of `date`. Empty when nothing on
@@ -48,69 +39,86 @@ pub fn day_apps(
     source: &FrameSource,
     date: &str,
 ) -> Result<DayApps, String> {
-    let frame_count = source.day(date).map_err(|e| e.to_string())?.frame_count;
-    let empty = DayApps { frame_count, apps: Vec::new() };
+    let empty = DayApps { apps: Vec::new() };
     let Some(db) = db else {
         return Ok(empty);
     };
+    let error = |e: rusqlite::Error| e.to_string();
+    let front = db.front_windows_in_day(date).map_err(error)?;
+    let menu = db.menu_apps_in_day(date).map_err(error)?;
+    let has_guesses = menu.iter().any(|(_, app)| app.is_some());
+    if front.is_empty() && !has_guesses {
+        return Ok(empty);
+    }
+    let frame_count = source.day(date).map_err(|e| e.to_string())?.frame_count;
     if frame_count == 0 {
         return Ok(empty);
     }
-    let error = |e: rusqlite::Error| e.to_string();
-    let front = db.front_apps_in_day(date).map_err(error)?;
-    let menu = db.menu_apps_in_day(date).map_err(error)?;
-    if front.is_empty() && menu.iter().all(|(_, app)| app.is_none()) {
-        return Ok(empty);
-    }
     let progress = db.ocr_progress(date).map_err(error)?;
-
-    // Every frame number to place on the scrubber, in one frame-source call:
-    // the recorded frames, then the OCR rows, then where OCR has got to.
     let by_position = matches!(progress, Some(OcrProgress::VideoPosition(_)));
     let done_through = match progress {
         Some(OcrProgress::FrameNumber(n) | OcrProgress::VideoPosition(n)) => Some(n),
         None => None,
     };
-    let mut numbers: Vec<u32> = front.iter().map(|(n, _)| *n).collect();
-    let front_indices = place(source, date, &numbers)?;
-    numbers = menu.iter().map(|(n, _)| *n).chain(done_through).collect();
-    // A day OCR read from video recorded 1-based positions in the day, so a
-    // position is an index plus one.
-    let menu_indices = if by_position {
-        numbers
-            .iter()
-            .map(|&p| (p as usize).checked_sub(1).filter(|&i| i < frame_count))
-            .collect()
-    } else {
-        place(source, date, &numbers)?
-    };
 
-    let mut names = Names::new(db.front_app_names().map_err(error)?);
+    // Each OCR row runs to the next one (exclusive) or, if that one is gone,
+    // the frame just before it (inclusive); the day's last row runs through
+    // the last frame OCR handled. The same as `search_ocr_day_impl`.
+    let menu_numbers: Vec<u32> = menu
+        .iter()
+        .enumerate()
+        .flat_map(|(i, (n, _))| match menu.get(i + 1) {
+            Some((next, _)) => [*n, *next, next - 1],
+            None => {
+                let last = done_through.unwrap_or(*n).max(*n);
+                [*n, last, last]
+            }
+        })
+        .collect();
+    // Placed in one frame-source call where possible. A day OCR read from
+    // video recorded 1-based positions, so a position is an index plus one.
+    let mut numbers: Vec<u32> = front.iter().map(|(n, _)| *n).collect();
+    if !by_position {
+        numbers.extend(&menu_numbers);
+    }
+    let mut indices = if numbers.is_empty() {
+        Vec::new()
+    } else {
+        source.indices_of_frames(date, &numbers).map_err(|e| e.to_string())?
+    };
+    let menu_indices: Vec<Option<usize>> = if by_position {
+        menu_numbers.iter().map(|&p| (p as usize).checked_sub(1)).collect()
+    } else {
+        indices.split_off(front.len())
+    };
+    // The day may have grown between the two looks at it.
+    let place = |index: &Option<usize>| index.filter(|&i| i < frame_count);
+
+    let known = if has_guesses {
+        db.front_app_names().map_err(error)?
+    } else {
+        Vec::new()
+    };
+    let mut names = Names::new(known);
     let mut app_of: Vec<Option<usize>> = vec![None; frame_count];
 
     // Menu bar guesses first, so the recorded windows overwrite them.
-    let mut runs: Vec<(usize, Option<&str>)> = menu
-        .iter()
-        .zip(&menu_indices)
-        .filter_map(|((_, app), index)| Some(((*index)?, app.as_deref())))
-        .collect();
-    runs.sort_by_key(|(index, _)| *index);
-    // The day's last row runs through the last frame OCR has handled.
-    let last_end = done_through
-        .and(menu_indices.get(menu.len()).copied().flatten())
-        .map(|index| index + 1);
-    for (i, &(start, app)) in runs.iter().enumerate() {
-        let end = match runs.get(i + 1) {
-            Some(&(next, _)) => next,
-            None => last_end.unwrap_or(start + 1).max(start + 1),
+    for (i, ((_, app), found)) in menu.iter().zip(menu_indices.chunks(3)).enumerate() {
+        let (Some(app), Some(start)) = (app, place(&found[0])) else {
+            continue;
         };
-        if let Some(app) = app {
-            let id = names.snapped(app);
-            app_of[start..end.min(frame_count)].fill(Some(id));
-        }
+        let has_next = i + 1 < menu.len();
+        let end = match (place(&found[1]), place(&found[2])) {
+            (Some(next), _) if has_next && next > start => next,
+            (_, Some(last)) => last + 1,
+            _ => start + 1,
+        };
+        let id = names.snapped(app);
+        app_of[start..end.clamp(start + 1, frame_count)].fill(Some(id));
     }
-    for ((_, app), index) in front.iter().zip(&front_indices) {
-        if let Some(index) = *index {
+    let windows = db.front_apps_of_day(date).map_err(error)?;
+    for ((_, window), index) in front.iter().zip(&indices) {
+        if let (Some(index), Some(app)) = (place(index), windows.get(window)) {
             app_of[index] = Some(names.exact(app));
         }
     }
@@ -127,21 +135,13 @@ pub fn day_apps(
         }
         if let Some(id) = app_of[start] {
             apps[id].frames += index - start;
-            apps[id].ranges.push(Stretch { start, end: index });
+            apps[id].ranges.push(FrameRange { start, end: index });
         }
         start = index;
     }
     apps.retain(|app| app.frames > 0);
     apps.sort_by(|a, b| b.frames.cmp(&a.frames).then_with(|| a.name.cmp(&b.name)));
-    Ok(DayApps { frame_count, apps })
-}
-
-/// Scrubber indices of frames `numbers` of `date`.
-fn place(source: &FrameSource, date: &str, numbers: &[u32]) -> Result<Vec<Option<usize>>, String> {
-    if numbers.is_empty() {
-        return Ok(Vec::new());
-    }
-    source.indices_of_frames(date, numbers).map_err(|e| e.to_string())
+    Ok(DayApps { apps })
 }
 
 /// App names numbered in the order they are first seen, with OCR's
@@ -177,14 +177,21 @@ impl Names {
     }
 }
 
-/// The recorded name `read` most likely is: itself, the same name in other
-/// case, or the one closest to it if that is within a letter (two for
-/// longer names) and no other is as close.
+/// The recorded name `read` most likely is: itself; the one closest to it if
+/// that is within a letter (two for longer names) and no other is as close;
+/// or the only one it ends, as the menu bar shortens `Google Chrome` to
+/// `Chrome`.
 fn snap<'a>(read: &'a str, known: &'a [String]) -> Option<&'a str> {
     if known.iter().any(|name| name == read) {
         return Some(read);
     }
     let read_lower = read.to_lowercase();
+    let mut ending = known
+        .iter()
+        .filter(|name| name.to_lowercase().ends_with(&format!(" {read_lower}")));
+    if let (Some(name), None) = (ending.next(), ending.next()) {
+        return Some(name);
+    }
     let mut best: Option<(usize, &str)> = None;
     let mut tied = false;
     for name in known {
@@ -289,8 +296,7 @@ mod tests {
         let (_cache, source) = source_in(library.path());
 
         let apps = day_apps(Some(&db), &source, DAY).unwrap();
-        assert_eq!(apps.frame_count, 6);
-        assert_eq!(apps.apps[0].name, "Blender");
+                assert_eq!(apps.apps[0].name, "Blender");
         assert_eq!(apps.apps[0].frames, 4);
         assert_eq!(ranges(&apps, "Blender"), vec![(0, 2), (3, 5)]);
         assert_eq!(ranges(&apps, "Safari"), vec![(2, 3), (5, 6)]);
@@ -319,22 +325,41 @@ mod tests {
     }
 
     #[test]
+    fn a_guess_on_a_missing_frame_still_ends_the_run_before_it() {
+        // Frame 3 was removed by hand: frames 1, 2, 4, 5 are indices 0-3.
+        let (library, db) = library(&[1, 2, 4, 5]);
+        ocr(&db, 1, "Safari");
+        ocr(&db, 3, "Blender");
+        ocr(&db, 4, "Mail");
+        db.record_ocr_frame(DAY, 5, None).unwrap();
+        let (_cache, source) = source_in(library.path());
+
+        let apps = day_apps(Some(&db), &source, DAY).unwrap();
+        assert_eq!(ranges(&apps, "Safari"), vec![(0, 2)]);
+        assert_eq!(ranges(&apps, "Mail"), vec![(2, 4)]);
+    }
+
+    #[test]
     fn a_day_with_no_app_data_has_no_apps() {
         let (library, db) = library(&[1, 2]);
         capture(&db, 1, None);
         let (_cache, source) = source_in(library.path());
         let apps = day_apps(Some(&db), &source, DAY).unwrap();
-        assert_eq!(apps, DayApps { frame_count: 2, apps: Vec::new() });
+        assert_eq!(apps, DayApps { apps: Vec::new() });
         assert_eq!(day_apps(None, &source, DAY).unwrap().apps, Vec::new());
     }
 
     #[test]
     fn snapping_takes_only_a_clear_near_miss() {
-        let known = vec!["Finder".to_string(), "Toggl Track".to_string(), "Mail".to_string(), "Maps".to_string()];
+        let known: Vec<String> = ["Finder", "Toggl Track", "Mail", "Maps", "Google Chrome", "Microsoft Word", "Word Counter"]
+            .map(String::from)
+            .to_vec();
         assert_eq!(snap("Finderc", &known), Some("Finder"));
         assert_eq!(snap("finder", &known), Some("Finder"));
         assert_eq!(snap("Toggi Track", &known), Some("Toggl Track"));
         assert_eq!(snap("Blender", &known), None);
+        assert_eq!(snap("Chrome", &known), Some("Google Chrome"));
+        assert_eq!(snap("Word", &known), Some("Microsoft Word"));
         // As close to Mail as to Maps.
         assert_eq!(snap("Mais", &known), None);
     }
