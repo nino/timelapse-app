@@ -1,5 +1,6 @@
 import React from "react";
 
+import { toggleActivity } from "./activity";
 import "./App.css";
 import { AppPicker } from "./AppPicker";
 import { mergeCloseRanges, nextInRanges } from "./apps";
@@ -184,18 +185,28 @@ export function App({
     return (): void => window.removeEventListener("keydown", handleKeydown);
   }, []);
 
+  // ⌥⌘A toggles the Activity window. That is the menu's shortcut, but it
+  // didn't reach the menu while a dropdown had focus, so the page handles it
+  // and keeps it from the menu; Rust ignores a second toggle straight after.
+  React.useEffect(() => {
+    const handleKeydown = (e: KeyboardEvent): void => {
+      if (e.code !== "KeyA" || !e.metaKey || !e.altKey || e.ctrlKey || e.shiftKey) return;
+      e.preventDefault();
+      void toggleActivity();
+    };
+    window.addEventListener("keydown", handleKeydown);
+    return (): void => window.removeEventListener("keydown", handleKeydown);
+  }, []);
+
   // Keyboard: ←/→ by 1, Shift by 10, Option by 100; ⌘←/⌘→ (Ctrl elsewhere)
   // to the previous/next day.
   React.useEffect(() => {
     const handleKeydown = (e: KeyboardEvent): void => {
       if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
-      // Leave the day picker alone, open or closed.
-      if (
-        e.target instanceof Element &&
-        e.target.closest('[role="listbox"], [aria-haspopup="listbox"]')
-      ) {
-        return;
-      }
+      // An open dropdown keeps its keys; a closed one, which ignores ←/→,
+      // passes them on. ⌘←/⌘→ always change the day.
+      const inOpenList = e.target instanceof Element && e.target.closest('[role="listbox"]');
+      if (inOpenList && !(e.metaKey || e.ctrlKey)) return;
       // In the find bar they move the caret.
       if (e.target instanceof HTMLInputElement && e.target.type !== "range") return;
       const direction = e.key === "ArrowLeft" ? -1 : 1;

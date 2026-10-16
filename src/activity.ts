@@ -135,6 +135,11 @@ export function setBoostAllowBattery(allowBattery: boolean): Promise<Boost | nul
   return invoke<Boost | null>("set_boost_allow_battery", { allowBattery });
 }
 
+/** What ⌥⌘A does: close the Activity window if it is in front, else bring it there. */
+export function toggleActivity(): Promise<void> {
+  return invoke<void>("toggle_activity");
+}
+
 /** A length of time, to the second under an hour: "45s", "3m 05s", "2h 14m". */
 export function formatDuration(seconds: number): string {
   const s = Math.max(0, Math.round(seconds));
