@@ -964,10 +964,30 @@ fn grow_settings_window(by: f64, window: tauri::WebviewWindow) -> Result<(), Str
     resize().map_err(|e| e.to_string())
 }
 
+/// ⌥⌘A from the main window's page. The key didn't reach the menu while one
+/// of the page's dropdowns had focus, so the page handles it itself and
+/// stops it there.
+#[tauri::command]
+fn toggle_activity(app: AppHandle) -> Result<(), String> {
+    toggle_activity_window(&app).map_err(|e| e.to_string())
+}
+
+/// When the Activity window was last toggled, so a ⌥⌘A that reaches both the
+/// menu and the page toggles it once rather than opening and closing it.
+static LAST_ACTIVITY_TOGGLE: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
 /// What the Activity menu item (⌥⌘A) does: closes the Activity window when
 /// it is the focused window, and otherwise brings it to the front, opening it
 /// if it isn't open.
 fn toggle_activity_window<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
+    {
+        let mut last = LAST_ACTIVITY_TOGGLE.lock().unwrap_or_else(|e| e.into_inner());
+        let now = std::time::Instant::now();
+        if last.is_some_and(|at| now.duration_since(at) < std::time::Duration::from_millis(300)) {
+            return Ok(());
+        }
+        *last = Some(now);
+    }
     if let Some(window) = app.get_webview_window(ACTIVITY_WINDOW) {
         if window.is_focused()? {
             return window.close();
@@ -1254,7 +1274,8 @@ pub fn run() {
             set_update_automatically,
             get_viewer_position,
             set_viewer_position,
-            grow_settings_window
+            grow_settings_window,
+            toggle_activity
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

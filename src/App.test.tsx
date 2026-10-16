@@ -1,6 +1,7 @@
 import { afterAll, beforeEach, describe, expect, it, mock, spyOn } from 'bun:test';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 
+import * as activity from './activity';
 import { App } from './App';
 import type { DayApps } from './apps';
 import * as frames from './frames';
@@ -25,6 +26,7 @@ const useOcrVersion = spyOn(ocrSearch, 'useOcrVersion');
 const getPendingFrames = spyOn(frames, 'getPendingFrames');
 const setViewerPosition = spyOn(viewerPosition, 'setViewerPosition');
 const useDayApps = spyOn(dayAppsHook, 'useDayApps');
+const toggleActivity = spyOn(activity, 'toggleActivity').mockResolvedValue(undefined);
 
 afterAll(() => {
   setViewerPosition.mockRestore();
@@ -38,6 +40,7 @@ afterAll(() => {
   useOcrVersion.mockRestore();
   getPendingFrames.mockRestore();
   useDayApps.mockRestore();
+  toggleActivity.mockRestore();
 });
 
 /**
@@ -222,14 +225,24 @@ describe('App', () => {
       await waitFor(() => expect(shownFrame()).toBe(frameUrl('2024-12-20', 9)));
     });
 
-    it('leaves the arrow keys to the day picker, open or closed', async () => {
+    it('steps frames with the arrow keys while the closed day picker has focus', async () => {
       mockLibrary({ '2024-12-20': 10, '2026-10-04': 3 });
       render(<App />);
       await waitFor(() => expect(position()).toBe('3 / 3'));
       fireEvent.keyDown(dayPicker(), { key: 'ArrowLeft' });
+      expect(position()).toBe('2 / 3');
+      await settleFrameTime();
+    });
+
+    it('leaves the arrow keys to the open day picker, except Cmd+arrows', async () => {
+      mockLibrary({ '2024-12-20': 10, '2026-10-04': 3 });
+      render(<App />);
+      await waitFor(() => expect(position()).toBe('3 / 3'));
       await openDayPicker();
       fireEvent.keyDown(screen.getByRole('listbox'), { key: 'ArrowLeft' });
       expect(position()).toBe('3 / 3');
+      fireEvent.keyDown(screen.getByRole('listbox'), { key: 'ArrowLeft', metaKey: true });
+      await waitFor(() => expect(dayPicker()).toHaveTextContent('2024-12-20'));
       await settleFrameTime();
     });
   });
@@ -635,6 +648,16 @@ describe('App', () => {
       await waitFor(() => expect(dayPicker()).toHaveTextContent('2026-10-04'));
       fireEvent.keyDown(findBar(), { key: 'ArrowLeft', metaKey: true });
       expect(dayPicker()).toHaveTextContent('2026-10-04');
+      await settleFrameTime();
+    });
+
+    it('toggles the Activity window on Option+Cmd+A, also from a dropdown', async () => {
+      mockLibrary({ '2026-10-04': 100 });
+      render(<App />);
+      toggleActivity.mockClear();
+      const event = fireEvent.keyDown(dayPicker(), { key: 'å', code: 'KeyA', metaKey: true, altKey: true });
+      expect(event).toBe(false);
+      expect(toggleActivity).toHaveBeenCalledTimes(1);
       await settleFrameTime();
     });
 
