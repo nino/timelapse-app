@@ -21,6 +21,8 @@ Tests:
 - `bun test` (also `bun run test`) / `bun run test:watch` / `bun run test:coverage` — Bun's own test runner with happy-dom; Tauri APIs are mocked. Filter with `bun test <path>` or `bun test -t <name>`. There is no Vitest; Vite and oxlint run under Node.
 - `cd src-tauri && cargo test` — Rust unit + Tauri command tests. Runs in cloud sessions: the SessionStart hook installs Tauri's Linux libraries and ffmpeg. On a Mac, run `bun run fetch:ffmpeg` once first, because the build needs the bundled ffmpeg. Single test: `cargo test <test_name>`; the frame-source crate alone: `cargo test -p frame_source`.
 
+**Before opening a PR, run the `pre-pr` skill** (`.claude/skills/pre-pr/SKILL.md`): it reviews your own diff, fixes what it finds and runs the CI checks.
+
 CI: `.github/workflows/ci.yml` runs on every PR and push to `main`. A Linux job runs lint, `bun run build` and `bun test`; a macOS job builds the frontend (`generate_context!` needs `dist/`), fetches the bundled ffmpeg, puts it on `PATH` for the tests, and runs `cargo test --workspace`.
 
 ## Architecture
