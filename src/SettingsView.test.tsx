@@ -65,4 +65,20 @@ describe('SettingsView', () => {
     await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('disk full'));
     expect(box).toBeChecked();
   });
+
+  it('leaves error reports off until turned on', async () => {
+    answer(async (cmd, args) =>
+      cmd === 'get_settings'
+        ? { updateAutomatically: true, sendErrorReports: false }
+        : { updateAutomatically: true, sendErrorReports: (args as { enabled: boolean }).enabled },
+    );
+    render(<SettingsView />);
+
+    const box = await screen.findByRole('checkbox', { name: /Send error reports/ });
+    expect(box).not.toBeChecked();
+    fireEvent.click(box);
+
+    expect(box).toBeChecked();
+    expect(invoke).toHaveBeenCalledWith('set_send_error_reports', { enabled: true });
+  });
 });

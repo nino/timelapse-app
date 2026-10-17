@@ -4940,7 +4940,9 @@ dependencies = [
  "objc2-core-foundation",
  "objc2-foundation",
  "objc2-vision",
+ "reqwest",
  "rusqlite",
+ "rustls",
  "screenshots",
  "serde",
  "serde_json",
@@ -4954,6 +4956,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

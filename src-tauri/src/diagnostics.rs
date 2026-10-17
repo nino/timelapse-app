@@ -5,7 +5,7 @@
 //! summaries), never one per frame. Recording one only sends it down a
 //! channel; a thread of its own writes whatever has queued up in one
 //! transaction, so no worker ever waits on the disk for it. Warnings and
-//! errors also go to stderr. Before `init` (and in tests) events go nowhere
+//! errors also go to stderr, and errors to PostHog (`analytics.rs`). Before `init` (and in tests) events go nowhere
 //! else.
 //!
 //! Rows older than `MAX_AGE`, and beyond the newest `MAX_ROWS`, are deleted
@@ -101,6 +101,9 @@ impl Event {
         if self.level != Level::Info {
             eprintln!("{}: {}", self.source, self.message);
         }
+        if self.level == Level::Error {
+            crate::analytics::exception(self.source, &self.message);
+        }
         if let Some(sink) = SINK.get() {
             let _ = sink.send(Message::Event(self));
         }
@@ -152,6 +155,7 @@ pub fn record_panics() {
         let thread = std::thread::current().name().unwrap_or("unnamed").to_string();
         error("panic", info.to_string()).data(json!({ "thread": thread })).record();
         flush(Duration::from_secs(1));
+        crate::analytics::flush(Duration::from_secs(2));
         previous(info);
     }));
 }

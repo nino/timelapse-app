@@ -6,6 +6,7 @@ export const SETTINGS_WINDOW = "settings";
 /** Mirrors `Settings` in `settings.rs`. */
 export type Settings = {
   updateAutomatically: boolean;
+  sendErrorReports: boolean;
 };
 
 export function getSettings(): Promise<Settings> {
@@ -15,6 +16,11 @@ export function getSettings(): Promise<Settings> {
 /** Saves the change and returns the settings as saved. */
 export function setUpdateAutomatically(enabled: boolean): Promise<Settings> {
   return invoke<Settings>("set_update_automatically", { enabled });
+}
+
+/** Saves the change and returns the settings as saved. */
+export function setSendErrorReports(enabled: boolean): Promise<Settings> {
+  return invoke<Settings>("set_send_error_reports", { enabled });
 }
 
 /** Makes the Settings window `by` logical pixels taller (shorter when negative) and shows it. */

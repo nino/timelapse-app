@@ -7,6 +7,7 @@
 //! call the logic directly.
 
 mod activity;
+mod analytics;
 mod app_state;
 mod boost;
 mod converter;
@@ -694,6 +695,13 @@ fn set_update_automatically(
     saved
 }
 
+#[tauri::command]
+fn set_send_error_reports(enabled: bool, settings: State<'_, SettingsStore>) -> Result<Settings, String> {
+    let saved = settings.update(|s| s.send_error_reports = enabled);
+    analytics::set_enabled(enabled);
+    saved
+}
+
 /// What the viewer showed when the app last quit.
 #[tauri::command]
 fn get_viewer_position(state: State<'_, AppStateStore>) -> ViewerPosition {
@@ -1117,6 +1125,10 @@ pub fn run() {
                     .map(|dir| dir.join(paths::TIMELAPSE_DIR_NAME)),
             ));
             restore_windows(app.handle())?;
+            let version = app.package_info().version.to_string();
+            let reports = app.state::<SettingsStore>().get().send_error_reports;
+            analytics::init(app.path().app_config_dir().ok().as_deref(), &version, reports);
+            analytics::capture("app started", serde_json::json!({}));
             updater::spawn(app.handle().clone());
 
             // Create the library up front. The frontend calls readDir on it
@@ -1272,6 +1284,7 @@ pub fn run() {
             log_frontend_error,
             get_settings,
             set_update_automatically,
+            set_send_error_reports,
             get_viewer_position,
             set_viewer_position,
             grow_settings_window,

@@ -14,12 +14,16 @@ pub struct Settings {
     /// Install new releases in the background (see `updater.rs`). "Check for
     /// Updates…" works either way.
     pub update_automatically: bool,
+    /// Send errors and an "app started" event to PostHog (`analytics.rs`).
+    /// Off unless someone turns it on.
+    pub send_error_reports: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Settings {
             update_automatically: true,
+            send_error_reports: false,
         }
     }
 }
@@ -89,6 +93,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let store = SettingsStore::load(Some(dir.path().to_path_buf()));
         assert!(store.get().update_automatically);
+        // Error reports are opt-in.
+        assert!(!store.get().send_error_reports);
     }
 
     #[test]

@@ -13,7 +13,8 @@ Each module's `//!` doc comment says how it works; this file is the map and the 
 - `day_status.rs` — whether OCR and video conversion have finished each day, for the day picker, and how many days and frames each has left, for the Activity window; from directory listings, `ocr_progress` and OCR's own count of video-only days, never by probing a video.
 - `day_apps.rs` — which app was in front across a day (recorded window, else the OCR'd menu bar), as scrubber stretches for the app filter.
 - `activity.rs`, `boost.rs` — what the Activity window shows, and Boost / Low power mode, which change how hard conversion and OCR may work.
-- `diagnostics.rs` — `<library>/diagnostics.db`, a log for Nino to upload when something looks wrong (there are no analytics).
+- `diagnostics.rs` — `<library>/diagnostics.db`, a log for Nino to upload when something looks wrong.
+- `analytics.rs` — only when "Send error reports" is on in Settings (off by default; never nag anyone to turn it on), release builds made with `POSTHOG_KEY`/`POSTHOG_HOST` send an "app started" event and every error-level diagnostics event to PostHog, anonymously and rate-limited. Never send library content (frames, OCR text, window titles) through it.
 - `app_state.rs`, `settings.rs`, `updater.rs`, `paths.rs` — remembered window and viewer state, preferences, auto-update, library and ffmpeg paths.
 
 ## Data model

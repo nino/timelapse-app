@@ -2,7 +2,13 @@ import React, { useCallback, useState } from "react";
 
 import "./App.css";
 import { useMountEffect } from "./hooks/useMountEffect";
-import { growSettingsWindow, getSettings, setUpdateAutomatically, type Settings } from "./settings";
+import {
+  growSettingsWindow,
+  getSettings,
+  setSendErrorReports,
+  setUpdateAutomatically,
+  type Settings,
+} from "./settings";
 import { focusRing } from "./ui";
 
 /**
@@ -40,11 +46,16 @@ export function SettingsView(): React.ReactNode {
     };
   }, [loaded]);
 
-  const toggleUpdates = (enabled: boolean): void => {
+  // Applied at once, put back if saving fails.
+  const toggle = (
+    change: Partial<Settings>,
+    save: (enabled: boolean) => Promise<Settings>,
+    enabled: boolean,
+  ): void => {
     const previous = settings;
-    setSettings((s) => (s ? { ...s, updateAutomatically: enabled } : s));
+    setSettings((s) => (s ? { ...s, ...change } : s));
     setError(null);
-    setUpdateAutomatically(enabled).then(setSettings, (e: unknown) => {
+    save(enabled).then(setSettings, (e: unknown) => {
       setSettings(previous);
       setError(String(e));
     });
@@ -58,22 +69,47 @@ export function SettingsView(): React.ReactNode {
         </p>
       )}
       {settings ? (
-        <section aria-label="Updates" className="rounded-xl border border-border bg-card px-4 py-3">
-          <label className="flex items-start gap-3">
-            <input
-              type="checkbox"
-              className={`mt-0.5 size-4 shrink-0 rounded accent-primary ${focusRing}`}
-              checked={settings.updateAutomatically}
-              onChange={(e) => toggleUpdates(e.currentTarget.checked)}
-            />
-            <span>
-              <span className="font-medium">Update automatically</span>
-              <span className="mt-0.5 block text-muted-fg">
-                Installs new versions in the background and relaunches when the window isn't in use.
+        <>
+          <section aria-label="Updates" className="rounded-xl border border-border bg-card px-4 py-3">
+            <label className="flex items-start gap-3">
+              <input
+                type="checkbox"
+                className={`mt-0.5 size-4 shrink-0 rounded accent-primary ${focusRing}`}
+                checked={settings.updateAutomatically}
+                onChange={(e) => {
+                  const enabled = e.currentTarget.checked;
+                  toggle({ updateAutomatically: enabled }, setUpdateAutomatically, enabled);
+                }}
+              />
+              <span>
+                <span className="font-medium">Update automatically</span>
+                <span className="mt-0.5 block text-muted-fg">
+                  Installs new versions in the background and relaunches when the window isn't in use.
+                </span>
               </span>
-            </span>
-          </label>
-        </section>
+            </label>
+          </section>
+          <section aria-label="Error reports" className="rounded-xl border border-border bg-card px-4 py-3">
+            <label className="flex items-start gap-3">
+              <input
+                type="checkbox"
+                className={`mt-0.5 size-4 shrink-0 rounded accent-primary ${focusRing}`}
+                checked={settings.sendErrorReports}
+                onChange={(e) => {
+                  const enabled = e.currentTarget.checked;
+                  toggle({ sendErrorReports: enabled }, setSendErrorReports, enabled);
+                }}
+              />
+              <span>
+                <span className="font-medium">Send error reports</span>
+                <span className="mt-0.5 block text-muted-fg">
+                  Sends error messages and the app version to the developer, to help fix bugs. Never your
+                  screenshots, their text or window titles.
+                </span>
+              </span>
+            </label>
+          </section>
+        </>
       ) : (
         !error && <p className="text-muted-fg">Loading…</p>
       )}
