@@ -61,10 +61,10 @@ export function SpeedPicker({
           <ListboxOption
             key={speed}
             value={speed}
-            className="flex h-7 cursor-default items-center justify-between gap-3 rounded-[11px] px-2.5 select-none data-focus:bg-muted data-selected:font-semibold"
+            className="flex h-7 cursor-default items-center gap-1.5 rounded-[11px] pr-2.5 pl-1.5 select-none data-focus:bg-muted data-selected:font-semibold"
           >
-            {speed} fps
             <Check />
+            {speed} fps
           </ListboxOption>
         ))}
       </ListboxOptions>
