@@ -19,6 +19,7 @@
     "noUnusedLocals": true,
     "noUnusedParameters": true,
     "noFallthroughCasesInSwitch": true,
+    "erasableSyntaxOnly": true,
 
     /* `bun:test` and the Bun globals the tests use */
     "types": ["bun"]
