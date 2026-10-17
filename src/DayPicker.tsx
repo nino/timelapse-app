@@ -64,13 +64,13 @@ function DayOptions({
         <ListboxOption
           key={date}
           value={date}
-          className="flex h-7 cursor-default items-center justify-between gap-3 rounded-[11px] px-2.5 select-none data-focus:bg-muted data-selected:font-semibold"
+          className="flex h-7 cursor-default items-center justify-between gap-3 rounded-[11px] pr-2.5 pl-1.5 select-none data-focus:bg-muted data-selected:font-semibold"
         >
-          {label(date)}
-          <span className="flex items-center gap-2">
-            <Status status={statuses.get(date)} />
+          <span className="flex items-center gap-1.5">
             <Check />
+            {label(date)}
           </span>
+          <Status status={statuses.get(date)} />
         </ListboxOption>
       ))}
     </ListboxOptions>
@@ -134,10 +134,12 @@ export function Chevron(): React.ReactNode {
   );
 }
 
-// Only shown on the selected option (ListboxOption sets data-selected).
+// Only shown on the selected option (ListboxOption sets data-selected). It
+// leads the option, as in macOS menus, so anything on the right (the day
+// picker's status marks) can sit at the edge.
 export function Check(): React.ReactNode {
   return (
-    <svg viewBox="0 0 16 16" aria-hidden="true" className="invisible size-3.5 in-data-selected:visible">
+    <svg viewBox="0 0 16 16" aria-hidden="true" className="invisible size-3.5 shrink-0 in-data-selected:visible">
       <path
         d="m3.5 8.5 3 3 6-7"
         fill="none"

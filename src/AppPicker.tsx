@@ -71,13 +71,13 @@ function AppOption({
   return (
     <ListboxOption
       value={value}
-      className="flex h-7 cursor-default items-center gap-2 rounded-[11px] px-2.5 select-none data-focus:bg-muted data-selected:font-semibold"
+      className="flex h-7 cursor-default items-center gap-2 rounded-[11px] pr-2.5 pl-1.5 select-none data-focus:bg-muted data-selected:font-semibold"
     >
+      <Check />
       <span className="min-w-0 flex-1 truncate">{label}</span>
       {detail !== undefined && (
         <span className="shrink-0 text-xs font-normal text-muted-fg tabular-nums">{detail}</span>
       )}
-      <Check />
     </ListboxOption>
   );
 }
