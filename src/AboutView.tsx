@@ -1,9 +1,10 @@
 import { getVersion } from "@tauri-apps/api/app";
-import React, { useEffect, useState } from "react";
+import React, { useState } from "react";
 
 import icon from "../src-tauri/icons/128x128@2x.png";
 import { byDay, formatDay, type ChangelogEntry } from "./about";
 import "./App.css";
+import { useMountEffect } from "./hooks/useMountEffect";
 
 /**
  * The About window (app menu → About Timelapse App): the app's name and
@@ -13,9 +14,9 @@ import "./App.css";
 export function AboutView({ changelog }: { changelog: ChangelogEntry[] }): React.ReactNode {
   const [version, setVersion] = useState<string | null>(null);
 
-  useEffect(() => {
+  useMountEffect(() => {
     getVersion().then(setVersion, (e: unknown) => console.error("Could not read the app version:", e));
-  }, []);
+  });
 
   return (
     <main className="min-h-screen bg-page p-4 text-sm flex flex-col gap-4">

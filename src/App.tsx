@@ -7,6 +7,8 @@ import { mergeCloseRanges, nextInRanges } from "./apps";
 import { DayPicker } from "./DayPicker";
 import { frameUrl, getFrameTime, type FrameRange, type FrameTime } from "./frames";
 import { useDayApps } from "./hooks/useDayApps";
+import { useLatestLoad } from "./hooks/useDirectoryChanges";
+import { useEventListener } from "./hooks/useEventListener";
 import { useDay, useDays } from "./hooks/useLibrary";
 import {
   useDayMatches,
@@ -15,6 +17,7 @@ import {
   useOcrVersion,
 } from "./hooks/useOcrSearch";
 import { usePendingFrames } from "./hooks/usePendingFrames";
+import { useTimeout } from "./hooks/useTimeout";
 import { PendingStretches } from "./PendingStretches";
 import { nextStop, previousStop, rangeAt, toStops, type DayMatch, type Stop } from "./search";
 import { savedPlaybackSpeed, savePlaybackSpeed, SpeedPicker, type PlaybackSpeed } from "./SpeedPicker";
@@ -96,15 +99,12 @@ export function App({
   const newestDay = days.length > 0 ? days[days.length - 1] : null;
 
   // Open the day the app showed when it last quit, or the newest day (today,
-  // while capturing) if that day is gone or there was none.
-  const restoredDay = React.useRef(initialPosition?.day ?? null);
-  React.useEffect(() => {
-    if (!selectedDay && newestDay) {
-      const restored = restoredDay.current;
-      restoredDay.current = null;
-      setSelectedDay(restored !== null && days.includes(restored) ? restored : newestDay);
-    }
-  }, [selectedDay, newestDay, days]);
+  // while capturing) if that day is gone or there was none. Nothing sets the
+  // selection back to null, so this happens once.
+  if (selectedDay === null && newestDay !== null) {
+    const restored = initialPosition?.day ?? null;
+    setSelectedDay(restored !== null && days.includes(restored) ? restored : newestDay);
+  }
 
   // Remember what is on screen for the next launch, once the viewer has
   // stayed put for a moment. Following the newest day's live edge is saved as
@@ -115,54 +115,35 @@ export function App({
   const savedIndex = followsLiveEdge ? null : currentIndex;
   // Until the selected day has loaded, `currentIndex` is a placeholder 0.
   const positionKnown = selectedDay !== null && frameCount > 0;
-  React.useEffect(() => {
-    if (!positionKnown) return;
-    const timer = setTimeout(() => {
+  useTimeout(
+    () => {
       setViewerPosition({ day: savedDay, index: savedIndex }).catch((error: unknown) => {
         console.error("Could not save the viewer position:", error);
       });
-    }, SAVE_POSITION_DELAY_MS);
-    return (): void => clearTimeout(timer);
-  }, [positionKnown, savedDay, savedIndex]);
+    },
+    positionKnown ? SAVE_POSITION_DELAY_MS : null,
+    `${savedDay}/${savedIndex}`,
+  );
 
   // Roll over to the new day at midnight, but only for someone who was
   // watching the live edge of the previous newest day.
-  const liveEdge = React.useRef({ selectedDay, followsLiveEdge });
-  React.useEffect(() => {
-    liveEdge.current = { selectedDay, followsLiveEdge };
-  }, [selectedDay, followsLiveEdge]);
-  const previousNewestDay = React.useRef(newestDay);
-  React.useEffect(() => {
-    const previous = previousNewestDay.current;
-    previousNewestDay.current = newestDay;
-    const viewer = liveEdge.current;
-    if (
-      previous &&
-      newestDay &&
-      newestDay !== previous &&
-      viewer.selectedDay === previous &&
-      viewer.followsLiveEdge
-    ) {
+  const [previousNewestDay, setPreviousNewestDay] = React.useState(newestDay);
+  if (newestDay !== previousNewestDay) {
+    setPreviousNewestDay(newestDay);
+    if (previousNewestDay && newestDay && selectedDay === previousNewestDay && followsLiveEdge) {
       setSelectedDay(newestDay);
     }
-  }, [newestDay]);
+  }
 
-  React.useEffect(() => {
-    // Left for another day before its matches arrived: forget the jump.
-    if (jumpToFirstMatch !== null && jumpToFirstMatch !== selectedDay) {
+  if (jumpToFirstMatch !== null) {
+    if (jumpToFirstMatch !== selectedDay) {
+      // Left for another day before its matches arrived: forget the jump.
       setJumpToFirstMatch(null);
-      return;
+    } else if (matches !== null && frameCount > 0) {
+      setJumpToFirstMatch(null);
+      if (stops.length > 0) goTo(stops[0].index);
     }
-    if (
-      jumpToFirstMatch === null ||
-      matches === null ||
-      frameCount === 0
-    ) {
-      return;
-    }
-    setJumpToFirstMatch(null);
-    if (stops.length > 0) goTo(stops[0].index);
-  }, [jumpToFirstMatch, selectedDay, matches, stops, frameCount, goTo]);
+  }
 
   const stepToMatch = React.useCallback(
     (direction: 1 | -1): void => {
@@ -174,59 +155,47 @@ export function App({
   );
 
   // ⌘F / Ctrl+F jumps to the find bar.
-  React.useEffect(() => {
-    const handleKeydown = (e: KeyboardEvent): void => {
-      if (e.key.toLowerCase() !== "f" || !(e.metaKey || e.ctrlKey)) return;
-      e.preventDefault();
-      findInput.current?.focus();
-      findInput.current?.select();
-    };
-    window.addEventListener("keydown", handleKeydown);
-    return (): void => window.removeEventListener("keydown", handleKeydown);
-  }, []);
+  useEventListener("keydown", (e) => {
+    if (e.key.toLowerCase() !== "f" || !(e.metaKey || e.ctrlKey)) return;
+    e.preventDefault();
+    findInput.current?.focus();
+    findInput.current?.select();
+  });
 
   // ⌥⌘A toggles the Activity window. That is the menu's shortcut, but it
   // didn't reach the menu while a dropdown had focus, so the page handles it
   // and keeps it from the menu; Rust ignores a second toggle straight after.
-  React.useEffect(() => {
-    const handleKeydown = (e: KeyboardEvent): void => {
-      if (e.code !== "KeyA" || !e.metaKey || !e.altKey || e.ctrlKey || e.shiftKey) return;
-      e.preventDefault();
-      void toggleActivity();
-    };
-    window.addEventListener("keydown", handleKeydown);
-    return (): void => window.removeEventListener("keydown", handleKeydown);
-  }, []);
+  useEventListener("keydown", (e) => {
+    if (e.code !== "KeyA" || !e.metaKey || !e.altKey || e.ctrlKey || e.shiftKey) return;
+    e.preventDefault();
+    void toggleActivity();
+  });
 
   // Keyboard: ←/→ by 1, Shift by 10, Option by 100; ⌘←/⌘→ (Ctrl elsewhere)
   // to the previous/next day.
-  React.useEffect(() => {
-    const handleKeydown = (e: KeyboardEvent): void => {
-      if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
-      // An open dropdown keeps its keys; a closed one, which ignores ←/→,
-      // passes them on. ⌘←/⌘→ always change the day.
-      const inOpenList = e.target instanceof Element && e.target.closest('[role="listbox"]');
-      if (inOpenList && !(e.metaKey || e.ctrlKey)) return;
-      // In the find bar they move the caret.
-      if (e.target instanceof HTMLInputElement && e.target.type !== "range") return;
-      const direction = e.key === "ArrowLeft" ? -1 : 1;
-      if (e.metaKey || e.ctrlKey) {
-        e.preventDefault();
-        // `days` runs oldest to newest.
-        const at = selectedDay === null ? -1 : days.indexOf(selectedDay);
-        const next = at === -1 ? undefined : days[at + direction];
-        if (next !== undefined) setSelectedDay(next);
-        return;
-      }
-      if (frameCount === 0) return;
-      // Also stops a focused slider from taking its own 1-frame step on top.
+  useEventListener("keydown", (e) => {
+    if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+    // An open dropdown keeps its keys; a closed one, which ignores ←/→,
+    // passes them on. ⌘←/⌘→ always change the day.
+    const inOpenList = e.target instanceof Element && e.target.closest('[role="listbox"]');
+    if (inOpenList && !(e.metaKey || e.ctrlKey)) return;
+    // In the find bar they move the caret.
+    if (e.target instanceof HTMLInputElement && e.target.type !== "range") return;
+    const direction = e.key === "ArrowLeft" ? -1 : 1;
+    if (e.metaKey || e.ctrlKey) {
       e.preventDefault();
-      const step = e.altKey ? 100 : e.shiftKey ? 10 : 1;
-      goTo(Math.min(frameCount - 1, Math.max(0, currentIndex + direction * step)));
-    };
-    window.addEventListener("keydown", handleKeydown);
-    return (): void => window.removeEventListener("keydown", handleKeydown);
-  }, [days, selectedDay, frameCount, currentIndex, goTo]);
+      // `days` runs oldest to newest.
+      const at = selectedDay === null ? -1 : days.indexOf(selectedDay);
+      const next = at === -1 ? undefined : days[at + direction];
+      if (next !== undefined) setSelectedDay(next);
+      return;
+    }
+    if (frameCount === 0) return;
+    // Also stops a focused slider from taking its own 1-frame step on top.
+    e.preventDefault();
+    const step = e.altKey ? 100 : e.shiftKey ? 10 : 1;
+    goTo(Math.min(frameCount - 1, Math.max(0, currentIndex + direction * step)));
+  });
 
   const wantedSrc =
     selectedDay && frameCount > 0 ? frameUrl(selectedDay, currentIndex) : null;
@@ -257,27 +226,24 @@ export function App({
   const highlights =
     currentMatch && loaded === wantedSrc && !frameFailed ? (matchLines ?? []) : [];
 
-  // Capture time of the frame on screen.
-  React.useEffect(() => {
-    if (!selectedDay || frameCount === 0) {
-      setFrameTime(null);
-      return;
-    }
-    let cancelled = false;
-    getFrameTime(selectedDay, currentIndex).then(
-      (time) => {
-        if (!cancelled) setFrameTime(time);
-      },
-      (error: unknown) => {
-        if (cancelled) return;
+  // Capture time of the frame on screen. The last one stays up while the
+  // next loads, so scrubbing doesn't flicker "--:--".
+  const loadFrameTime = React.useCallback(
+    async (isCurrent: () => boolean): Promise<void> => {
+      if (!selectedDay || frameCount === 0) return;
+      try {
+        const time = await getFrameTime(selectedDay, currentIndex);
+        if (isCurrent()) setFrameTime(time);
+      } catch (error) {
+        if (!isCurrent()) return;
         console.error("Error fetching frame time:", error);
         setFrameTime(null);
-      },
-    );
-    return (): void => {
-      cancelled = true;
-    };
-  }, [selectedDay, currentIndex, frameCount]);
+      }
+    },
+    [selectedDay, currentIndex, frameCount],
+  );
+  useLatestLoad(loadFrameTime);
+  const shownFrameTime = selectedDay && frameCount > 0 ? frameTime : null;
 
   const error = daysError ?? dayError;
   if (error) {
@@ -503,9 +469,9 @@ export function App({
           </div>
           <div
             className="text-sm font-medium text-muted-fg min-w-[60px] text-center tabular-nums"
-            title={frameTime && !frameTime.exact ? "Estimated" : undefined}
+            title={shownFrameTime && !shownFrameTime.exact ? "Estimated" : undefined}
           >
-            {formatFrameTime(frameTime)}
+            {formatFrameTime(shownFrameTime)}
           </div>
         </div>
       </div>
@@ -647,12 +613,9 @@ function OtherDays({
 }
 
 /** `value`, once it has stopped changing for `delayMs`. */
-function useDebounced<T>(value: T, delayMs: number): T {
+function useDebounced(value: string, delayMs: number): string {
   const [settled, setSettled] = React.useState(value);
-  React.useEffect(() => {
-    const timer = setTimeout(() => setSettled(value), delayMs);
-    return (): void => clearTimeout(timer);
-  }, [value, delayMs]);
+  useTimeout(() => setSettled(value), value === settled ? null : delayMs, value);
   return settled;
 }
 
@@ -695,13 +658,33 @@ function usePlayback({
   const next = nextFrame(currentIndex);
   const atEnd = next === null;
   const playing = playingDay !== null && playingDay === selectedDay && !atEnd;
-  const lastStepAt = React.useRef(0);
+  // Each step waits for `frameMs` to pass since the last one (`due`) and for
+  // its frame to be on screen, whichever comes last, so slow loads use up the
+  // wait instead of adding to it.
+  const [steps, setSteps] = React.useState(0);
+  const [due, setDue] = React.useState(false);
+  const step = (to: number): void => {
+    setDue(false);
+    setSteps((n) => n + 1);
+    goTo(to);
+    if (nextFrame(to) === null) setPlayingDay(null);
+  };
+  useTimeout(
+    () => {
+      if (frameShown && next !== null) step(next);
+      else setDue(true);
+    },
+    playing && !due ? frameMs : null,
+    steps,
+  );
   // Scrubbed past the end (or the filter's last stretch): stop for good, so
   // nothing starts playing by itself if the end moves later on. Set during
   // render, as React allows for state derived from earlier renders.
   if (playingDay !== null && atEnd) setPlayingDay(null);
+  // The wait is over and the frame has just arrived.
+  if (playing && due && frameShown && next !== null) step(next);
 
-  const togglePlaying = React.useCallback((): void => {
+  const togglePlaying = (): void => {
     if (playing) {
       setPlayingDay(null);
       return;
@@ -713,46 +696,31 @@ function usePlayback({
       if (first === undefined || first >= frameCount) return;
       goTo(first);
     }
-    lastStepAt.current = 0;
+    // The first frame shows as soon as it has loaded.
+    setDue(true);
     setPlayingDay(selectedDay);
-  }, [playing, selectedDay, frameCount, atEnd, ranges, goTo]);
-
-  React.useEffect(() => {
-    if (!playing || !frameShown || next === null) return;
-    const wait = Math.max(0, lastStepAt.current + frameMs - performance.now());
-    const timer = setTimeout((): void => {
-      lastStepAt.current = performance.now();
-      goTo(next);
-      if (nextFrame(next) === null) setPlayingDay(null);
-    }, wait);
-    return (): void => clearTimeout(timer);
-  }, [playing, frameShown, next, nextFrame, frameMs, goTo]);
+  };
 
   // Nobody is watching a hidden or minimised window: stop rather than keep
   // loading frames.
-  React.useEffect(() => {
-    if (!playing) return;
-    const handleVisibility = (): void => {
+  useEventListener(
+    "visibilitychange",
+    () => {
       if (document.hidden) setPlayingDay(null);
-    };
-    document.addEventListener("visibilitychange", handleVisibility);
-    return (): void => document.removeEventListener("visibilitychange", handleVisibility);
-  }, [playing]);
+    },
+    "document",
+  );
 
   // Space plays and pauses, except where it types or presses a button.
-  React.useEffect(() => {
-    const handleKeydown = (e: KeyboardEvent): void => {
-      if (e.key !== " " || e.metaKey || e.ctrlKey || e.altKey) return;
-      if (e.target instanceof Element) {
-        if (e.target.closest('button, [role="listbox"], [aria-haspopup="listbox"], textarea')) return;
-        if (e.target instanceof HTMLInputElement && e.target.type !== "range") return;
-      }
-      e.preventDefault();
-      togglePlaying();
-    };
-    window.addEventListener("keydown", handleKeydown);
-    return (): void => window.removeEventListener("keydown", handleKeydown);
-  }, [togglePlaying]);
+  useEventListener("keydown", (e) => {
+    if (e.key !== " " || e.metaKey || e.ctrlKey || e.altKey) return;
+    if (e.target instanceof Element) {
+      if (e.target.closest('button, [role="listbox"], [aria-haspopup="listbox"], textarea')) return;
+      if (e.target instanceof HTMLInputElement && e.target.type !== "range") return;
+    }
+    e.preventDefault();
+    togglePlaying();
+  });
 
   return { playing, togglePlaying };
 }
@@ -773,45 +741,36 @@ function useGatedImage(wanted: string | null): {
   onLoad: () => void;
   onError: () => void;
 } {
-  const [src, setSrc] = React.useState<string | null>(null);
-  const [frameFailed, setFrameFailed] = React.useState(false);
-  const [loaded, setLoaded] = React.useState<string | null>(null);
-  const [settled, setSettled] = React.useState<string | null>(null);
-  const srcRef = React.useRef<string | null>(null);
-  const wantedRef = React.useRef<string | null>(wanted);
-  const inFlight = React.useRef(false);
+  const [state, setState] = React.useState<{
+    src: string | null;
+    /** Whether `src` is still loading. */
+    inFlight: boolean;
+    frameFailed: boolean;
+    loaded: string | null;
+    settled: string | null;
+  }>({ src: null, inFlight: false, frameFailed: false, loaded: null, settled: null });
 
-  const show = React.useCallback((next: string | null): void => {
-    srcRef.current = next;
-    inFlight.current = next !== null;
-    setSrc(next);
+  // Nothing loading: show the wanted frame. Otherwise the load that finishes
+  // brings this round again.
+  if (!state.inFlight && wanted !== state.src) {
+    setState({ ...state, src: wanted, inFlight: wanted !== null });
+  }
+
+  const settle = React.useCallback((failed: boolean): void => {
+    setState((s) => ({
+      ...s,
+      inFlight: false,
+      frameFailed: failed,
+      settled: s.src,
+      loaded: failed ? s.loaded : s.src,
+    }));
   }, []);
 
-  React.useEffect(() => {
-    wantedRef.current = wanted;
-    if (!inFlight.current && wanted !== srcRef.current) {
-      show(wanted);
-    }
-  }, [wanted, show]);
-
-  const settle = React.useCallback(
-    (failed: boolean): void => {
-      inFlight.current = false;
-      setFrameFailed(failed);
-      setSettled(srcRef.current);
-      if (!failed) setLoaded(srcRef.current);
-      if (wantedRef.current !== srcRef.current) {
-        show(wantedRef.current);
-      }
-    },
-    [show],
-  );
-
   return {
-    src,
-    frameFailed,
-    loaded,
-    settled,
+    src: state.src,
+    frameFailed: state.frameFailed,
+    loaded: state.loaded,
+    settled: state.settled,
     onLoad: React.useCallback((): void => settle(false), [settle]),
     onError: React.useCallback((): void => settle(true), [settle]),
   };

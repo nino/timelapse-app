@@ -2,6 +2,7 @@ import React from "react";
 
 import { getDayApps, type DayApps } from "../apps";
 import { useAnswer } from "./useOcrSearch";
+import { useTimeout } from "./useTimeout";
 
 // While an app is picked, its stretches are re-asked at most this often, as
 // new captures come in or OCR reads older frames' menu bars.
@@ -19,29 +20,27 @@ export function useDayApps(
   active: boolean,
 ): DayApps | null {
   const changes = useThrottled(`${ocrVersion}:${frameCount}`, REFRESH_MS);
-  const { value, error } = useAnswer(
+  const { value } = useAnswer(
     date !== null && frameCount > 0 ? date : null,
     active ? changes : "",
     (): Promise<DayApps> => getDayApps(date ?? ""),
+    (error) => console.warn("Could not find the day's apps:", error),
   );
-  React.useEffect(() => {
-    if (error) console.warn("Could not find the day's apps:", error);
-  }, [error]);
   return value;
 }
 
-/** `value`, changing at most once every `intervalMs`, to its latest. */
-function useThrottled<T>(value: T, intervalMs: number): T {
+/**
+ * `value`, changing at most once every `intervalMs`, to its latest. The first
+ * change after a quiet spell shows straight away.
+ */
+function useThrottled(value: string, intervalMs: number): string {
   const [shown, setShown] = React.useState(value);
-  const shownAt = React.useRef(0);
-  React.useEffect(() => {
-    if (Object.is(value, shown)) return;
-    const wait = Math.max(0, shownAt.current + intervalMs - Date.now());
-    const timer = setTimeout((): void => {
-      shownAt.current = Date.now();
-      setShown(value);
-    }, wait);
-    return (): void => clearTimeout(timer);
-  }, [value, shown, intervalMs]);
+  // Whether `shown` changed less than `intervalMs` ago.
+  const [cooling, setCooling] = React.useState(false);
+  if (value !== shown && !cooling) {
+    setShown(value);
+    setCooling(true);
+  }
+  useTimeout(() => setCooling(false), cooling ? intervalMs : null, shown);
   return shown;
 }

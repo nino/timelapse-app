@@ -3,6 +3,7 @@ import React from "react";
 import { getDay, getDayStatuses, listDays, type Day, type DayStatus } from "../frames";
 import { timelapseRoot } from "../timelapseRoot";
 import { useDirectoryChanges, useLatestLoad } from "./useDirectoryChanges";
+import { useInterval } from "./useInterval";
 
 export function ensureError(val: unknown): Error {
   if (val instanceof Error) {
@@ -53,25 +54,23 @@ const DAY_STATUS_INTERVAL_MS = 5000;
 export function useDayStatuses(open: boolean): Map<string, DayStatus> {
   const [statuses, setStatuses] = React.useState<Map<string, DayStatus>>(() => new Map());
 
-  React.useEffect(() => {
-    if (!open) return;
-    let current = true;
-    const load = async (): Promise<void> => {
+  const load = React.useCallback(
+    async (isCurrent: () => boolean): Promise<void> => {
+      if (!open) return;
       try {
         const list = await getDayStatuses();
-        if (!current) return;
+        if (!isCurrent()) return;
         setStatuses((previous) => (sameStatuses(previous, list) ? previous : byDate(list)));
       } catch (error) {
         console.warn("Could not read day statuses:", error);
       }
-    };
-    void load();
-    const timer = setInterval(() => void load(), DAY_STATUS_INTERVAL_MS);
-    return (): void => {
-      current = false;
-      clearInterval(timer);
-    };
-  }, [open]);
+    },
+    [open],
+  );
+  // Asked on opening and every few seconds while open. The ticks don't drop
+  // each other's answers, so a slow answer still lands.
+  useLatestLoad(load);
+  useInterval(() => void load(() => true), open ? DAY_STATUS_INTERVAL_MS : null);
 
   return statuses;
 }

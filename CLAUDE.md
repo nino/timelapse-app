@@ -57,5 +57,6 @@ CI: `.github/workflows/ci.yml` runs on every PR and push to `main`. A Linux job 
 - `import/no-default-export: error` — use named exports. `*.config.ts` / `*.config.js` and `scripts/**` are exempted via an `overrides` block (config files must default-export).
 - `no-console: warn` with `warn`/`error` allowed (so `console.log` is a lint warning, not silently fine). Off under `scripts/**`, which is CLI output.
 - oxlint's `correctness` category is on as `error`; `react/set-state-in-effect` is demoted to `warn` because some hooks trip it.
+- **No effects.** `useEffect`, `useLayoutEffect` and `useInsertionEffect` are banned outside the effect hooks in `src/hooks/`: `useMountEffect`, `useEventListener`, `useInterval`, `useTimeout`, and `useDirectoryChanges`/`useLatestLoad` (the allowlist is in `.oxlintrc.json`). Derive state during render, act in the event handler, use a ref callback, or build on one of those hooks.
 - `src-tauri/**` is in `ignorePatterns` — don't try to lint Rust through bun.
 - Imports are alphabetised and grouped by hand; oxlint has no `import/order` rule to check it.

@@ -19,10 +19,7 @@ export function useDirectoryChanges(
   path: string | null,
   onChange: () => void,
 ): void {
-  const onChangeRef = React.useRef(onChange);
-  React.useEffect(() => {
-    onChangeRef.current = onChange;
-  }, [onChange]);
+  const onChangeEvent = React.useEffectEvent(onChange);
 
   React.useEffect(() => {
     if (!path) {
@@ -33,7 +30,7 @@ export function useDirectoryChanges(
     let unwatch: UnwatchFn | null = null;
     let pollTimer: ReturnType<typeof setInterval> | null = null;
 
-    watch(path, () => onChangeRef.current(), {
+    watch(path, () => onChangeEvent(), {
       baseDir: BaseDirectory.Home,
       delayMs: WATCH_DEBOUNCE_MS,
     }).then(
@@ -48,7 +45,7 @@ export function useDirectoryChanges(
       (error: unknown) => {
         if (disposed) return;
         console.warn(`Could not watch ${path}, polling instead:`, error);
-        pollTimer = setInterval(() => onChangeRef.current(), POLL_INTERVAL_MS);
+        pollTimer = setInterval(() => onChangeEvent(), POLL_INTERVAL_MS);
       },
     );
 

@@ -1,6 +1,7 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useCallback, useState } from "react";
 
 import "./App.css";
+import { useMountEffect } from "./hooks/useMountEffect";
 import { growSettingsWindow, getSettings, setUpdateAutomatically, type Settings } from "./settings";
 import { focusRing } from "./ui";
 
@@ -11,18 +12,17 @@ import { focusRing } from "./ui";
 export function SettingsView(): React.ReactNode {
   const [settings, setSettings] = useState<Settings | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const main = useRef<HTMLElement>(null);
   const loaded = settings !== null || error !== null;
 
-  useEffect(() => {
+  useMountEffect(() => {
     getSettings().then(setSettings, (e: unknown) => setError(String(e)));
-  }, []);
+  });
 
   // The window is exactly as tall as its content, so the margin below the
   // card matches the margin above it. Refitted whenever the content's height
-  // changes, which includes the fonts arriving and rewrapping the text.
-  useEffect(() => {
-    const content = main.current;
+  // changes, which includes the fonts arriving and rewrapping the text. A new
+  // callback once loaded, so React attaches it again and it starts fitting.
+  const main = useCallback((content: HTMLElement | null): (() => void) | undefined => {
     if (!loaded || !content) return;
     const fit = (): void => {
       const by = Math.ceil(content.getBoundingClientRect().height) - window.innerHeight;
