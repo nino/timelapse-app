@@ -22,6 +22,15 @@ export function SettingsView(): React.ReactNode {
 
   useMountEffect(() => {
     getSettings().then(setSettings, (e: unknown) => setError(String(e)));
+    // The window is fitted to the content, so it never needs a scrollbar. One
+    // flashing in while the fit catches up narrows the content, which rewraps
+    // the text, changes its height and sets off another fit, so the
+    // scrollbar flickered on and off until the two happened to agree.
+    const root = document.documentElement;
+    root.style.overflow = "hidden";
+    return (): void => {
+      root.style.overflow = "";
+    };
   });
 
   // The window is exactly as tall as its content, so the margin below the

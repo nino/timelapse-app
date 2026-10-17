@@ -36,6 +36,15 @@ describe('SettingsView', () => {
     );
   });
 
+  it('never shows a scrollbar, which would rewrap the text and refit the window', async () => {
+    mocked(invoke).mockResolvedValue({ updateAutomatically: true });
+    const { unmount } = render(<SettingsView />);
+
+    expect(document.documentElement.style.overflow).toBe('hidden');
+    unmount();
+    expect(document.documentElement.style.overflow).toBe('');
+  });
+
   it('saves a change as soon as it is made', async () => {
     answer(async (cmd, args) =>
       cmd === 'get_settings'
