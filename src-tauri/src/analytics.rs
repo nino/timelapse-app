@@ -11,7 +11,8 @@
 //! What is sent: "app started" with the version, OS and architecture, and
 //! every error the diagnostics log records (`diagnostics::Level::Error`:
 //! background failures, panics and the page's uncaught errors), as a PostHog
-//! exception with its source and message. Nothing from the library leaves the
+//! exception with its source and message (home folder replaced by `~`,
+//! capped at `MAX_MESSAGE` characters). Nothing from the library leaves the
 //! machine: no frames, no OCR text, no window titles. Events carry a random id,
 //! made on the first send and kept in the config directory until reports are
 //! turned off, and create no person profile.
@@ -115,8 +116,23 @@ pub fn capture(name: &str, properties: Value) {
 /// Queue an error as a PostHog exception.
 pub fn exception(source: &str, message: &str) {
     if SINK.get().is_some() {
-        capture("$exception", exception_properties(source, message));
+        let home = dirs::home_dir();
+        let message = scrub(message, home.as_deref().and_then(Path::to_str));
+        capture("$exception", exception_properties(source, &message));
     }
+}
+
+/// Longest message sent, in characters.
+const MAX_MESSAGE: usize = 1000;
+
+/// Paths in error messages name the account (`/Users/<name>/…`), so the home
+/// folder becomes `~`; and a message is cut at `MAX_MESSAGE` characters.
+fn scrub(message: &str, home: Option<&str>) -> String {
+    let message = match home.map(|h| h.trim_end_matches('/')).filter(|h| h.len() > 1) {
+        Some(home) => message.replace(home, "~"),
+        None => message.to_string(),
+    };
+    message.chars().take(MAX_MESSAGE).collect()
 }
 
 /// Wait up to `timeout` for every event queued so far to be sent. For a panic,
@@ -292,6 +308,18 @@ mod tests {
         let first = install_id(Some(&path));
         assert_eq!(install_id(Some(&path)), first);
         assert_ne!(install_id(None), first);
+    }
+
+    #[test]
+    fn scrub_hides_the_home_folder_and_caps_length() {
+        assert_eq!(
+            scrub("cannot open /Users/nino/Timelapse/x.png", Some("/Users/nino/")),
+            "cannot open ~/Timelapse/x.png"
+        );
+        assert_eq!(scrub("no home", None), "no home");
+        // A home of "/" would turn every slash into "~".
+        assert_eq!(scrub("/a/b", Some("/")), "/a/b");
+        assert_eq!(scrub(&"x".repeat(5000), None).chars().count(), MAX_MESSAGE);
     }
 
     #[test]
