@@ -199,9 +199,11 @@ jobs:
           APPLE_API_KEY_PATH: ${{ runner.temp }}/apple-api-key.p8
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          # Baked into the build by `analytics.rs`; without them it sends nothing.
-          POSTHOG_KEY: ${{ secrets.POSTHOG_KEY }}
-          POSTHOG_HOST: ${{ secrets.POSTHOG_HOST }}
+          # Baked into the build by `analytics.rs`, which sends only when
+          # "Send error reports" is on. PostHog project keys are public (they
+          # only allow sending events), so this one isn't a secret.
+          POSTHOG_KEY: phc_khU8oAxkqoNVCHp5euLyyWCQ4W3sBAMrJnTtZGKgcWwA
+          POSTHOG_HOST: https://eu.i.posthog.com
         run: |
           if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ]; then
             echo "::error::TAURI_SIGNING_PRIVATE_KEY is not set"

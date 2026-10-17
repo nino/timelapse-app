@@ -1,15 +1,20 @@
-//! Error reports and a launch event, sent to PostHog.
+//! Error reports and a launch event, sent to PostHog, only for someone who
+//! turned on "Send error reports" in Settings (`Settings::send_error_reports`,
+//! off by default). Nothing is sent, or queued for later, while it is off, and
+//! the app never asks anyone to turn it on.
 //!
 //! Only release builds whose compile environment set `POSTHOG_KEY` and
-//! `POSTHOG_HOST` send anything (the release workflow sets both from
-//! repository secrets); dev builds, tests and local `tauri build`s never do.
+//! `POSTHOG_HOST` can send anything (the release workflow sets both; a
+//! PostHog project key is public); dev builds, tests and local `tauri build`s
+//! never do.
 //!
 //! What is sent: "app started" with the version, OS and architecture, and
 //! every error the diagnostics log records (`diagnostics::Level::Error`:
 //! background failures, panics and the page's uncaught errors), as a PostHog
 //! exception with its source and message. Nothing from the library leaves the
-//! machine: no frames, no OCR text, no window titles. Events carry a random id
-//! kept in the config directory and create no person profile.
+//! machine: no frames, no OCR text, no window titles. Events carry a random id,
+//! made on the first send and kept in the config directory until reports are
+//! turned off, and create no person profile.
 //!
 //! Like the diagnostics log, `capture` only sends an event down a channel; a
 //! thread of its own posts it, so no worker ever waits on the network. At most
@@ -17,7 +22,8 @@
 //! can't flood the project; the rest are dropped.
 
 use serde_json::{json, Map, Value};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -35,12 +41,30 @@ const ID_FILE: &str = "analytics-id";
 enum Message {
     Event { name: String, properties: Value },
     Flush(Sender<()>),
+    /// Reports were turned off: forget the install id.
+    Forget,
 }
 
 static SINK: OnceLock<Sender<Message>> = OnceLock::new();
 
-/// Start sending, if this build is meant to. Later calls do nothing.
-pub fn init(config_dir: Option<&Path>, version: &str) {
+/// Whether the person opted in. Mirrors `Settings::send_error_reports`.
+static ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Follow the "Send error reports" setting. Turning it off drops whatever is
+/// still queued and deletes the install id.
+pub fn set_enabled(enabled: bool) {
+    let was = ENABLED.swap(enabled, Ordering::SeqCst);
+    if was && !enabled {
+        if let Some(sink) = SINK.get() {
+            let _ = sink.send(Message::Forget);
+        }
+    }
+}
+
+/// Start the sender, if this build can send. `enabled` is the saved setting.
+/// Later calls do nothing.
+pub fn init(config_dir: Option<&Path>, version: &str, enabled: bool) {
+    set_enabled(enabled);
     let (Some(key), Some(host)) = (configured(KEY), configured(HOST)) else {
         return;
     };
@@ -62,7 +86,8 @@ pub fn init(config_dir: Option<&Path>, version: &str) {
         },
         url: format!("{}/i/v0/e/", host.trim_end_matches('/')),
         key: key.to_string(),
-        distinct_id: install_id(config_dir),
+        id_file: config_dir.map(|dir| dir.join(ID_FILE)),
+        distinct_id: None,
         common: common_properties(version),
     };
     let (send, receive) = mpsc::channel();
@@ -76,8 +101,12 @@ pub fn init(config_dir: Option<&Path>, version: &str) {
     }
 }
 
-/// Queue an event. Never blocks; does nothing unless `init` started sending.
+/// Queue an event. Never blocks; does nothing unless `init` started sending
+/// and reports are turned on.
 pub fn capture(name: &str, properties: Value) {
+    if !ENABLED.load(Ordering::SeqCst) {
+        return;
+    }
     if let Some(sink) = SINK.get() {
         let _ = sink.send(Message::Event { name: name.to_string(), properties });
     }
@@ -107,9 +136,8 @@ fn configured(value: Option<&'static str>) -> Option<&'static str> {
 
 /// This install's random id, created on first use. Without a config directory
 /// (or if it can't be written) each run gets a fresh one.
-fn install_id(config_dir: Option<&Path>) -> String {
-    let path = config_dir.map(|dir| dir.join(ID_FILE));
-    if let Some(id) = path.as_ref().and_then(|p| std::fs::read_to_string(p).ok()) {
+fn install_id(path: Option<&Path>) -> String {
+    if let Some(id) = path.and_then(|p| std::fs::read_to_string(p).ok()) {
         let id = id.trim();
         if !id.is_empty() {
             return id.to_string();
@@ -187,29 +215,41 @@ struct Poster {
     client: reqwest::Client,
     url: String,
     key: String,
-    distinct_id: String,
+    id_file: Option<PathBuf>,
+    /// Read or made on the first send, so nobody who never opts in gets one.
+    distinct_id: Option<String>,
     common: Map<String, Value>,
 }
 
 impl Poster {
-    fn run(self, receiver: Receiver<Message>) {
+    fn run(mut self, receiver: Receiver<Message>) {
         let mut limiter = Limiter::new(Instant::now());
         for message in receiver {
             match message {
+                // Checked again here: reports may have been turned off since
+                // the event was queued.
                 Message::Event { name, properties } => {
-                    if limiter.allow(Instant::now()) {
+                    if ENABLED.load(Ordering::SeqCst) && limiter.allow(Instant::now()) {
                         self.send(&name, properties);
                     }
                 }
                 Message::Flush(done) => {
                     let _ = done.send(());
                 }
+                Message::Forget => {
+                    self.distinct_id = None;
+                    if let Some(path) = &self.id_file {
+                        let _ = std::fs::remove_file(path);
+                    }
+                }
             }
         }
     }
 
-    fn send(&self, name: &str, properties: Value) {
-        let body = payload(&self.key, &self.distinct_id, &self.common, name, properties);
+    fn send(&mut self, name: &str, properties: Value) {
+        let id_file = self.id_file.as_deref();
+        let distinct_id = self.distinct_id.get_or_insert_with(|| install_id(id_file));
+        let body = payload(&self.key, distinct_id, &self.common, name, properties);
         let request = self.client.post(&self.url).json(&body).send();
         if let Err(e) = tauri::async_runtime::block_on(request).and_then(|r| r.error_for_status()) {
             // Not a diagnostics error: that would be sent here again.
@@ -248,8 +288,9 @@ mod tests {
     #[test]
     fn install_id_is_kept() {
         let dir = tempfile::TempDir::new().unwrap();
-        let first = install_id(Some(dir.path()));
-        assert_eq!(install_id(Some(dir.path())), first);
+        let path = dir.path().join(ID_FILE);
+        let first = install_id(Some(&path));
+        assert_eq!(install_id(Some(&path)), first);
         assert_ne!(install_id(None), first);
     }
 
