@@ -697,9 +697,18 @@ fn set_update_automatically(
 
 #[tauri::command]
 fn set_send_error_reports(enabled: bool, settings: State<'_, SettingsStore>) -> Result<Settings, String> {
-    let saved = settings.update(|s| s.send_error_reports = enabled);
-    analytics::set_enabled(enabled);
-    saved
+    match settings.update(|s| s.send_error_reports = enabled) {
+        Ok(saved) => {
+            analytics::set_enabled(enabled);
+            Ok(saved)
+        }
+        Err(e) => {
+            // The page puts the switch back when saving fails, so take the
+            // change back here too rather than send with the switch shown off.
+            let _ = settings.update(|s| s.send_error_reports = !enabled);
+            Err(e)
+        }
+    }
 }
 
 /// What the viewer showed when the app last quit.
