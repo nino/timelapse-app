@@ -51,11 +51,34 @@ export function ActivityView(): React.ReactNode {
           <Capture capture={activity.capture} now={now} />
           <Conversion conversion={activity.conversion} now={now} />
           <Ocr ocr={activity.ocr} now={now} />
+          <ErrorTest />
         </>
       ) : (
         !error && <p className="text-muted-fg">Loading…</p>
       )}
     </main>
+  );
+}
+
+// Throws a test error, to check that error reports reach PostHog. The
+// window's error listener (`diagnostics.ts`) logs it like any other
+// frontend error, and a release build with "Send error reports" on sends it.
+function ErrorTest(): React.ReactNode {
+  return (
+    <Section
+      title="Error reports"
+      footer={
+        <button
+          type="button"
+          onClick={(): void => {
+            throw new Error("Test error from the Activity window");
+          }}
+          className={`mt-2 ${plainButton}`}
+        >
+          Throw a test error
+        </button>
+      }
+    />
   );
 }
 
