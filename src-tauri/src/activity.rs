@@ -467,10 +467,11 @@ impl Activity {
         }
     }
 
-    /// A frame OCR failed on and said it would try again has now been read:
-    /// the error saying so starts with `retry_message`, and is cleared if it
-    /// is still the last one, since nothing is wrong any more.
-    pub fn ocr_retry_worked(&self, retry_message: &str) {
+    /// A frame OCR failed on and said it would try again has now been read,
+    /// or the recognizer has read another frame (`why` says which): the
+    /// error saying so starts with `retry_message`, and is cleared if it is
+    /// still the last one, since nothing is stuck any more.
+    pub fn ocr_retry_worked(&self, retry_message: &str, why: &str) {
         let mut cleared = false;
         self.update(|s| {
             if s.ocr.last_error.as_ref().is_some_and(|e| e.message.starts_with(retry_message)) {
@@ -479,7 +480,7 @@ impl Activity {
             }
         });
         if cleared {
-            diagnostics::info("ocr", format!("{}: read on a later try", retry_message)).record();
+            diagnostics::info("ocr", format!("{}: {}", retry_message, why)).record();
         }
     }
 
@@ -535,9 +536,9 @@ mod tests {
     fn a_retry_that_works_clears_its_error_only() {
         let activity = Activity::default();
         activity.ocr_failed("Could not read day frame 7, will try again: broken".into());
-        activity.ocr_retry_worked("Could not read day frame 8, will try again");
+        activity.ocr_retry_worked("Could not read day frame 8, will try again", "read");
         assert!(activity.snapshot(false, || true).ocr.last_error.is_some());
-        activity.ocr_retry_worked("Could not read day frame 7, will try again");
+        activity.ocr_retry_worked("Could not read day frame 7, will try again", "read");
         assert!(activity.snapshot(false, || true).ocr.last_error.is_none());
     }
 

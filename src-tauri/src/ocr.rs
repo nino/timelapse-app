@@ -351,8 +351,10 @@ pub struct OcrWorker {
     activity: Arc<Activity>,
     videos: Option<VideoReader>,
     /// How many times the recognizer has failed on a frame, by day and
-    /// number (or video position), until it reads or is passed over.
-    attempts: HashMap<(String, u32), u32>,
+    /// number (or video position), until it reads or is passed over, and
+    /// the start of the error that says it will be tried again
+    /// (`retry_message`).
+    attempts: HashMap<(String, u32), (u32, String)>,
     /// Whether a frame was passed over for recognizer failures and none has
     /// been read since. A failure on the next frame then says the recognizer
     /// itself is broken, even in a new helper process, so no more frames are
@@ -618,11 +620,19 @@ impl OcrWorker {
         let key = (day.to_string(), number);
         let error = match result {
             Ok(read) => {
-                if self.attempts.remove(&key).is_some() {
-                    self.activity.ocr_retry_worked(&retry_message(what, number));
+                if let Some((_, message)) = self.attempts.remove(&key) {
+                    self.activity.ocr_retry_worked(&message, "read on a later try");
                 }
                 if read {
                     self.recognizer_broken = false;
+                    // The recognizer works again, so a frame it failed on is
+                    // no longer an error to show while it waits its turn: a
+                    // frame from a video waits for every new screenshot to
+                    // be read first. It keeps its count of attempts, so one
+                    // the recognizer can never read is still passed over.
+                    for (_, message) in self.attempts.values() {
+                        self.activity.ocr_retry_worked(message, "the text recognizer is reading again");
+                    }
                 }
                 return Some(if read { Outcome::Read } else { Outcome::Unchanged });
             }
@@ -633,11 +643,11 @@ impl OcrWorker {
                 return None;
             }
             Err(FrameError::Recognizer(error)) => {
-                let attempts = self.attempts.entry(key.clone()).or_insert(0);
+                let (attempts, message) =
+                    self.attempts.entry(key.clone()).or_insert_with(|| (0, retry_message(what, number)));
                 *attempts += 1;
                 if *attempts < RECOGNIZER_ATTEMPTS || self.recognizer_broken {
-                    self.activity
-                        .ocr_failed(format!("{}: {}", retry_message(what, number), error));
+                    self.activity.ocr_failed(format!("{}: {}", message, error));
                     return None;
                 }
                 self.recognizer_broken = true;
@@ -1904,6 +1914,34 @@ mod tests {
         broken.store(false, std::sync::atomic::Ordering::SeqCst);
         assert_eq!(library.video_pass(usize::MAX).recognized, 2);
         assert_eq!(library.progress(DAY_1), Some(OcrProgress::VideoPosition(2)));
+    }
+
+    #[test]
+    fn a_video_frame_waiting_for_another_try_stops_showing_once_screenshots_read() {
+        let (library, broken) = breakable();
+        let mut library = library.with_videos();
+        if !write_video(&library.root.join("2024-01-01--18-00-00.mov"), &[0, 200]) {
+            eprintln!("skipping: ffmpeg with libx264 is not available");
+            return;
+        }
+        let last_error = |library: &Library| library.worker.activity.snapshot(false, || true).ocr.last_error;
+
+        assert!(library.video_pass(usize::MAX).stalled);
+        assert!(last_error(&library).is_some());
+
+        // New screenshots are read before the video frame's next try.
+        broken.store(false, std::sync::atomic::Ordering::SeqCst);
+        frame(&library.root, DAY_2, 1, 0, false);
+        assert_eq!(library.pass().recognized, 1);
+        assert!(last_error(&library).is_none());
+
+        // The frame is still tried again, and still counts its attempts.
+        broken.store(true, std::sync::atomic::Ordering::SeqCst);
+        for _ in 1..RECOGNIZER_ATTEMPTS - 1 {
+            assert!(library.video_pass(usize::MAX).stalled);
+        }
+        assert_eq!(library.video_pass(usize::MAX).failed, 1);
+        assert_eq!(library.progress(DAY_1), Some(OcrProgress::VideoPosition(1)));
     }
 
     #[test]
