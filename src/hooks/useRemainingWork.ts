@@ -1,6 +1,7 @@
 import React from "react";
 
 import { getRemainingWork, type RemainingWork } from "../activity";
+import { useMountEffect } from "./useMountEffect";
 
 /** How often the Activity window asks what is left. Each answer lists the library. */
 export const REMAINING_WORK_POLL_MS = 10_000;
@@ -13,7 +14,7 @@ export const REMAINING_WORK_POLL_MS = 10_000;
 export function useRemainingWork(): RemainingWork | null {
   const [work, setWork] = React.useState<RemainingWork | null>(null);
 
-  React.useEffect(() => {
+  useMountEffect(() => {
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
     let asking = false;
@@ -48,7 +49,7 @@ export function useRemainingWork(): RemainingWork | null {
       if (timer !== undefined) clearTimeout(timer);
       document.removeEventListener("visibilitychange", onVisibilityChange);
     };
-  }, []);
+  });
 
   return work;
 }

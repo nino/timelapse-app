@@ -8,6 +8,7 @@
 - `hooks/useLibrary.ts` (`useDays`, `useDay`) re-asks Rust whenever `useDirectoryChanges` reports a change in the library root or the day folder (the fs plugin's `watch`, falling back to polling every 3 s). `useDay` returns `null` while a newly selected day loads, never the previous day's answer, and reloads that find nothing new keep the old value so effects don't re-run.
 - `DayPicker.tsx` marks each day with whether OCR and video conversion are done (`useDayStatuses`), asked for every 5 s, only while the list is open.
 - `hooks/useOcrSearch.ts` drives the find bar; `hooks/usePendingFrames.ts` marks the video stretches not decoded yet, which the scrubber draws paler.
+- Effects live only in the hooks the lint allowlists (see the root CLAUDE.md). `useLatestLoad` is the one for asking Rust something whenever its inputs change; `useTimeout` covers debouncing and other waits keyed on a value.
 - Don't call `get_screenshot_metadata`: it looks frames up by number alone, which collides across days.
 
 ## Behaviour to keep

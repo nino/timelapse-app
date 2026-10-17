@@ -44,12 +44,14 @@ type Answer<T> = { key: string; value: T | null; error: Error | null };
  * Run `ask` for `key`, and again whenever `version` changes. Returns null
  * while a new key loads, never the previous key's answer. A repeat that finds
  * nothing new keeps the old value, and one that fails keeps the last good
- * answer rather than wiping it.
+ * answer rather than wiping it. `onError` hears about every failed ask that
+ * is still current.
  */
 export function useAnswer<T>(
   key: string | null,
   version: string | null,
   ask: () => Promise<T>,
+  onError?: (error: Error) => void,
 ): { value: T | null; error: Error | null } {
   const [answer, setAnswer] = React.useState<Answer<T>>({ key: "", value: null, error: null });
 
@@ -66,6 +68,7 @@ export function useAnswer<T>(
         );
       } catch (error) {
         if (!isCurrent()) return;
+        onError?.(ensureError(error));
         setAnswer((previous) =>
           previous.key === key && previous.value !== null
             ? previous
@@ -73,7 +76,8 @@ export function useAnswer<T>(
         );
       }
     },
-    // `ask` is rebuilt every render; `key` says everything it depends on.
+    // `ask` and `onError` are rebuilt every render; `key` says everything
+    // they depend on.
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [key, version],
   );

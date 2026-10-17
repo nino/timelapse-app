@@ -1,6 +1,7 @@
 import React from "react";
 
 import { getActivity, type Activity } from "../activity";
+import { useMountEffect } from "./useMountEffect";
 
 /** How often the Activity window asks. The answer is read from memory in Rust. */
 export const ACTIVITY_POLL_MS = 1000;
@@ -24,7 +25,7 @@ export function useActivity(): {
   }>(() => ({ activity: null, now: Date.now(), error: null }));
   const askNow = React.useRef<() => void>(() => {});
 
-  React.useEffect(() => {
+  useMountEffect(() => {
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
     let asking = false;
@@ -67,7 +68,7 @@ export function useActivity(): {
       if (timer !== undefined) clearTimeout(timer);
       document.removeEventListener("visibilitychange", onVisibilityChange);
     };
-  }, []);
+  });
 
   const refresh = React.useCallback((): void => askNow.current(), []);
   return { ...state, refresh };

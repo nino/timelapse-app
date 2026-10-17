@@ -1,6 +1,8 @@
 import React from "react";
 
 import { frameUrl, getPendingFrames, onFramesDecoded, type Day, type PendingFrames } from "../frames";
+import { useLatestLoad } from "./useDirectoryChanges";
+import { useMountEffect } from "./useMountEffect";
 
 /**
  * The stretches of `day` that would have to be decoded from video before
@@ -22,26 +24,25 @@ export function usePendingFrames(day: Day | null, loaded: string | null): Pendin
   const current = hasVideo && state?.date === date ? state.pending : null;
 
   // A finished load of a pending frame means its chunk is decoded now.
-  const currentRef = React.useRef(current);
-  React.useEffect(() => {
-    currentRef.current = current;
-  }, [current]);
-  React.useEffect(() => {
-    const pending = currentRef.current;
+  const [seenLoaded, setSeenLoaded] = React.useState(loaded);
+  if (loaded !== seenLoaded) {
+    setSeenLoaded(loaded);
     const index = date && loaded ? frameIndex(loaded, date) : null;
-    if (index === null || !pending) return;
-    if (pending.ranges.some(({ start, end }) => start <= index && index < end)) {
+    if (index !== null && current?.ranges.some(({ start, end }) => start <= index && index < end)) {
       setDecodes((n) => n + 1);
     }
-  }, [date, loaded]);
+  }
 
-  // Read-ahead decodes chunks no frame load asked for.
-  React.useEffect(() => {
-    if (!date || !hasVideo) return;
+  // Read-ahead decodes chunks no frame load asked for. It only reads ahead
+  // into days with video, so listening all along costs nothing, and counting
+  // per day means another day's decodes don't re-ask about this one.
+  const [readAhead, setReadAhead] = React.useState<ReadonlyMap<string, number>>(() => new Map());
+  const readAheadDecodes = date === null ? 0 : (readAhead.get(date) ?? 0);
+  useMountEffect(() => {
     let stop: (() => void) | null = null;
     let unmounted = false;
     onFramesDecoded((decoded) => {
-      if (decoded === date) setDecodes((n) => n + 1);
+      setReadAhead((counts) => new Map(counts).set(decoded, (counts.get(decoded) ?? 0) + 1));
     }).then(
       (unlisten) => {
         if (unmounted) unlisten();
@@ -55,27 +56,29 @@ export function usePendingFrames(day: Day | null, loaded: string | null): Pendin
       unmounted = true;
       stop?.();
     };
-  }, [date, hasVideo]);
+  });
 
   // Answers may land out of order. Each one is published unless a newer
   // request has already published, so a burst of requests still shows the
   // latest answer that arrived rather than none at all.
   const asked = React.useRef(0);
   const published = React.useRef(0);
-  React.useEffect(() => {
+  const load = React.useCallback(async (): Promise<void> => {
     if (!date || !hasVideo) return;
     const mine = ++asked.current;
-    getPendingFrames(date).then(
-      (pending) => {
-        if (mine < published.current) return;
-        published.current = mine;
-        setState({ date, pending });
-      },
-      (error: unknown) => {
-        console.error("Error fetching pending frames:", error);
-      },
-    );
-  }, [date, hasVideo, frameCount, decodes]);
+    try {
+      const pending = await getPendingFrames(date);
+      if (mine < published.current) return;
+      published.current = mine;
+      setState({ date, pending });
+    } catch (error) {
+      console.error("Error fetching pending frames:", error);
+    }
+    // `frameCount` and the decode counts aren't read, but each change means
+    // the answer may have changed, so it is asked again.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [date, hasVideo, frameCount, decodes, readAheadDecodes]);
+  useLatestLoad(load);
 
   return current;
 }

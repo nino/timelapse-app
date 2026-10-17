@@ -23,9 +23,38 @@
     "no-duplicate-imports": "error",
     "no-unused-expressions": "error",
 
-    "react/set-state-in-effect": "warn"
+    "react/set-state-in-effect": "warn",
+
+    "no-restricted-imports": [
+      "error",
+      {
+        "paths": [
+          {
+            "name": "react",
+            "importNames": ["useEffect", "useLayoutEffect", "useInsertionEffect"],
+            "message": "Effects are banned outside the effect hooks in src/hooks (useMountEffect, useEventListener, useInterval, useTimeout, useDirectoryChanges, useLatestLoad). Derive state during render, do it in the event handler, use a ref callback, or use one of those hooks."
+          }
+        ]
+      }
+    ],
+    "no-restricted-properties": [
+      "error",
+      { "object": "React", "property": "useEffect", "message": "Effects are banned outside the effect hooks in src/hooks (useMountEffect, useEventListener, useInterval, useTimeout, useDirectoryChanges, useLatestLoad). Derive state during render, do it in the event handler, use a ref callback, or use one of those hooks." },
+      { "object": "React", "property": "useLayoutEffect", "message": "Effects are banned outside the effect hooks in src/hooks (useMountEffect, useEventListener, useInterval, useTimeout, useDirectoryChanges, useLatestLoad). Derive state during render, do it in the event handler, use a ref callback, or use one of those hooks." },
+      { "object": "React", "property": "useInsertionEffect", "message": "Effects are banned outside the effect hooks in src/hooks (useMountEffect, useEventListener, useInterval, useTimeout, useDirectoryChanges, useLatestLoad). Derive state during render, do it in the event handler, use a ref callback, or use one of those hooks." }
+    ]
   },
   "overrides": [
+    {
+      "files": [
+        "src/hooks/useMountEffect.ts",
+        "src/hooks/useEventListener.ts",
+        "src/hooks/useInterval.ts",
+        "src/hooks/useTimeout.ts",
+        "src/hooks/useDirectoryChanges.ts"
+      ],
+      "rules": { "no-restricted-imports": "off", "no-restricted-properties": "off" }
+    },
     {
       "files": ["*.config.js", "*.config.ts", "scripts/**"],
       "rules": {
