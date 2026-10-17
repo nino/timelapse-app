@@ -7,6 +7,7 @@
 //! call the logic directly.
 
 mod activity;
+mod analytics;
 mod app_state;
 mod boost;
 mod converter;
@@ -1117,6 +1118,9 @@ pub fn run() {
                     .map(|dir| dir.join(paths::TIMELAPSE_DIR_NAME)),
             ));
             restore_windows(app.handle())?;
+            let version = app.package_info().version.to_string();
+            analytics::init(app.path().app_config_dir().ok().as_deref(), &version);
+            analytics::capture("app started", serde_json::json!({}));
             updater::spawn(app.handle().clone());
 
             // Create the library up front. The frontend calls readDir on it

@@ -14,5 +14,9 @@ fn main() {
         }
     }
 
+    // `analytics.rs` bakes these in with `option_env!`.
+    println!("cargo:rerun-if-env-changed=POSTHOG_KEY");
+    println!("cargo:rerun-if-env-changed=POSTHOG_HOST");
+
     tauri_build::build()
 }
