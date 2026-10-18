@@ -31,11 +31,14 @@ export function getDay(date: string): Promise<Day> {
   return invoke<Day>("get_day", { date });
 }
 
-/** Whether OCR and video conversion have finished a day. Mirrors `DayStatus` in Rust. */
+/** How far one job has got with a day. Mirrors `Stage` in Rust. */
+export type Stage = "todo" | "partial" | "done";
+
+/** How far OCR and video conversion have got with a day. Mirrors `DayStatus` in Rust. */
 export type DayStatus = {
   date: string;
-  ocrDone: boolean;
-  videoDone: boolean;
+  ocr: Stage;
+  video: Stage;
 };
 
 /** Every day's `DayStatus`, oldest first. */

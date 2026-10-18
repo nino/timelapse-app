@@ -541,13 +541,13 @@ describe('App', () => {
     });
   });
 
-  it('shows whether OCR and video conversion are done for each day in the picker', async () => {
+  it('shows how far OCR and video conversion have got with each day in the picker', async () => {
     mockLibrary({ '2026-10-03': 3, '2026-10-04': 3 });
     useDayStatuses.mockImplementation((open: boolean): Map<string, DayStatus> =>
       open
         ? new Map([
-            ['2026-10-03', { date: '2026-10-03', ocrDone: true, videoDone: true }],
-            ['2026-10-04', { date: '2026-10-04', ocrDone: true, videoDone: false }],
+            ['2026-10-03', { date: '2026-10-03', ocr: 'done', video: 'done' }],
+            ['2026-10-04', { date: '2026-10-04', ocr: 'partial', video: 'todo' }],
           ])
         : new Map(),
     );
@@ -558,7 +558,7 @@ describe('App', () => {
       'OCR done, video done',
     );
     expect(screen.getByRole('option', { name: /2026-10-04/ })).toHaveTextContent(
-      'OCR done, video not done',
+      'OCR partly done, video not started',
     );
   });
 

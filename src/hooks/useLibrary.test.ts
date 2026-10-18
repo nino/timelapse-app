@@ -142,28 +142,28 @@ describe('useDay', () => {
 
 describe('useDayStatuses', () => {
   it('asks each time the picker opens and keeps the last answer while closed', async () => {
-    mocked(invoke).mockResolvedValueOnce([{ date: '2026-10-04', ocrDone: false, videoDone: false }]);
+    mocked(invoke).mockResolvedValueOnce([{ date: '2026-10-04', ocr: 'todo', video: 'todo' }]);
     const { result, rerender } = renderHook(({ open }) => useDayStatuses(open), {
       initialProps: { open: false },
     });
     expect(invoke).not.toHaveBeenCalled();
 
     rerender({ open: true });
-    await waitFor(() => expect(result.current.get('2026-10-04')?.ocrDone).toBe(false));
+    await waitFor(() => expect(result.current.get('2026-10-04')?.ocr).toBe('todo'));
     expect(invoke).toHaveBeenCalledWith('get_day_statuses');
 
-    mocked(invoke).mockResolvedValueOnce([{ date: '2026-10-04', ocrDone: true, videoDone: false }]);
+    mocked(invoke).mockResolvedValueOnce([{ date: '2026-10-04', ocr: 'done', video: 'todo' }]);
     rerender({ open: false });
-    expect(result.current.get('2026-10-04')?.ocrDone).toBe(false);
+    expect(result.current.get('2026-10-04')?.ocr).toBe('todo');
     rerender({ open: true });
-    await waitFor(() => expect(result.current.get('2026-10-04')?.ocrDone).toBe(true));
+    await waitFor(() => expect(result.current.get('2026-10-04')?.ocr).toBe('done'));
   });
 
   it('asks again every few seconds while open, keeping the map when nothing changed', async () => {
     const intervals = spyOn(globalThis, 'setInterval');
-    mocked(invoke).mockResolvedValue([{ date: '2026-10-04', ocrDone: false, videoDone: false }]);
+    mocked(invoke).mockResolvedValue([{ date: '2026-10-04', ocr: 'todo', video: 'todo' }]);
     const { result } = renderHook(() => useDayStatuses(true));
-    await waitFor(() => expect(result.current.get('2026-10-04')?.videoDone).toBe(false));
+    await waitFor(() => expect(result.current.get('2026-10-04')?.video).toBe('todo'));
     const first = result.current;
     const [[tick, ms]] = intervals.mock.calls;
     expect(ms).toBe(5000);
@@ -171,9 +171,9 @@ describe('useDayStatuses', () => {
     await act(async () => (tick as () => void)());
     expect(result.current).toBe(first);
 
-    mocked(invoke).mockResolvedValue([{ date: '2026-10-04', ocrDone: true, videoDone: true }]);
+    mocked(invoke).mockResolvedValue([{ date: '2026-10-04', ocr: 'done', video: 'done' }]);
     await act(async () => (tick as () => void)());
-    await waitFor(() => expect(result.current.get('2026-10-04')?.videoDone).toBe(true));
+    await waitFor(() => expect(result.current.get('2026-10-04')?.video).toBe('done'));
     intervals.mockRestore();
   });
 });

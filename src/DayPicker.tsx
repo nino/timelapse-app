@@ -1,7 +1,7 @@
 import { Listbox, ListboxButton, ListboxOption, ListboxOptions } from "@headlessui/react";
 import React from "react";
 
-import type { DayStatus } from "./frames";
+import type { DayStatus, Stage } from "./frames";
 import { useDayStatuses } from "./hooks/useLibrary";
 import { focusRing } from "./ui";
 
@@ -77,44 +77,58 @@ function DayOptions({
   );
 }
 
+const STAGE_WORDS: Record<Stage, string> = { todo: "not started", partial: "partly done", done: "done" };
+
 /**
  * Two marks: the text glyph for OCR, the film glyph for video conversion,
- * each in the success colour once done and faint while still to do. Nothing
- * until the status is known.
+ * each in the success colour once done, faint while still to do, and green
+ * on its left half once started. Nothing until the status is known.
  */
 function Status({ status }: { status: DayStatus | undefined }): React.ReactNode {
   if (!status) return <span className="w-7" />;
-  const ocr = status.ocrDone ? "OCR done" : "OCR not done";
-  const video = status.videoDone ? "video done" : "video not done";
-  const tone = (done: boolean): string => (done ? "text-success" : "text-faint-fg opacity-50");
+  const text = `OCR ${STAGE_WORDS[status.ocr]}, video ${STAGE_WORDS[status.video]}`;
   return (
-    <span className="flex w-7 items-center gap-1" title={`${ocr}, ${video}`}>
-      <span className="sr-only">{`${ocr}, ${video}`}</span>
-      <TextGlyph className={tone(status.ocrDone)} />
-      <FilmGlyph className={tone(status.videoDone)} />
+    <span className="flex w-7 items-center gap-1" title={text}>
+      <span className="sr-only">{text}</span>
+      <Mark stage={status.ocr}>
+        <path
+          d="M2 3h8M2 6h8M2 9h5"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="1.5"
+          strokeLinecap="round"
+        />
+      </Mark>
+      <Mark stage={status.video}>
+        <rect x="1.5" y="2.5" width="9" height="7" rx="1.5" fill="none" stroke="currentColor" strokeWidth="1.5" />
+        <path d="M5 4.5v3l2.5-1.5z" fill="currentColor" />
+      </Mark>
     </span>
   );
 }
 
-function TextGlyph({ className }: { className: string }): React.ReactNode {
-  return (
-    <svg viewBox="0 0 12 12" aria-hidden="true" className={`size-3 ${className}`}>
-      <path
-        d="M2 3h8M2 6h8M2 9h5"
-        fill="none"
-        stroke="currentColor"
-        strokeWidth="1.5"
-        strokeLinecap="round"
-      />
-    </svg>
-  );
-}
+const DONE = "text-success";
+const TODO = "text-faint-fg opacity-50";
 
-function FilmGlyph({ className }: { className: string }): React.ReactNode {
+/**
+ * A 12px glyph drawn in `currentColor`. A partial one is drawn twice: faint,
+ * then green inside a nested 6px-wide viewport, which clips it to the left
+ * half without needing a `clipPath` id.
+ */
+function Mark({ stage, children }: { stage: Stage; children: React.ReactNode }): React.ReactNode {
+  if (stage !== "partial") {
+    return (
+      <svg viewBox="0 0 12 12" aria-hidden="true" className={`size-3 ${stage === "done" ? DONE : TODO}`}>
+        {children}
+      </svg>
+    );
+  }
   return (
-    <svg viewBox="0 0 12 12" aria-hidden="true" className={`size-3 ${className}`}>
-      <rect x="1.5" y="2.5" width="9" height="7" rx="1.5" fill="none" stroke="currentColor" strokeWidth="1.5" />
-      <path d="M5 4.5v3l2.5-1.5z" fill="currentColor" />
+    <svg viewBox="0 0 12 12" aria-hidden="true" className="size-3">
+      <g className={TODO}>{children}</g>
+      <svg width="6" height="12" viewBox="0 0 6 12" className={DONE}>
+        {children}
+      </svg>
     </svg>
   );
 }
