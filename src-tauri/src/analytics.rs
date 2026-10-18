@@ -175,6 +175,8 @@ fn install_id(path: Option<&Path>) -> String {
 fn common_properties(version: &str) -> Map<String, Value> {
     let mut properties = Map::new();
     properties.insert("$lib".into(), json!("timelapse-app"));
+    // Which app sent it: all of Nino's apps share one PostHog project.
+    properties.insert("app".into(), json!("timelapse-app"));
     properties.insert("app_version".into(), json!(version));
     properties.insert("os".into(), json!(std::env::consts::OS));
     properties.insert("arch".into(), json!(std::env::consts::ARCH));
