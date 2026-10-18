@@ -84,7 +84,7 @@ function sameStatuses(previous: Map<string, DayStatus>, list: Array<DayStatus>):
     previous.size === list.length &&
     list.every((status) => {
       const old = previous.get(status.date);
-      return old?.ocrDone === status.ocrDone && old.videoDone === status.videoDone;
+      return old?.ocr === status.ocr && old.video === status.video;
     })
   );
 }

@@ -1,4 +1,4 @@
-//! Whether OCR and video conversion have finished each day, for the marks
+//! How far OCR and video conversion have got with each day, for the marks
 //! in the day picker, and how much of each is left, for the Activity window.
 //!
 //! Built from what is cheap to read: the library's directory listings (file
@@ -7,12 +7,14 @@
 //!
 //! - **Video** is done once a day has no screenshots left: the converter
 //!   deletes an hour's PNGs only after encoding it, and the old script's
-//!   days never had any left.
+//!   days never had any left. It is partial while a day has both screenshots
+//!   and a video (some hours converted).
 //! - **OCR** is done once the day's progress mark covers its highest
 //!   remaining screenshot. A day without screenshots is done if the mark
 //!   covers the frames its hourly videos were made from (`video_frames`),
 //!   or, if it is read from video, once OCR has marked it complete
-//!   (`ScreenshotDatabase::set_video_day_complete`).
+//!   (`ScreenshotDatabase::set_video_day_complete`). It is partial once the
+//!   progress mark is past zero but the day isn't done.
 //!
 //! A day with neither screenshots nor videos (an empty folder while the
 //! screen is locked) gets no status, and nor does a day whose folder can't
@@ -30,8 +32,17 @@ use std::path::Path;
 #[serde(rename_all = "camelCase")]
 pub struct DayStatus {
     pub date: String,
-    pub ocr_done: bool,
-    pub video_done: bool,
+    pub ocr: Stage,
+    pub video: Stage,
+}
+
+/// How far one job has got with a day.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Stage {
+    Todo,
+    Partial,
+    Done,
 }
 
 /// What OCR and video conversion have left to do across the library, for the
@@ -64,8 +75,8 @@ pub fn day_statuses(root: &Path, db: Option<&ScreenshotDatabase>) -> std::io::Re
     Ok(days
         .into_iter()
         .map(|(date, folder)| DayStatus {
-            ocr_done: ocr_done(&date, &folder, &progress, db),
-            video_done: folder.screenshots.is_empty(),
+            ocr: ocr_stage(&date, &folder, &progress, db),
+            video: video_stage(&folder),
             date,
         })
         .collect())
@@ -93,7 +104,7 @@ pub fn remaining_work(
             work.video.days += 1;
             work.video.frames += folder.screenshots.len() as u64;
         }
-        if ocr_done(date, folder, &progress, db) {
+        if ocr_stage(date, folder, &progress, db) == Stage::Done {
             continue;
         }
         work.ocr.days += 1;
@@ -169,15 +180,39 @@ fn scan(root: &Path, db: Option<&ScreenshotDatabase>) -> std::io::Result<(Progre
     Ok((progress, days))
 }
 
-/// Whether OCR has read all of `date`.
-fn ocr_done(date: &str, folder: &DayFolder, progress: &Progress, db: Option<&ScreenshotDatabase>) -> bool {
-    match (folder.last_screenshot(), progress.get(date)) {
-        (Some(last), Some((OcrProgress::FrameNumber(done), _))) => *done >= last,
-        (None, Some((OcrProgress::FrameNumber(done), _))) => db
+/// How much of `date` OCR has read.
+fn ocr_stage(date: &str, folder: &DayFolder, progress: &Progress, db: Option<&ScreenshotDatabase>) -> Stage {
+    let Some((mark, complete)) = progress.get(date) else {
+        return Stage::Todo;
+    };
+    let done = match (folder.last_screenshot(), mark) {
+        (Some(last), OcrProgress::FrameNumber(done)) => *done >= last,
+        (None, OcrProgress::FrameNumber(done)) => db
             .and_then(|db| db.last_video_frame(date).ok())
             .is_some_and(|last| last.is_some_and(|last| *done >= last)),
-        (None, Some((OcrProgress::VideoPosition(_), complete))) => *complete,
-        _ => false,
+        (None, OcrProgress::VideoPosition(_)) => *complete,
+        (Some(_), OcrProgress::VideoPosition(_)) => false,
+    };
+    let started = match mark {
+        OcrProgress::FrameNumber(done) | OcrProgress::VideoPosition(done) => *done > 0,
+    };
+    if done {
+        Stage::Done
+    } else if started {
+        Stage::Partial
+    } else {
+        Stage::Todo
+    }
+}
+
+/// How much of a day the converter has encoded.
+fn video_stage(folder: &DayFolder) -> Stage {
+    if folder.screenshots.is_empty() {
+        Stage::Done
+    } else if folder.has_videos {
+        Stage::Partial
+    } else {
+        Stage::Todo
     }
 }
 
@@ -228,12 +263,10 @@ mod tests {
         std::fs::write(path, b"").unwrap();
     }
 
-    fn status(date: &str, ocr_done: bool, video_done: bool) -> DayStatus {
-        DayStatus {
-            date: date.into(),
-            ocr_done,
-            video_done,
-        }
+    use Stage::{Done, Partial, Todo};
+
+    fn status(date: &str, ocr: Stage, video: Stage) -> DayStatus {
+        DayStatus { date: date.into(), ocr, video }
     }
 
     #[test]
@@ -275,13 +308,13 @@ mod tests {
         assert_eq!(
             day_statuses(root, Some(&db)).unwrap(),
             vec![
-                status("2024-01-01", true, true),
-                status("2024-01-02", false, true),
-                status("2024-01-03", false, true),
-                status("2026-10-01", true, true),
-                status("2026-10-02", true, false),
-                status("2026-10-03", false, false),
-                status("2026-10-08", false, true),
+                status("2024-01-01", Done, Done),
+                status("2024-01-02", Partial, Done),
+                status("2024-01-03", Todo, Done),
+                status("2026-10-01", Done, Done),
+                status("2026-10-02", Done, Partial),
+                status("2026-10-03", Partial, Todo),
+                status("2026-10-08", Todo, Done),
             ]
         );
     }
@@ -341,7 +374,7 @@ mod tests {
 
         assert_eq!(
             day_statuses(dir.path(), None).unwrap(),
-            vec![status("2026-10-04", false, false), status("2026-10-05", false, true)]
+            vec![status("2026-10-04", Todo, Todo), status("2026-10-05", Todo, Done)]
         );
     }
 
@@ -352,7 +385,7 @@ mod tests {
 
         assert_eq!(
             day_statuses(dir.path(), None).unwrap(),
-            vec![status("2026-10-03", false, false)]
+            vec![status("2026-10-03", Todo, Todo)]
         );
     }
 
@@ -373,7 +406,7 @@ mod tests {
         assert_eq!(db.ocr_progress("2026-10-04").unwrap(), None);
         assert_eq!(
             day_statuses(root, Some(&db)).unwrap(),
-            vec![status("2026-10-03", false, false)]
+            vec![status("2026-10-03", Partial, Todo)]
         );
     }
 }
