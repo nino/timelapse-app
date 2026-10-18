@@ -203,7 +203,9 @@ jobs:
           # "Send error reports" is on. PostHog project keys are public (they
           # only allow sending events), so this one isn't a secret.
           POSTHOG_KEY: phc_khU8oAxkqoNVCHp5euLyyWCQ4W3sBAMrJnTtZGKgcWwA
-          POSTHOG_HOST: https://eu.i.posthog.com
+          # ninoes forwards this to PostHog's EU cloud; sending there rather than
+          # to posthog.com keeps tracker blockers from stopping reports.
+          POSTHOG_HOST: https://ninoes.fly.dev/relay
         run: |
           if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ]; then
             echo "::error::TAURI_SIGNING_PRIVATE_KEY is not set"
