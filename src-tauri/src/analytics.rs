@@ -266,7 +266,9 @@ impl Poster {
         let id_file = self.id_file.as_deref();
         let distinct_id = self.distinct_id.get_or_insert_with(|| install_id(id_file));
         let body = payload(&self.key, distinct_id, &self.common, name, properties);
-        let request = self.client.post(&self.url).json(&body).send();
+        // Built inside `block_on`: with a timeout set, `send` starts a tokio
+        // timer straight away, which panics on this plain thread.
+        let request = async { self.client.post(&self.url).json(&body).send().await };
         if let Err(e) = tauri::async_runtime::block_on(request).and_then(|r| r.error_for_status()) {
             // Not a diagnostics error: that would be sent here again.
             eprintln!("Could not send {} to PostHog: {}", name, e);
@@ -320,6 +322,60 @@ mod tests {
         // A home of "/" would turn every slash into "~".
         assert_eq!(scrub("/a/b", Some("/")), "/a/b");
         assert_eq!(scrub(&"x".repeat(5000), None).chars().count(), MAX_MESSAGE);
+    }
+
+    /// Sends one event to a local server, from a plain thread as `run` does.
+    #[test]
+    fn send_posts_from_a_plain_thread() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/i/v0/e/", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0; 4096];
+            // Read the headers, then as much body as they announce.
+            let complete = |request: &[u8]| {
+                let text = String::from_utf8_lossy(request);
+                let Some(end) = text.find("\r\n\r\n") else {
+                    return false;
+                };
+                let length = text[..end]
+                    .lines()
+                    .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().to_string()))
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(0);
+                request.len() >= end + 4 + length
+            };
+            while !complete(&request) {
+                let n = stream.read(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..n]);
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}")
+                .unwrap();
+            String::from_utf8_lossy(&request).into_owned()
+        });
+        if rustls::crypto::CryptoProvider::get_default().is_none() {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+        }
+        let mut poster = Poster {
+            client: reqwest::Client::builder().timeout(TIMEOUT).build().unwrap(),
+            url,
+            key: "phc_test".into(),
+            id_file: None,
+            distinct_id: None,
+            common: common_properties("1.2.3"),
+        };
+        std::thread::spawn(move || poster.send("$exception", exception_properties("test", "boom")))
+            .join()
+            .expect("send must not panic off the async runtime");
+        let request = server.join().unwrap();
+        assert!(request.starts_with("POST /i/v0/e/ "), "{request}");
+        assert!(request.contains("\"api_key\":\"phc_test\""), "{request}");
     }
 
     #[test]
