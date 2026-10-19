@@ -8,9 +8,11 @@
 //! Two ways in:
 //! - In the background, while "Update automatically" is on in Settings: a check
 //!   at launch and then hourly. An installed update replaces the bundle on disk
-//!   but not the running process, and this app is rarely quit, so it relaunches
-//!   itself, but only while none of its windows is focused, so nobody is
-//!   scrubbing through a day when it goes.
+//!   but not the running process, so it starts the next time the app opens.
+//!   The app never relaunches by itself: a relaunch opens the app again, and
+//!   macOS brings a newly opened app to the front, taking focus from whatever
+//!   the user was doing. Instead it tells the main window (`UPDATE_READY`),
+//!   which shows an Update button in the title bar that relaunches it.
 //!   It never installs an update that needs an admin password (the app is in
 //!   a folder this account can't write to, such as /Applications for a
 //!   non-admin user), because the plugin would ask for one with no warning,
@@ -21,7 +23,7 @@
 
 use std::sync::Arc;
 use std::time::Duration;
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 use tauri_plugin_updater::{Update, UpdaterExt};
 use tokio::sync::{Mutex, Notify};
@@ -31,8 +33,9 @@ use crate::settings::SettingsStore;
 
 /// How often to look for a new release. Every push to `main` is one.
 const CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
-/// How often to look for a moment to relaunch once an update is installed.
-const RELAUNCH_POLL: Duration = Duration::from_secs(30);
+/// Sent to the windows, with the version, once an update is installed and
+/// waiting for a relaunch.
+pub const UPDATE_READY: &str = "update-ready";
 
 /// Shared by the background loop and "Check for Updates…".
 #[derive(Default)]
@@ -68,7 +71,12 @@ pub fn spawn(app: AppHandle) {
         loop {
             if app.state::<SettingsStore>().get().update_automatically && can_install_silently() {
                 match install_newer(&app, &updater).await {
-                    Ok(Some(_)) => break,
+                    Ok(Some(version)) => {
+                        if let Err(e) = app.emit(UPDATE_READY, version) {
+                            eprintln!("Couldn't announce the update: {}", e);
+                        }
+                        break;
+                    }
                     Ok(None) => {}
                     Err(e) => eprintln!("Update check failed: {}", e),
                 }
@@ -78,10 +86,6 @@ pub fn spawn(app: AppHandle) {
                 _ = updater.wake.notified() => {}
             }
         }
-        while window_is_focused(&app) {
-            tokio::time::sleep(RELAUNCH_POLL).await;
-        }
-        relaunch(&app);
     });
 }
 
@@ -277,6 +281,18 @@ pub fn check_from_menu(app: AppHandle) {
     });
 }
 
+/// The version installed on disk and waiting for a relaunch, if any, for a
+/// window that opens after `UPDATE_READY` was sent. `None` while a check or
+/// install is under way; `UPDATE_READY` follows if it installs one.
+pub fn installed_version(updater: &Updater) -> Option<String> {
+    updater.installed.try_lock().ok().and_then(|installed| installed.clone())
+}
+
+/// The title bar's Update button: relaunch into the installed update.
+pub fn relaunch_into_update(app: &AppHandle) {
+    relaunch(app);
+}
+
 fn offer_relaunch(app: &AppHandle, version: &str) {
     let relaunch = app
         .dialog()
@@ -359,12 +375,6 @@ fn warn(app: &AppHandle, title: &str, message: &str) {
         .title(title)
         .kind(MessageDialogKind::Warning)
         .blocking_show();
-}
-
-fn window_is_focused(app: &AppHandle) -> bool {
-    app.webview_windows()
-        .values()
-        .any(|window| window.is_focused().unwrap_or(false))
 }
 
 /// Whether this account can replace the running app bundle by itself. The

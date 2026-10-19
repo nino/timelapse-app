@@ -10,6 +10,7 @@ import * as dayAppsHook from './hooks/useDayApps';
 import * as library from './hooks/useLibrary';
 import * as ocrSearch from './hooks/useOcrSearch';
 import type { DayCount, DayMatch, LineBox } from './search';
+import * as updates from './updates';
 import * as viewerPosition from './viewerPosition';
 
 // Spied on rather than replaced with `mock.module`: Bun runs every test file in
@@ -27,6 +28,9 @@ const getPendingFrames = spyOn(frames, 'getPendingFrames');
 const setViewerPosition = spyOn(viewerPosition, 'setViewerPosition');
 const useDayApps = spyOn(dayAppsHook, 'useDayApps');
 const toggleActivity = spyOn(activity, 'toggleActivity').mockResolvedValue(undefined);
+const getInstalledUpdate = spyOn(updates, 'getInstalledUpdate');
+const onUpdateReady = spyOn(updates, 'onUpdateReady');
+const relaunchIntoUpdate = spyOn(updates, 'relaunchIntoUpdate').mockResolvedValue(undefined);
 
 afterAll(() => {
   setViewerPosition.mockRestore();
@@ -41,6 +45,9 @@ afterAll(() => {
   getPendingFrames.mockRestore();
   useDayApps.mockRestore();
   toggleActivity.mockRestore();
+  getInstalledUpdate.mockRestore();
+  onUpdateReady.mockRestore();
+  relaunchIntoUpdate.mockRestore();
 });
 
 /**
@@ -150,6 +157,8 @@ describe('App', () => {
     setViewerPosition.mockResolvedValue(undefined);
     useDayStatuses.mockReturnValue(new Map());
     useDayApps.mockReturnValue(null);
+    getInstalledUpdate.mockResolvedValue(null);
+    onUpdateReady.mockResolvedValue((): void => {});
   });
 
   describe('Library states', () => {
@@ -892,6 +901,41 @@ describe('App', () => {
       finishLoading();
       await waitFor(() => expect(stretches()).toHaveLength(0));
       await settleFrameTime();
+    });
+  });
+
+  describe('Updates', () => {
+    it('shows no Update button until an update is installed', async () => {
+      mockLibrary({ '2026-10-04': 3 });
+      render(<App />);
+      await settleFrameTime();
+      expect(screen.queryByRole('button', { name: 'Update' })).not.toBeInTheDocument();
+    });
+
+    it('offers an update installed in the background, and relaunches only when clicked', async () => {
+      let announce: (version: string) => void = () => {};
+      onUpdateReady.mockImplementation((handler) => {
+        announce = handler;
+        return Promise.resolve((): void => {});
+      });
+      mockLibrary({ '2026-10-04': 3 });
+      render(<App />);
+      await settleFrameTime();
+
+      act(() => announce('0.2.40'));
+      const button = screen.getByRole('button', { name: 'Update' });
+      expect(button).toHaveAttribute('title', 'Relaunch to start version 0.2.40');
+      expect(relaunchIntoUpdate).not.toHaveBeenCalled();
+
+      fireEvent.click(button);
+      expect(relaunchIntoUpdate).toHaveBeenCalledTimes(1);
+    });
+
+    it('offers an update installed before the window opened', async () => {
+      getInstalledUpdate.mockResolvedValue('0.2.40');
+      mockLibrary({ '2026-10-04': 3 });
+      render(<App />);
+      expect(await screen.findByRole('button', { name: 'Update' })).toBeInTheDocument();
     });
   });
 });

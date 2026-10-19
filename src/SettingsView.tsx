@@ -93,7 +93,7 @@ export function SettingsView(): React.ReactNode {
               <span>
                 <span className="font-medium">Update automatically</span>
                 <span className="mt-0.5 block text-muted-fg">
-                  Installs new versions in the background and relaunches when the window isn't in use.
+                  Installs new versions in the background. They start the next time the app opens, or when you click Update in the title bar.
                 </span>
               </span>
             </label>

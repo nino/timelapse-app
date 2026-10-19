@@ -702,6 +702,19 @@ fn set_update_automatically(
     saved
 }
 
+/// The version of an update installed and waiting for a relaunch, if any.
+/// The main window shows an Update button for it, as it does on `UPDATE_READY`.
+#[tauri::command]
+fn get_installed_update(updater: State<'_, UpdaterState>) -> Option<String> {
+    updater::installed_version(&updater)
+}
+
+/// The Update button: quit and open the installed update.
+#[tauri::command]
+fn relaunch_into_update(app: AppHandle) {
+    updater::relaunch_into_update(&app);
+}
+
 #[tauri::command]
 fn set_send_error_reports(enabled: bool, settings: State<'_, SettingsStore>) -> Result<Settings, String> {
     match settings.update(|s| s.send_error_reports = enabled) {
@@ -1301,6 +1314,8 @@ pub fn run() {
             send_feedback,
             get_settings,
             set_update_automatically,
+            get_installed_update,
+            relaunch_into_update,
             set_send_error_reports,
             get_viewer_position,
             set_viewer_position,
