@@ -408,4 +408,41 @@ describe('ActivityView', () => {
       expect(screen.getByTestId('OCR-headline')).toHaveTextContent('Off for low-power mode; resumes in 10m 00s');
     });
   });
+
+  describe('feedback', () => {
+    function respond(sendFeedback: (args: unknown) => Promise<unknown>): void {
+      mocked(invoke).mockImplementation(<T,>(command: string, args?: unknown): Promise<T> => {
+        if (command === 'send_feedback') return sendFeedback(args) as Promise<T>;
+        return Promise.resolve(command === 'get_remaining_work' ? REMAINING : activity()) as Promise<T>;
+      });
+    }
+
+    it('sends a feature request and clears the form', async () => {
+      respond(() => Promise.resolve(null));
+      render(<ActivityView />);
+
+      fireEvent.click(await screen.findByRole('button', { name: 'Feature request' }));
+      const field = screen.getByRole('textbox', { name: 'Feedback' });
+      expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled();
+      fireEvent.change(field, { target: { value: 'Search by app' } });
+      fireEvent.click(screen.getByRole('button', { name: 'Send' }));
+
+      expect(invoke).toHaveBeenCalledWith('send_feedback', { kind: 'feature', message: 'Search by app' });
+      expect(await screen.findByRole('status')).toHaveTextContent('Sent');
+      expect(field).toHaveValue('');
+    });
+
+    it('keeps the text and says why when sending fails', async () => {
+      respond(() => Promise.reject("This build can't send feedback"));
+      render(<ActivityView />);
+
+      const field = await screen.findByRole('textbox', { name: 'Feedback' });
+      fireEvent.change(field, { target: { value: 'It crashed' } });
+      fireEvent.click(screen.getByRole('button', { name: 'Send' }));
+
+      expect(invoke).toHaveBeenCalledWith('send_feedback', { kind: 'bug', message: 'It crashed' });
+      expect(await screen.findByRole('alert')).toHaveTextContent("can't send feedback");
+      expect(field).toHaveValue('It crashed');
+    });
+  });
 });

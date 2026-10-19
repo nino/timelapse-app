@@ -21,6 +21,13 @@
 //! thread of its own posts it, so no worker ever waits on the network. At most
 //! `LIMIT` events go out per `WINDOW`, so a loop that fails on every frame
 //! can't flood the project; the rest are dropped.
+//!
+//! Feedback (a bug report or feature request written in the Activity window)
+//! is the exception: `feedback` posts it straight away, whatever the setting
+//! says, because sending it is the person's own request, and reports back
+//! whether it arrived. It is a "feedback" event with `kind` and `message`.
+//! Someone who opted in sends it under their install id; anyone else under a
+//! one-off id, so feedback never creates one.
 
 use serde_json::{json, Map, Value};
 use std::path::{Path, PathBuf};
@@ -47,6 +54,18 @@ enum Message {
 }
 
 static SINK: OnceLock<Sender<Message>> = OnceLock::new();
+
+/// Where `feedback` posts. Set by `init` when this build can send.
+static FEEDBACK: OnceLock<Target> = OnceLock::new();
+
+#[derive(Clone)]
+struct Target {
+    client: reqwest::Client,
+    url: String,
+    key: String,
+    id_file: Option<PathBuf>,
+    common: Map<String, Value>,
+}
 
 /// Whether the person opted in. Mirrors `Settings::send_error_reports`.
 static ENABLED: AtomicBool = AtomicBool::new(false);
@@ -77,7 +96,7 @@ pub fn init(config_dir: Option<&Path>, version: &str, enabled: bool) {
     if rustls::crypto::CryptoProvider::get_default().is_none() {
         let _ = rustls::crypto::ring::default_provider().install_default();
     }
-    let poster = Poster {
+    let target = Target {
         client: match reqwest::Client::builder().timeout(TIMEOUT).build() {
             Ok(client) => client,
             Err(e) => {
@@ -88,11 +107,12 @@ pub fn init(config_dir: Option<&Path>, version: &str, enabled: bool) {
         url: format!("{}/i/v0/e/", host.trim_end_matches('/')),
         key: key.to_string(),
         id_file: config_dir.map(|dir| dir.join(ID_FILE)),
-        distinct_id: None,
         common: common_properties(version),
     };
+    let poster = Poster { target: target.clone(), distinct_id: None };
     let (send, receive) = mpsc::channel();
     if SINK.set(send).is_ok() {
+        let _ = FEEDBACK.set(target);
         let spawned = std::thread::Builder::new()
             .name("analytics".into())
             .spawn(move || poster.run(receive));
@@ -124,6 +144,44 @@ pub fn exception(source: &str, message: &str) {
 
 /// Longest message sent, in characters.
 const MAX_MESSAGE: usize = 1000;
+
+/// Longest feedback sent, in characters.
+const MAX_FEEDBACK: usize = 10_000;
+
+/// Send a bug report (`kind` "bug") or feature request ("feature") now, and
+/// say whether PostHog took it.
+pub async fn feedback(kind: &str, message: &str) -> Result<(), String> {
+    let properties = feedback_properties(kind, message)?;
+    let Some(target) = FEEDBACK.get() else {
+        return Err("This build can't send feedback: only release builds can.".to_string());
+    };
+    let distinct_id = if ENABLED.load(Ordering::SeqCst) {
+        install_id(target.id_file.as_deref())
+    } else {
+        uuid::Uuid::new_v4().to_string()
+    };
+    let body = payload(&target.key, &distinct_id, &target.common, "feedback", properties);
+    target
+        .client
+        .post(&target.url)
+        .json(&body)
+        .send()
+        .await
+        .and_then(|r| r.error_for_status())
+        .map(|_| ())
+        .map_err(|e| format!("Could not send feedback: {}", e))
+}
+
+fn feedback_properties(kind: &str, message: &str) -> Result<Value, String> {
+    if kind != "bug" && kind != "feature" {
+        return Err(format!("Unknown kind of feedback: {}", kind));
+    }
+    let message: String = message.trim().chars().take(MAX_FEEDBACK).collect();
+    if message.is_empty() {
+        return Err("Write something first.".to_string());
+    }
+    Ok(json!({ "kind": kind, "message": message }))
+}
 
 /// Paths in error messages name the account (`/Users/<name>/…`), so the home
 /// folder becomes `~`; and a message is cut at `MAX_MESSAGE` characters.
@@ -230,13 +288,9 @@ impl Limiter {
 }
 
 struct Poster {
-    client: reqwest::Client,
-    url: String,
-    key: String,
-    id_file: Option<PathBuf>,
+    target: Target,
     /// Read or made on the first send, so nobody who never opts in gets one.
     distinct_id: Option<String>,
-    common: Map<String, Value>,
 }
 
 impl Poster {
@@ -256,7 +310,7 @@ impl Poster {
                 }
                 Message::Forget => {
                     self.distinct_id = None;
-                    if let Some(path) = &self.id_file {
+                    if let Some(path) = &self.target.id_file {
                         let _ = std::fs::remove_file(path);
                     }
                 }
@@ -265,12 +319,12 @@ impl Poster {
     }
 
     fn send(&mut self, name: &str, properties: Value) {
-        let id_file = self.id_file.as_deref();
-        let distinct_id = self.distinct_id.get_or_insert_with(|| install_id(id_file));
-        let body = payload(&self.key, distinct_id, &self.common, name, properties);
+        let target = &self.target;
+        let distinct_id = self.distinct_id.get_or_insert_with(|| install_id(target.id_file.as_deref()));
+        let body = payload(&target.key, distinct_id, &target.common, name, properties);
         // Built inside `block_on`: with a timeout set, `send` starts a tokio
         // timer straight away, which panics on this plain thread.
-        let request = async { self.client.post(&self.url).json(&body).send().await };
+        let request = async { target.client.post(&target.url).json(&body).send().await };
         if let Err(e) = tauri::async_runtime::block_on(request).and_then(|r| r.error_for_status()) {
             // Not a diagnostics error: that would be sent here again.
             eprintln!("Could not send {} to PostHog: {}", name, e);
@@ -294,6 +348,19 @@ mod tests {
         assert_eq!(properties["$process_person_profile"], false);
         assert_eq!(properties["$exception_list"][0]["type"], "ocr");
         assert_eq!(properties["$exception_list"][0]["value"], "boom");
+    }
+
+    #[test]
+    fn feedback_needs_a_known_kind_and_some_text() {
+        assert_eq!(
+            feedback_properties("bug", "  It crashed \n").unwrap(),
+            json!({ "kind": "bug", "message": "It crashed" })
+        );
+        assert!(feedback_properties("feature", "More colours").is_ok());
+        assert!(feedback_properties("praise", "Nice").is_err());
+        assert!(feedback_properties("bug", "   ").is_err());
+        let long = feedback_properties("bug", &"x".repeat(20_000)).unwrap();
+        assert_eq!(long["message"].as_str().unwrap().chars().count(), MAX_FEEDBACK);
     }
 
     #[test]
@@ -365,12 +432,14 @@ mod tests {
             let _ = rustls::crypto::ring::default_provider().install_default();
         }
         let mut poster = Poster {
-            client: reqwest::Client::builder().timeout(TIMEOUT).build().unwrap(),
-            url,
-            key: "phc_test".into(),
-            id_file: None,
+            target: Target {
+                client: reqwest::Client::builder().timeout(TIMEOUT).build().unwrap(),
+                url,
+                key: "phc_test".into(),
+                id_file: None,
+                common: common_properties("1.2.3"),
+            },
             distinct_id: None,
-            common: common_properties("1.2.3"),
         };
         std::thread::spawn(move || poster.send("$exception", exception_properties("test", "boom")))
             .join()
