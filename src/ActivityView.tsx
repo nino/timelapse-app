@@ -155,13 +155,18 @@ function Section({
 }): React.ReactNode {
   return (
     <section aria-label={title} className="rounded-xl border border-border bg-card px-4 py-3">
-      <h2 className="text-xs font-semibold uppercase tracking-wide text-muted-fg">{title}</h2>
-      {headline !== undefined && (
-        <p className="mt-1 flex items-center gap-2 font-medium">
-          <span aria-hidden className={`size-2 shrink-0 rounded-full ${dotColour[tone ?? "quiet"]}`} />
-          <span data-testid={`${title}-headline`}>{headline}</span>
-        </p>
-      )}
+      {/* The title and the headline share one row, split by the status dot. */}
+      <div className="flex items-baseline gap-2">
+        <h2 className="shrink-0 text-xs font-semibold uppercase tracking-wide text-muted-fg">{title}</h2>
+        {headline !== undefined && (
+          <>
+            <span aria-hidden className={`size-2 shrink-0 rounded-full ${dotColour[tone ?? "quiet"]}`} />
+            <p data-testid={`${title}-headline`} className="min-w-0 font-medium">
+              {headline}
+            </p>
+          </>
+        )}
+      </div>
       {children && <dl className="mt-2 grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 tabular-nums">{children}</dl>}
       {footer}
     </section>
