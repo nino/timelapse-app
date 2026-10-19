@@ -14,7 +14,8 @@
 //! lookup names the app and window in front (`FrontWindow`), so recording it
 //! costs no extra system call.
 //!
-//! A black frame makes the loop wait 10 s. A failed capture is retried on the
+//! A black frame makes the loop wait 10 s. A capture too small to be a screen
+//! (`MIN_CAPTURE_SIDE`) counts as failed. A failed capture is retried on the
 //! next tick, and only from the `FAILURES_BEFORE_BACKOFF`th failure in a row
 //! does it wait 60 s. Errors also go to a bounded in-memory log.
 
@@ -584,6 +585,11 @@ const FRAME_HEIGHT: u32 = 1124;
 /// laptop, which gets 1.14, three quarters.
 const MIN_PIXELS_PER_POINT: f64 = 1.0;
 
+/// The smallest width or height a capture can have and still be a screen.
+/// In October 2026 a 2×2 frame was stored, which only a capture a few pixels
+/// across can turn into, and Vision refuses to read it.
+const MIN_CAPTURE_SIDE: u32 = 64;
+
 /// How many pixels per point a big screen's frame gets, or as many as the
 /// capture has if fewer. At 1.4, with OCR reading such frames in tiles (see
 /// `ocr_tiles`), a 2560×1440-point screen's pages read about four fifths of
@@ -614,7 +620,18 @@ fn frame_size(capture: &Capture) -> (u32, u32) {
 /// The PNG is written to a hidden temporary file beside `file_path` and renamed
 /// into place, so an interrupted write never leaves a truncated `NNNNN.png`
 /// for `next_filename`, the viewer and the converter to trip over.
+///
+/// A capture smaller than `MIN_CAPTURE_SIDE` on either side is an error and
+/// nothing is written: no screen is that small, so it is a glitch.
 fn store_frame(capture: &Capture, file_path: &str) -> Result<bool, Error> {
+    if capture.width < MIN_CAPTURE_SIDE || capture.height < MIN_CAPTURE_SIDE {
+        return Err(Error::UnableToCreateScreenshot {
+            reason: format!(
+                "The screen gave a {}×{} image ({:.2} px a point), too small to be a screen",
+                capture.width, capture.height, capture.pixels_per_point
+            ),
+        });
+    }
     let frame = fit_to_frame(capture, file_path)?;
     if is_image_all_black(&frame) {
         return Ok(true);
@@ -1246,6 +1263,22 @@ mod tests {
         let capture = RgbImage::new(3456, 2234);
 
         assert!(store_frame(&capture_of(&capture), path.to_str().unwrap()).unwrap());
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 0, "nothing is written");
+    }
+
+    #[test]
+    fn test_store_frame_rejects_a_capture_too_small_to_be_a_screen() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("00001.png");
+        // A few pixels from a screen thought to be 1512 points wide: before,
+        // this became a 2×2 frame.
+        for (width, height) in [(1, 1), (3, 2), (3024, 2)] {
+            let capture = blank_capture(width, height, width as f64 / 1512.0);
+
+            let result = store_frame(&capture, path.to_str().unwrap());
+
+            assert!(matches!(result, Err(Error::UnableToCreateScreenshot { .. })), "{}×{}", width, height);
+        }
         assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 0, "nothing is written");
     }
 
