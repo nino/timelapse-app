@@ -12,7 +12,11 @@
 //! screenshots were deleted before OCR existed) are read from the videos
 //! instead, a batch at a time whenever there are no new screenshots to read,
 //! newest day first. There, frames are counted by their position in the day
-//! (see `ScreenshotDatabase::record_video_ocr_frame`).
+//! (see `ScreenshotDatabase::record_video_ocr_frame`). That backlog is large,
+//! so OCR first samples every `VIDEO_SAMPLE_STEP`-th frame of every such day
+//! (`record_video_ocr_sample`), then reads them all. Nothing waits on those
+//! days being read, unlike screenshots, whose PNGs stay until OCR has read
+//! every frame of their hour, so screenshots are never sampled.
 //!
 //! During a boost, screenshots are read several at a time by a pool of
 //! recognizers ahead of the frame being handled (see `ocr_readahead`).
@@ -24,9 +28,9 @@
 use crate::activity::{Activity, State};
 use crate::boost::Boost;
 use crate::converter::{is_day_folder_name, on_ac_power, OcrCheck, HourBatch};
-use crate::database::{LineBox, OcrProgress, ScreenshotDatabase};
+use crate::database::{DayOcrProgress, LineBox, OcrProgress, ScreenshotDatabase};
 use crate::ocr_readahead::ReadAhead;
-use frame_source::{FrameSource, RawFrame};
+use frame_source::{DayVideo, FrameSource, RawFrame};
 use image::{imageops, GrayImage};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -53,6 +57,14 @@ const FRAMES_PER_POWER_CHECK: usize = 30;
 /// screenshots that arrive meanwhile wait at most a few minutes. Decoding
 /// restarts at the progress mark with each batch.
 const VIDEO_FRAMES_PER_PASS: usize = 1800;
+
+/// Before reading every frame of the days that only exist as video, OCR
+/// reads every this-many-th frame of all of them: 20 s of screen time apart,
+/// since each video frame was one screenshot a second. Text usually stays on
+/// screen longer than that, so a search finds most things early, and a
+/// sample's text stands for the frames up to the next sample until the full
+/// read gets there.
+const VIDEO_SAMPLE_STEP: usize = 20;
 
 /// How much decoded video the OCR worker's frame source may cache. It decodes
 /// by streaming, which caches nothing, so this only bounds the folder.
@@ -381,6 +393,9 @@ pub struct VideoReader {
     /// Videos ffmpeg failed on, passed over until the app restarts rather than
     /// retried every pass.
     failed: HashSet<PathBuf>,
+    /// Sample every this-many-th frame of every day before reading them all
+    /// (`VIDEO_SAMPLE_STEP`), or `None` to read them all straight away.
+    sample_step: Option<usize>,
 }
 
 impl VideoReader {
@@ -389,7 +404,14 @@ impl VideoReader {
             source,
             scratch,
             failed: HashSet::new(),
+            sample_step: Some(VIDEO_SAMPLE_STEP),
         }
+    }
+
+    #[cfg(test)]
+    fn sampling_every(mut self, step: Option<usize>) -> Self {
+        self.sample_step = step;
+        self
     }
 }
 
@@ -769,19 +791,24 @@ impl OcrWorker {
         let mut pending = Vec::new();
         let mut days = videos.source.days().map_err(|e| e.to_string())?;
         days.reverse();
-        let progress: HashMap<String, (OcrProgress, bool)> = self
+        let progress: HashMap<String, DayOcrProgress> = self
             .db
             .all_ocr_progress()
             .map_err(|e| e.to_string())?
             .into_iter()
-            .map(|(day, progress, complete)| (day, (progress, complete)))
+            .map(|row| (row.day.clone(), row))
             .collect();
         for day in days {
             // None until OCR has started on the day.
-            let (done, marked_complete) = match progress.get(&day) {
-                None => (0, None),
-                Some((OcrProgress::VideoPosition(last), complete)) => (*last as usize, Some(*complete)),
-                Some((OcrProgress::FrameNumber(_), _)) => continue,
+            let (done, sampled, marked_complete) = match progress.get(&day) {
+                None => (0, 0, None),
+                Some(DayOcrProgress {
+                    progress: OcrProgress::VideoPosition(last),
+                    complete,
+                    sampled_through,
+                    ..
+                }) => (*last as usize, *sampled_through as usize, Some(*complete)),
+                Some(_) => continue,
             };
             let Some(day_videos) = videos.source.video_only_day(&day).map_err(|e| e.to_string())?
             else {
@@ -802,96 +829,160 @@ impl OcrWorker {
             }
             unread.retain(|video| !videos.failed.contains(&video.path));
             if !unread.is_empty() {
-                pending.push((day, done, unread, !any_failed));
+                pending.push(PendingVideoDay { day, done, sampled, videos: unread, whole: !any_failed });
             }
         }
         let frames_left = pending
             .iter()
-            .map(|(day, done, day_videos, _)| {
-                let left = day_videos
+            .map(|pending| {
+                let left = pending
+                    .videos
                     .iter()
-                    .map(|video| (video.first_index + video.frame_count - video.first_index.max(*done)) as u64)
+                    .map(|video| (video.first_index + video.frame_count - video.first_index.max(pending.done)) as u64)
                     .sum();
-                (day.clone(), left)
+                (pending.day.clone(), left)
             })
             .collect();
         self.activity.ocr_video_pass_started(frames_left);
 
-        for (day, done, day_videos, whole) in pending {
-            let mut finished = whole;
-            for video in day_videos {
+        // First every `VIDEO_SAMPLE_STEP`-th frame of every day, so that a
+        // search finds something on each day long before all are read.
+        let sampled_days = if videos.sample_step.is_some() { &pending[..] } else { &[] };
+        for pending in sampled_days {
+            let from = pending.done.max(pending.sampled);
+            for video in &pending.videos {
                 let end = video.first_index + video.frame_count;
-                let mut stopped = false;
-                let mut stalled = false;
-                let mut failure = None;
-                let scratch = videos.scratch.as_path();
-                let streamed = videos.source.stream_video(
-                    &video,
-                    done.saturating_sub(video.first_index),
-                    &mut |index, frame| {
-                        if summary.handled() >= max_frames
-                            || summary.handled() > 0
-                                && summary.handled() % FRAMES_PER_POWER_CHECK == 0
-                                && !keep_going()
-                        {
-                            stopped = true;
-                            return false;
-                        }
-                        let position = (video.first_index + index + 1) as u32;
-                        let result = self.handle_video_frame(&day, position, &frame, scratch);
-                        let what = format!("{} video frame", day);
-                        let Some(outcome) = self.settle(&day, position, &what, result) else {
-                            stalled = true;
-                            return false;
-                        };
-                        if outcome == Outcome::Failed {
-                            let recorded = self.db.record_video_ocr_frame(&day, position, None);
-                            if let Err(error) = recorded {
-                                failure = Some(error.to_string());
-                                return false;
-                            }
-                        }
-                        summary.count(outcome);
-                        self.activity.ocr_frame_handled(&day, position, outcome);
-                        true
-                    },
-                );
-                if let Some(error) = failure {
-                    return Err(error);
+                if end <= from {
+                    continue;
                 }
-                if stalled {
-                    summary.stalled = true;
-                    return Ok(summary);
+                let first = from.saturating_sub(video.first_index);
+                match self.read_video(videos, &pending.day, video, first, true, &mut summary, max_frames, keep_going)? {
+                    VideoRead::Stopped => return Ok(summary),
+                    VideoRead::Finished => self
+                        .db
+                        .record_video_ocr_sample(&pending.day, end as u32, None)
+                        .map_err(|e| e.to_string())?,
+                    // The full read below won't get past it either.
+                    VideoRead::Failed => break,
                 }
-                if stopped {
-                    return Ok(summary);
+            }
+            // Kept only while sampling the day, rather than one thumbnail
+            // for every day of the backlog.
+            let key = sample_key(&pending.day);
+            self.last_read.remove(&key);
+            self.last_text.remove(&key);
+        }
+
+        // Then every frame, day by day.
+        for pending in pending {
+            let mut finished = pending.whole;
+            for video in &pending.videos {
+                if videos.failed.contains(&video.path) {
+                    finished = false;
+                    break;
                 }
-                match streamed {
+                let end = video.first_index + video.frame_count;
+                let first = pending.done.saturating_sub(video.first_index);
+                match self.read_video(videos, &pending.day, video, first, false, &mut summary, max_frames, keep_going)? {
+                    VideoRead::Stopped => return Ok(summary),
                     // The container can claim more frames than decode, so a
                     // finished video counts as done up to its end; otherwise
                     // the mark would stop short and the tail be decoded again
                     // every pass.
-                    Ok(()) => self
+                    VideoRead::Finished => self
                         .db
-                        .record_video_ocr_frame(&day, end as u32, None)
+                        .record_video_ocr_frame(&pending.day, end as u32, None)
                         .map_err(|e| e.to_string())?,
-                    Err(error) => {
-                        self.activity
-                            .ocr_failed(format!("Cannot decode {}: {}", video.path.display(), error));
-                        videos.failed.insert(video.path.clone());
-                        // Later videos would move the mark past this one's
-                        // unread frames.
+                    // Later videos would move the mark past this one's
+                    // unread frames.
+                    VideoRead::Failed => {
                         finished = false;
                         break;
                     }
                 }
             }
             if finished {
-                self.mark_complete(&day, true);
+                self.mark_complete(&pending.day, true);
             }
         }
 
         Ok(summary)
+    }
+
+    /// Hand `video`'s frames from its frame `first` on to OCR, or with
+    /// `sampling` only every `VIDEO_SAMPLE_STEP`-th of them, counting each in
+    /// `summary`. A video ffmpeg fails on is added to `videos.failed`.
+    #[allow(clippy::too_many_arguments)]
+    fn read_video(
+        &mut self,
+        videos: &mut VideoReader,
+        day: &str,
+        video: &DayVideo,
+        first: usize,
+        sampling: bool,
+        summary: &mut PassSummary,
+        max_frames: usize,
+        keep_going: &mut dyn FnMut() -> bool,
+    ) -> Result<VideoRead, String> {
+        let mut stopped = false;
+        let mut stalled = false;
+        let mut failure = None;
+        let scratch = videos.scratch.as_path();
+        let step = if sampling { videos.sample_step.unwrap_or(1) } else { 1 };
+        let streamed = videos.source.stream_video_every(video, first, step, &mut |index, frame| {
+            if summary.handled() >= max_frames
+                || summary.handled() > 0
+                    && summary.handled() % FRAMES_PER_POWER_CHECK == 0
+                    && !keep_going()
+            {
+                stopped = true;
+                return false;
+            }
+            let position = (video.first_index + index + 1) as u32;
+            let result = self.handle_video_frame(day, position, &frame, scratch, sampling);
+            let what = format!("{} video frame", day);
+            let Some(outcome) = self.settle(day, position, &what, result) else {
+                stalled = true;
+                return false;
+            };
+            if outcome == Outcome::Failed {
+                let recorded = if sampling {
+                    self.db.record_video_ocr_sample(day, position, None)
+                } else {
+                    self.db.record_video_ocr_frame(day, position, None)
+                };
+                if let Err(error) = recorded {
+                    failure = Some(error.to_string());
+                    return false;
+                }
+            }
+            summary.count(outcome);
+            if sampling {
+                self.activity.ocr_frame_sampled(day, position, outcome);
+            } else {
+                self.activity.ocr_frame_handled(day, position, outcome);
+            }
+            true
+        });
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        if stalled {
+            summary.stalled = true;
+            return Ok(VideoRead::Stopped);
+        }
+        if stopped {
+            return Ok(VideoRead::Stopped);
+        }
+        match streamed {
+            Ok(()) => Ok(VideoRead::Finished),
+            Err(error) => {
+                self.activity
+                    .ocr_failed(format!("Cannot decode {}: {}", video.path.display(), error));
+                videos.failed.insert(video.path.clone());
+                Ok(VideoRead::Failed)
+            }
+        }
     }
 
     /// Set `day`'s complete flag for the day picker. Only the picker reads
@@ -908,6 +999,7 @@ impl OcrWorker {
         position: u32,
         frame: &RawFrame,
         scratch: &Path,
+        sampling: bool,
     ) -> Result<bool, FrameError> {
         let started = Instant::now();
         let thumbnail = Thumbnail::of_rgb(frame).map_err(FrameError::Unreadable)?;
@@ -918,10 +1010,47 @@ impl OcrWorker {
             write_png(&path, frame)?;
             Ok(path)
         };
+        if sampling {
+            // Compared with the last sample, not with the full read's last
+            // frame, which may be anywhere in the day.
+            return self.read_if_changed(&sample_key(day), thumbnail, &image, &|db, result| {
+                db.record_video_ocr_sample(day, position, result)
+            });
+        }
         self.read_if_changed(day, thumbnail, &image, &|db, result| {
             db.record_video_ocr_frame(day, position, result)
         })
     }
+}
+
+/// What the sampling pass keeps a day's last sample under in
+/// `last_read`/`last_text`, apart from the full read's last frame.
+fn sample_key(day: &str) -> String {
+    format!("{day} samples")
+}
+
+/// A day read from video with frames left to read, as a video pass lists it.
+struct PendingVideoDay {
+    day: String,
+    /// The day's progress mark.
+    done: usize,
+    /// How far the sampling pass has got.
+    sampled: usize,
+    /// Its videos with frames past the mark, except ones that failed.
+    videos: Vec<DayVideo>,
+    /// No video of the day has failed to decode.
+    whole: bool,
+}
+
+/// How reading one video ended.
+enum VideoRead {
+    /// It was read to the end.
+    Finished,
+    /// The pass has to stop: it was told to, reached its frame limit, or the
+    /// recognizer failed.
+    Stopped,
+    /// ffmpeg failed on it.
+    Failed,
 }
 
 /// Write a decoded frame as a PNG, favouring speed over size: it is read once
@@ -1814,7 +1943,16 @@ mod tests {
             )
             .unwrap();
             let scratch = self.root.join(".ocr");
-            self.worker = self.worker.with_videos(VideoReader::new(source, scratch));
+            // Most tests here are about reading every frame; the sampling
+            // pass's own tests turn it on with `sampling_every`.
+            let videos = VideoReader::new(source, scratch).sampling_every(None);
+            self.worker = self.worker.with_videos(videos);
+            self
+        }
+
+        fn sampling_every(mut self, step: usize) -> Library {
+            let videos = self.worker.videos.take().unwrap().sampling_every(Some(step));
+            self.worker.videos = Some(videos);
             self
         }
 
@@ -1833,7 +1971,7 @@ mod tests {
                 .all_ocr_progress()
                 .unwrap()
                 .into_iter()
-                .any(|(d, _, complete)| d == day && complete)
+                .any(|row| row.day == day && row.complete)
         }
     }
 
@@ -1897,6 +2035,82 @@ mod tests {
         assert!(library.complete(DAY_1));
         // Every frame differs from the one before it, so all are read.
         assert_eq!(library.seen().len(), 5);
+    }
+
+    #[test]
+    fn samples_every_video_day_before_reading_them_all() {
+        let mut library = Library::new().with_videos().sampling_every(2);
+        if !write_video(&library.root.join("2024-01-01--18-00-00.mov"), &[0, 200, 0, 200, 0, 200])
+            || !write_video(&library.root.join("2024-01-02--20-00-00.mov"), &[0, 300, 300, 0])
+        {
+            eprintln!("skipping: ffmpeg with libx264 is not available");
+            return;
+        }
+        let sampled = |library: &Library, day: &str| {
+            let rows = library.worker.db.all_ocr_progress().unwrap();
+            rows.into_iter().find(|row| row.day == day).map(|row| row.sampled_through)
+        };
+
+        // Newest day first: day 2's positions 1 and 3, then day 1's 1 and 3,
+        // before the pass runs out of frames. Day 2's third frame looks like
+        // its first, and is compared with that sample, not with the frame
+        // before it.
+        let summary = library.video_pass(4);
+        assert_eq!(summary, PassSummary { recognized: 3, skipped: 1, ..Default::default() });
+        assert_eq!(sampled(&library, DAY_2), Some(4));
+        assert_eq!(sampled(&library, DAY_1), Some(3));
+        // Samples don't count down what is left to read in full.
+        let left = library.worker.activity.ocr_video_frames_left().unwrap();
+        assert_eq!((left.get(DAY_1), left.get(DAY_2)), (Some(&6), Some(&4)));
+        // Nothing is read through yet, but both days are searchable.
+        assert_eq!(library.progress(DAY_1), Some(OcrProgress::VideoPosition(0)));
+        assert_eq!(library.progress(DAY_2), Some(OcrProgress::VideoPosition(0)));
+        let mut hits: Vec<_> = library
+            .worker
+            .db
+            .search_ocr("video", 10)
+            .unwrap()
+            .into_iter()
+            .map(|hit| (hit.day, hit.frame_number, hit.from_video))
+            .collect();
+        hits.sort();
+        assert_eq!(hits, vec![(DAY_1.to_string(), 1, true), (DAY_2.to_string(), 1, true)]);
+        // A sample's text stands for the frames after it up to how far
+        // sampling has got.
+        let matches = library.worker.db.search_ocr_in_day(DAY_1, "video").unwrap();
+        assert_eq!(matches[0].done_through, Some(3));
+
+        // Then the rest of day 1's samples (positions 4 and 6), and then
+        // every frame, newest day first.
+        let summary = library.video_pass(usize::MAX);
+        assert_eq!(summary.handled(), 2 + 4 + 6);
+        assert_eq!(sampled(&library, DAY_1), Some(6));
+        assert_eq!(library.progress(DAY_1), Some(OcrProgress::VideoPosition(6)));
+        assert_eq!(library.progress(DAY_2), Some(OcrProgress::VideoPosition(4)));
+        assert!(library.complete(DAY_1) && library.complete(DAY_2));
+        // Each day's last sample is forgotten once the day is sampled.
+        assert!(library.worker.last_read.keys().all(|key| !key.ends_with("samples")));
+
+        assert_eq!(library.video_pass(usize::MAX), PassSummary::default());
+    }
+
+    #[test]
+    fn samples_only_what_is_left_of_a_day() {
+        let mut library = Library::new().with_videos().sampling_every(2);
+        if !write_video(&library.root.join("2024-01-01--18-00-00.mov"), &[0, 200, 0])
+            || !write_video(&library.root.join("2024-01-01--23-00-00.mov"), &[200, 0, 200])
+        {
+            eprintln!("skipping: ffmpeg with libx264 is not available");
+            return;
+        }
+        // Read through the first video before sampling existed.
+        library.worker.db.record_video_ocr_frame(DAY_1, 3, None).unwrap();
+
+        // Sampling starts at the mark: positions 4 and 6, then the full read
+        // covers 4 to 6.
+        let summary = library.video_pass(usize::MAX);
+        assert_eq!(summary.handled(), 2 + 3);
+        assert_eq!(library.progress(DAY_1), Some(OcrProgress::VideoPosition(6)));
     }
 
     #[test]

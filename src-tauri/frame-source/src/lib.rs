@@ -518,7 +518,18 @@ impl FrameSource {
         first: usize,
         on_frame: &mut dyn FnMut(usize, RawFrame) -> bool,
     ) -> Result<(), Error> {
-        video::stream_frames(&self.tools, &video.path, video.info, first, on_frame)
+        self.stream_video_every(video, first, 1, on_frame)
+    }
+
+    /// `stream_video` for only every `step`-th frame from `first` on.
+    pub fn stream_video_every(
+        &self,
+        video: &DayVideo,
+        first: usize,
+        step: usize,
+        on_frame: &mut dyn FnMut(usize, RawFrame) -> bool,
+    ) -> Result<(), Error> {
+        video::stream_frames(&self.tools, &video.path, video.info, first, step, on_frame)
     }
 
     /// Where frames recorded by number (as OCR records them) sit in the day:

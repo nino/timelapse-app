@@ -664,6 +664,18 @@ fn streams_every_frame_of_a_video_only_day() {
         .unwrap();
     assert_eq!(seen, (5..20).collect::<Vec<_>>());
 
+    // Every fourth frame from frame 5 on, each the frame its index says.
+    let mut seen = Vec::new();
+    source
+        .stream_video_every(&videos[0], 5, 4, &mut |index, frame| {
+            let level = usize::from(frame.rgb[0]);
+            assert!(level.abs_diff(index * LEVEL_STEP) <= 2, "frame {index}: gray {level}");
+            seen.push(index);
+            true
+        })
+        .unwrap();
+    assert_eq!(seen, vec![5, 9, 13, 17]);
+
     // Stopping early.
     let mut count = 0;
     source

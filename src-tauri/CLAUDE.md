@@ -23,7 +23,7 @@ All in `screenshots.db`, keyed by `(day, frame_number)`:
 - `screenshots` — one row per stored PNG, with its capture time (`created_at` UTC, `local_time`), `day` folder name, and `window_id` (the app and window in front, NULL when unknown).
 - `windows` — one row per distinct app path, app name and window title.
 - `ocr_frames` — OCR text, one line per box, boxes packed by `pack_boxes`; one row per frame whose text differs from the day's previous row, so a row stands for every frame up to the next one. `menu_app` is the front app read from the menu bar text, a guess for frames without `window_id`. Searched through the FTS5 index `ocr_fts`.
-- `ocr_progress` — per day, the highest frame OCR has handled, with every frame below it handled too. For a day read from video (`by_position`) the numbers are positions in the day's videos instead, and `complete` is set once OCR has read all of them.
+- `ocr_progress` — per day, the highest frame OCR has handled, with every frame below it handled too. For a day read from video (`by_position`) the numbers are positions in the day's videos instead, and `complete` is set once OCR has read all of them. `sampled_through` is how far OCR's first, every-20th-frame pass over such days has got; the samples' rows sit ahead of the mark until the full read catches up.
 - `video_frames` — for each hourly video, which screenshot each of its frames came from and its capture time, so frames keep their time once the PNGs are gone.
 
 ## Things to know before changing behaviour

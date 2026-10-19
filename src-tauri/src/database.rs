@@ -308,6 +308,19 @@ impl ScreenshotDatabase {
             )?;
         }
 
+        // Migration 10: how far OCR's sampling pass has got through a day
+        // read from video (see `record_video_ocr_sample`).
+        if !Self::migration_applied(&tx, "ocr_video_samples")? {
+            tx.execute(
+                "ALTER TABLE ocr_progress ADD COLUMN sampled_through INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+            tx.execute(
+                "INSERT INTO migrations (migration_name, applied_at) VALUES (?1, ?2)",
+                rusqlite::params!["ocr_video_samples", Utc::now().to_rfc3339()],
+            )?;
+        }
+
         tx.commit()?;
 
         Ok(vacuum)
@@ -564,34 +577,60 @@ impl ScreenshotDatabase {
         by_position: bool,
     ) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
-
         if let Some((text, boxes)) = result {
-            tx.execute(
-                "INSERT INTO ocr_frames (day, frame_number, text, boxes, processed_at, menu_app)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                 ON CONFLICT (day, frame_number) DO UPDATE SET
-                     text = excluded.text,
-                     boxes = excluded.boxes,
-                     processed_at = excluded.processed_at,
-                     menu_app = excluded.menu_app",
-                rusqlite::params![
-                    day,
-                    frame_number,
-                    text,
-                    pack_boxes(boxes),
-                    Utc::now().to_rfc3339(),
-                    menu_bar_app(text, boxes)
-                ],
-            )?;
+            Self::store_text(&tx, day, frame_number, text, boxes)?;
         }
-
         tx.execute(
             "INSERT INTO ocr_progress (day, last_frame, by_position) VALUES (?1, ?2, ?3)
              ON CONFLICT (day) DO UPDATE SET last_frame = max(last_frame, excluded.last_frame)",
             rusqlite::params![day, frame_number, by_position],
         )?;
-
         tx.commit()
+    }
+
+    /// Record a frame that OCR's sampling pass over a day read from video
+    /// handled: like `record_video_ocr_frame`, except that the progress mark
+    /// stays put, since the frames between samples are still unread, and the
+    /// day's `sampled_through` moves up to `position` instead.
+    pub fn record_video_ocr_sample(
+        &self,
+        day: &str,
+        position: u32,
+        result: Option<(&str, &[LineBox])>,
+    ) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        if let Some((text, boxes)) = result {
+            Self::store_text(&tx, day, position, text, boxes)?;
+        }
+        tx.execute(
+            "INSERT INTO ocr_progress (day, last_frame, by_position, sampled_through)
+             VALUES (?1, 0, 1, ?2)
+             ON CONFLICT (day) DO UPDATE SET
+                 sampled_through = max(sampled_through, excluded.sampled_through)",
+            rusqlite::params![day, position],
+        )?;
+        tx.commit()
+    }
+
+    fn store_text(tx: &Transaction, day: &str, frame_number: u32, text: &str, boxes: &[LineBox]) -> Result<()> {
+        tx.execute(
+            "INSERT INTO ocr_frames (day, frame_number, text, boxes, processed_at, menu_app)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT (day, frame_number) DO UPDATE SET
+                 text = excluded.text,
+                 boxes = excluded.boxes,
+                 processed_at = excluded.processed_at,
+                 menu_app = excluded.menu_app",
+            rusqlite::params![
+                day,
+                frame_number,
+                text,
+                pack_boxes(boxes),
+                Utc::now().to_rfc3339(),
+                menu_bar_app(text, boxes)
+            ],
+        )?;
+        Ok(())
     }
 
     /// The highest frame of `day` that OCR has handled, with every frame below
@@ -638,12 +677,12 @@ impl ScreenshotDatabase {
         Ok(())
     }
 
-    /// Every day's OCR progress, and for days read from video whether OCR
-    /// has finished them, in day order.
-    pub fn all_ocr_progress(&self) -> Result<Vec<(String, OcrProgress, bool)>> {
-        let mut statement = self
-            .conn
-            .prepare("SELECT day, last_frame, by_position, complete FROM ocr_progress ORDER BY day")?;
+    /// Every day's OCR progress, in day order.
+    pub fn all_ocr_progress(&self) -> Result<Vec<DayOcrProgress>> {
+        let mut statement = self.conn.prepare(
+            "SELECT day, last_frame, by_position, complete, sampled_through
+             FROM ocr_progress ORDER BY day",
+        )?;
         let rows = statement.query_map([], |row| {
             let last: u32 = row.get(1)?;
             let progress = if row.get(2)? {
@@ -651,7 +690,12 @@ impl ScreenshotDatabase {
             } else {
                 OcrProgress::FrameNumber(last)
             };
-            Ok((row.get(0)?, progress, row.get(3)?))
+            Ok(DayOcrProgress {
+                day: row.get(0)?,
+                progress,
+                complete: row.get(3)?,
+                sampled_through: row.get(4)?,
+            })
         })?;
         rows.collect()
     }
@@ -779,14 +823,15 @@ impl ScreenshotDatabase {
 
         // A row stands for every frame up to the day's next row, because OCR
         // only writes a row when the screen changed. The day's last row runs
-        // to the end of what OCR has handled.
+        // to the end of what OCR has handled or sampled.
         let mut statement = self.conn.prepare(
             "WITH day_rows AS (
                  SELECT id, frame_number,
                         LEAD(frame_number) OVER (ORDER BY frame_number) AS next_frame
                  FROM ocr_frames WHERE day = ?1
              )
-             SELECT day_rows.frame_number, day_rows.next_frame, ocr_progress.last_frame
+             SELECT day_rows.frame_number, day_rows.next_frame,
+                    max(ocr_progress.last_frame, ocr_progress.sampled_through)
              FROM day_rows
              JOIN ocr_fts ON ocr_fts.rowid = day_rows.id
              LEFT JOIN ocr_progress ON ocr_progress.day = ?1
@@ -968,7 +1013,8 @@ pub struct OcrDayMatch {
     /// The day's next OCR'd frame, where this frame's text stops standing in
     /// for the frames after it. `None` for the day's last OCR'd frame.
     pub next_frame: Option<u32>,
-    /// The highest frame OCR has handled on the day (see `ocr_done_through`).
+    /// The highest frame OCR has handled on the day (see `ocr_done_through`),
+    /// or sampled, if its sampling pass got further.
     pub done_through: Option<u32>,
 }
 
@@ -983,6 +1029,18 @@ pub struct OcrHit {
     pub snippet: String,
     /// The day was read from video because its screenshots were already gone.
     pub from_video: bool,
+}
+
+/// One day's row of `ocr_progress`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DayOcrProgress {
+    pub day: String,
+    pub progress: OcrProgress,
+    /// For a day read from video, whether OCR has read all of its videos.
+    pub complete: bool,
+    /// For a day read from video, the furthest position OCR's sampling pass
+    /// has handled (0 if it hasn't started); see `record_video_ocr_sample`.
+    pub sampled_through: u32,
 }
 
 /// A day's OCR progress mark; see `record_ocr_frame` and
@@ -1480,6 +1538,33 @@ mod tests {
         assert_eq!(rows, 1);
 
         assert_eq!(db.ocr_done_through("2024-01-02").unwrap(), None);
+    }
+
+    #[test]
+    fn test_video_samples_leave_the_mark() {
+        let temp_dir = TempDir::new().unwrap();
+        let db = ScreenshotDatabase::new(temp_dir.path().join("test.db")).unwrap();
+
+        db.record_video_ocr_frame("2024-01-02", 10, Some(("read through", &[]))).unwrap();
+        db.record_video_ocr_sample("2024-01-02", 40, Some(("sampled text", &[]))).unwrap();
+        db.record_video_ocr_sample("2024-01-02", 30, None).unwrap();
+        db.record_video_ocr_sample("2024-01-03", 1, Some(("sampled text", &[]))).unwrap();
+
+        let rows = db.all_ocr_progress().unwrap();
+        let summary: Vec<_> = rows.iter().map(|row| (row.day.as_str(), row.progress, row.sampled_through)).collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("2024-01-02", OcrProgress::VideoPosition(10), 40),
+                ("2024-01-03", OcrProgress::VideoPosition(0), 1),
+            ]
+        );
+        // A sample is found like any other video frame, and its text runs to
+        // where sampling got.
+        let hits = db.search_ocr("sampled", 10).unwrap();
+        assert!(hits.iter().all(|hit| hit.from_video));
+        let found = db.search_ocr_in_day("2024-01-02", "sampled").unwrap();
+        assert_eq!((found[0].frame_number, found[0].next_frame, found[0].done_through), (40, None, Some(40)));
     }
 
     #[test]
