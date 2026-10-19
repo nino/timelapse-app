@@ -144,27 +144,38 @@ pub struct RawFrame<'a> {
     pub rgb: &'a [u8],
 }
 
-/// Decode every frame of `video` from frame `first` on, handing each to
-/// `on_frame` with its index in the video, without writing anything to disk.
-/// Stops early, killing ffmpeg, when `on_frame` returns false.
+/// Decode every `step`-th frame of `video` from frame `first` on (`first`,
+/// `first + step`, …), handing each to `on_frame` with its index in the
+/// video, without writing anything to disk. Stops early, killing ffmpeg,
+/// when `on_frame` returns false.
 ///
 /// This is for bulk work that reads a whole video once, such as OCR, so
-/// ffmpeg always runs at background priority.
+/// ffmpeg always runs at background priority. With a `step` over 1 ffmpeg
+/// still decodes every frame, since each depends on the ones before it, but
+/// only converts and sends the ones asked for.
 pub fn stream_frames(
     tools: &Tools,
     video: &Path,
     info: VideoInfo,
     first: usize,
+    step: usize,
     on_frame: &mut dyn FnMut(usize, RawFrame) -> bool,
 ) -> Result<(), Error> {
+    let step = step.max(1);
     let mut command = Command::new(&tools.ffmpeg);
     lower_priority(&mut command);
+    command
+        .args(["-v", "error", "-nostdin", "-ss", &format!("{:.6}", seek_to(first, info))])
+        .arg("-i")
+        .arg(video);
+    if step > 1 {
+        // `n` counts from the seek point, so frame `first` is n = 0.
+        // Passthrough stops ffmpeg from repeating frames to fill the gaps.
+        command.args(["-vf", &format!("select=not(mod(n\\,{step}))"), "-fps_mode", "passthrough"]);
+    }
     // PPM rather than raw video: each frame carries its own size, so nothing
     // has to be probed first.
     let mut child = command
-        .args(["-v", "error", "-nostdin", "-ss", &format!("{:.6}", seek_to(first, info))])
-        .arg("-i")
-        .arg(video)
         .args(["-f", "image2pipe", "-c:v", "ppm", "-pix_fmt", "rgb24", "-"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -198,7 +209,7 @@ pub fn stream_frames(
         if !on_frame(index, frame) {
             break false;
         }
-        index += 1;
+        index += step;
     };
 
     if !finished {

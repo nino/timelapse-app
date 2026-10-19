@@ -14,7 +14,8 @@
 //!   covers the frames its hourly videos were made from (`video_frames`),
 //!   or, if it is read from video, once OCR has marked it complete
 //!   (`ScreenshotDatabase::set_video_day_complete`). It is partial once the
-//!   progress mark is past zero but the day isn't done.
+//!   progress mark is past zero, or OCR has sampled some of a day read from
+//!   video, but the day isn't done.
 //!
 //! A day with neither screenshots nor videos (an empty folder while the
 //! screen is locked) gets no status, and nor does a day whose folder can't
@@ -66,7 +67,9 @@ pub struct Backlog {
     pub uncounted_days: usize,
 }
 
-type Progress = HashMap<String, (OcrProgress, bool)>;
+/// Per day: the progress mark, whether a day read from video is complete,
+/// and how far OCR's sampling pass has got through such a day.
+type Progress = HashMap<String, (OcrProgress, bool, u32)>;
 
 /// The status of every day in `root` that has frames, oldest first. `db` is
 /// `None` before the library has a database, when OCR has done nothing.
@@ -109,11 +112,11 @@ pub fn remaining_work(
         }
         work.ocr.days += 1;
         let frames = match (folder.last_screenshot(), progress.get(date)) {
-            (Some(_), Some((OcrProgress::FrameNumber(done), _))) => {
+            (Some(_), Some((OcrProgress::FrameNumber(done), _, _))) => {
                 Some(folder.screenshots.iter().filter(|&&n| n > *done).count() as u64)
             }
             (Some(_), _) => Some(folder.screenshots.len() as u64),
-            (None, Some((OcrProgress::FrameNumber(done), _))) => {
+            (None, Some((OcrProgress::FrameNumber(done), _, _))) => {
                 db.and_then(|db| db.video_frames_after(date, *done).ok())
             }
             (None, _) => video_frames_left.and_then(|left| left.get(date).copied()),
@@ -132,7 +135,7 @@ fn scan(root: &Path, db: Option<&ScreenshotDatabase>) -> std::io::Result<(Progre
     let progress: Progress = match db.map(|db| db.all_ocr_progress()) {
         Some(Ok(rows)) => rows
             .into_iter()
-            .map(|(day, progress, complete)| (day, (progress, complete)))
+            .map(|row| (row.day, (row.progress, row.complete, row.sampled_through)))
             .collect(),
         Some(Err(error)) => {
             eprintln!("Day statuses: cannot read OCR progress: {}", error);
@@ -182,7 +185,7 @@ fn scan(root: &Path, db: Option<&ScreenshotDatabase>) -> std::io::Result<(Progre
 
 /// How much of `date` OCR has read.
 fn ocr_stage(date: &str, folder: &DayFolder, progress: &Progress, db: Option<&ScreenshotDatabase>) -> Stage {
-    let Some((mark, complete)) = progress.get(date) else {
+    let Some((mark, complete, sampled_through)) = progress.get(date) else {
         return Stage::Todo;
     };
     let done = match (folder.last_screenshot(), mark) {
@@ -194,7 +197,8 @@ fn ocr_stage(date: &str, folder: &DayFolder, progress: &Progress, db: Option<&Sc
         (Some(_), OcrProgress::VideoPosition(_)) => false,
     };
     let started = match mark {
-        OcrProgress::FrameNumber(done) | OcrProgress::VideoPosition(done) => *done > 0,
+        OcrProgress::FrameNumber(done) => *done > 0,
+        OcrProgress::VideoPosition(done) => *done > 0 || *sampled_through > 0,
     };
     if done {
         Stage::Done
@@ -284,6 +288,9 @@ mod tests {
         db.record_video_ocr_frame("2024-01-02", 10, None).unwrap();
         // Old script's day OCR hasn't reached.
         touch(&root.join("2024-01-03--20-00-00.mov"));
+        // Old script's day OCR has only sampled.
+        touch(&root.join("2024-01-04--20-00-00.mov"));
+        db.record_video_ocr_sample("2024-01-04", 40, None).unwrap();
         // Converted hour by hour; the PNGs went after OCR.
         touch(&root.join("2026-10-01--09-00-00--hourly.mov"));
         let frames = [(3599, Local::now()), (3600, Local::now())];
@@ -311,6 +318,7 @@ mod tests {
                 status("2024-01-01", Done, Done),
                 status("2024-01-02", Partial, Done),
                 status("2024-01-03", Todo, Done),
+                status("2024-01-04", Partial, Done),
                 status("2026-10-01", Done, Done),
                 status("2026-10-02", Done, Partial),
                 status("2026-10-03", Partial, Todo),

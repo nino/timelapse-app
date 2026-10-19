@@ -435,6 +435,17 @@ impl Activity {
     }
 
     pub fn ocr_frame_handled(&self, day: &str, number: u32, outcome: crate::ocr::Outcome) {
+        self.frame_handled(day, number, outcome, true);
+    }
+
+    /// A frame of a day read from video was handled by OCR's sampling pass,
+    /// which leaves the day's frames to be read in full later, so they are
+    /// not counted down.
+    pub fn ocr_frame_sampled(&self, day: &str, number: u32, outcome: crate::ocr::Outcome) {
+        self.frame_handled(day, number, outcome, false);
+    }
+
+    fn frame_handled(&self, day: &str, number: u32, outcome: crate::ocr::Outcome, counts_down: bool) {
         let mut reading_video = false;
         self.update(|s| {
             reading_video = s.ocr.reading_video;
@@ -446,7 +457,7 @@ impl Activity {
                 crate::ocr::Outcome::Failed => s.ocr.failed += 1,
             }
         });
-        if reading_video {
+        if reading_video && counts_down {
             if let Ok(mut left) = self.video_frames_left.lock() {
                 if let Some(frames) = left.as_mut().and_then(|left| left.get_mut(day)) {
                     *frames = frames.saturating_sub(1);
