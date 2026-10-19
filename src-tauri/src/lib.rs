@@ -678,6 +678,13 @@ fn log_frontend_error(window: tauri::Window, message: String, detail: Option<Str
         .record();
 }
 
+/// Sends a bug report (`kind` "bug") or feature request ("feature") to
+/// PostHog and says whether it arrived (`analytics::feedback`).
+#[tauri::command]
+async fn send_feedback(kind: String, message: String) -> Result<(), String> {
+    analytics::feedback(&kind, &message).await
+}
+
 /// The app's settings. Changes apply at once and are saved straight away.
 #[tauri::command]
 fn get_settings(settings: State<'_, SettingsStore>) -> Settings {
@@ -1291,6 +1298,7 @@ pub fn run() {
             stop_low_power,
             set_boost_allow_battery,
             log_frontend_error,
+            send_feedback,
             get_settings,
             set_update_automatically,
             set_send_error_reports,

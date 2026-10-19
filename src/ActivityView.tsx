@@ -21,9 +21,10 @@ import {
   type Failure,
   type RemainingWork,
 } from "./activity";
+import { sendFeedback, type FeedbackKind } from "./feedback";
 import { useActivity } from "./hooks/useActivity";
 import { useRemainingWork } from "./hooks/useRemainingWork";
-import { focusRing, segmentButton } from "./ui";
+import { fieldFrame, focusRing, segmentButton } from "./ui";
 
 /** The Activity window (Window → Activity): what capture, video conversion and OCR are doing. */
 export function ActivityView(): React.ReactNode {
@@ -51,7 +52,7 @@ export function ActivityView(): React.ReactNode {
           <Capture capture={activity.capture} now={now} />
           <Conversion conversion={activity.conversion} now={now} />
           <Ocr ocr={activity.ocr} now={now} />
-          <ErrorTest />
+          <Feedback />
         </>
       ) : (
         !error && <p className="text-muted-fg">Loading…</p>
@@ -60,23 +61,81 @@ export function ActivityView(): React.ReactNode {
   );
 }
 
-// Throws a test error, to check that error reports reach PostHog. The
-// window's error listener (`diagnostics.ts`) logs it like any other
-// frontend error, and a release build with "Send error reports" on sends it.
-function ErrorTest(): React.ReactNode {
+// `segmentButton` without its fixed width, for labels of any length.
+const kindButton = `inline-flex items-center px-3 transition-colors hover:bg-muted ${focusRing}`;
+
+const FEEDBACK_KINDS: { kind: FeedbackKind; label: string; placeholder: string }[] = [
+  { kind: "bug", label: "Bug", placeholder: "What went wrong, and what did you expect?" },
+  { kind: "feature", label: "Feature request", placeholder: "What would you like the app to do?" },
+];
+
+/**
+ * A bug report or feature request, sent to PostHog as a "feedback" event
+ * (`analytics::feedback`), whether or not error reports are on.
+ */
+function Feedback(): React.ReactNode {
+  const [kind, setKind] = React.useState<FeedbackKind>("bug");
+  const [message, setMessage] = React.useState("");
+  const [busy, setBusy] = React.useState(false);
+  const [result, setResult] = React.useState<{ sent: true } | { error: string } | null>(null);
+  const { placeholder } = FEEDBACK_KINDS.find((k) => k.kind === kind) ?? FEEDBACK_KINDS[0];
+
+  const send = (event: React.FormEvent): void => {
+    event.preventDefault();
+    setBusy(true);
+    setResult(null);
+    sendFeedback(kind, message)
+      .then(() => {
+        setMessage("");
+        setResult({ sent: true });
+      })
+      .catch((e: unknown) => setResult({ error: String(e) }))
+      .finally(() => setBusy(false));
+  };
+
   return (
     <Section
-      title="Error reports"
+      title="Feedback"
       footer={
-        <button
-          type="button"
-          onClick={(): void => {
-            throw new Error("Test error from the Activity window");
-          }}
-          className={`mt-2 ${plainButton}`}
-        >
-          Throw a test error
-        </button>
+        <form onSubmit={send} className="mt-2 flex flex-col gap-2">
+          <div role="group" aria-label="Kind" className="flex h-7.5 self-start rounded-xl border border-border bg-card">
+            {FEEDBACK_KINDS.map((k, i) => (
+              <button
+                key={k.kind}
+                type="button"
+                aria-pressed={k.kind === kind}
+                onClick={() => setKind(k.kind)}
+                className={`${kindButton} ${i === 0 ? "rounded-l-[11px]" : "border-l border-border"} ${
+                  i === FEEDBACK_KINDS.length - 1 ? "rounded-r-[11px]" : ""
+                } ${k.kind === kind ? "bg-muted font-semibold" : "text-muted-fg"}`}
+              >
+                {k.label}
+              </button>
+            ))}
+          </div>
+          <textarea
+            aria-label="Feedback"
+            value={message}
+            placeholder={placeholder}
+            rows={4}
+            onChange={(e) => {
+              setMessage(e.currentTarget.value);
+              setResult(null);
+            }}
+            className={`${fieldFrame} resize-y px-2.5 py-1.5 outline-none placeholder:text-faint-fg`}
+          />
+          <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
+            <button type="submit" disabled={busy || message.trim() === ""} className={primaryButton}>
+              {busy ? "Sending…" : "Send"}
+            </button>
+            {result && "sent" in result && <p role="status" className="text-muted-fg">Sent. Thanks!</p>}
+            {result && "error" in result && (
+              <p role="alert" className="text-danger">
+                {result.error}
+              </p>
+            )}
+          </div>
+        </form>
       }
     />
   );
