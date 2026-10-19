@@ -24,7 +24,8 @@ import {
 import { sendFeedback, type FeedbackKind } from "./feedback";
 import { useActivity } from "./hooks/useActivity";
 import { useRemainingWork } from "./hooks/useRemainingWork";
-import { fieldFrame, focusRing, segmentButton } from "./ui";
+import { SegmentedControl } from "./SegmentedControl";
+import { fieldFrame, focusRing } from "./ui";
 
 /** The Activity window (Window → Activity): what capture, video conversion and OCR are doing. */
 export function ActivityView(): React.ReactNode {
@@ -61,9 +62,6 @@ export function ActivityView(): React.ReactNode {
   );
 }
 
-// `segmentButton` without its fixed width, for labels of any length.
-const kindButton = `inline-flex items-center px-3 transition-colors hover:bg-muted ${focusRing}`;
-
 const FEEDBACK_KINDS: { kind: FeedbackKind; label: string; placeholder: string }[] = [
   { kind: "bug", label: "Bug", placeholder: "What went wrong, and what did you expect?" },
   { kind: "feature", label: "Feature request", placeholder: "What would you like the app to do?" },
@@ -98,21 +96,12 @@ function Feedback(): React.ReactNode {
       title="Feedback"
       footer={
         <form onSubmit={send} className="mt-2 flex flex-col gap-2">
-          <div role="group" aria-label="Kind" className="flex h-7.5 self-start rounded-xl border border-border bg-card">
-            {FEEDBACK_KINDS.map((k, i) => (
-              <button
-                key={k.kind}
-                type="button"
-                aria-pressed={k.kind === kind}
-                onClick={() => setKind(k.kind)}
-                className={`${kindButton} ${i === 0 ? "rounded-l-[11px]" : "border-l border-border"} ${
-                  i === FEEDBACK_KINDS.length - 1 ? "rounded-r-[11px]" : ""
-                } ${k.kind === kind ? "bg-muted font-semibold" : "text-muted-fg"}`}
-              >
-                {k.label}
-              </button>
-            ))}
-          </div>
+          <SegmentedControl
+            label="Kind"
+            options={FEEDBACK_KINDS.map((k) => ({ value: k.kind, label: k.label }))}
+            value={kind}
+            onChange={setKind}
+          />
           <textarea
             aria-label="Feedback"
             value={message}
@@ -310,21 +299,13 @@ function Speed({
       footer={
         <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-2">
           {!on && !lowPower && (
-            <div role="group" aria-label="Length" className="flex h-7.5 rounded-xl border border-border bg-card">
-              {BOOST_MINUTES.map((m, i) => (
-                <button
-                  key={m}
-                  type="button"
-                  aria-pressed={m === minutes}
-                  onClick={() => setMinutes(m)}
-                  className={`${segmentButton} w-10 tabular-nums ${i === 0 ? "rounded-l-[11px]" : "border-l border-border"} ${
-                    i === BOOST_MINUTES.length - 1 ? "rounded-r-[11px]" : ""
-                  } ${m === minutes ? "bg-muted font-semibold" : "text-muted-fg"}`}
-                >
-                  {boostLabel(m)}
-                </button>
-              ))}
-            </div>
+            <SegmentedControl
+              label="Length"
+              options={BOOST_MINUTES.map((m) => ({ value: m, label: boostLabel(m) }))}
+              value={minutes}
+              onChange={setMinutes}
+              itemClassName="w-10 tabular-nums"
+            />
           )}
           {on && (
             <button type="button" disabled={busy} onClick={() => run(stopBoost)} className={plainButton}>
