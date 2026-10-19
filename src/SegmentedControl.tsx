@@ -21,23 +21,23 @@ export function SegmentedControl<T extends string | number>({
   options: { value: T; label: string }[];
   value: T;
   onChange: (value: T) => void;
-  /** Extra classes for every choice, such as a fixed width. */
+  /** Classes for every choice, such as a fixed width; they replace the default `px-3`. */
   itemClassName?: string;
 }): React.ReactNode {
   return (
-    <div role="group" aria-label={label} className="flex h-7.5 w-fit gap-0.5 rounded-xl bg-track/70 p-0.5 dark:bg-page">
-      {options.map((option) => {
+    <div role="group" aria-label={label} className="flex h-7.5 w-fit gap-0.5 rounded-xl bg-segment p-0.5">
+      {options.map((option): React.ReactNode => {
         const selected = option.value === value;
         return (
           <button
             key={option.value}
             type="button"
             aria-pressed={selected}
-            onClick={() => onChange(option.value)}
+            onClick={(): void => onChange(option.value)}
             className={`inline-flex items-center justify-center rounded-[10px] transition-colors ${itemClassName} ${
               selected
-                ? "bg-card font-semibold text-fg ring-1 ring-border dark:bg-muted"
-                : "text-muted-fg hover:bg-card/50 hover:text-fg dark:hover:bg-muted/50"
+                ? "bg-segment-pill font-semibold text-fg ring-1 ring-border"
+                : "text-muted-fg hover:bg-segment-pill/50 hover:text-fg"
             } ${focusRing}`}
           >
             {option.label}

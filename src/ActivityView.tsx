@@ -66,6 +66,9 @@ const FEEDBACK_KINDS: { kind: FeedbackKind; label: string; placeholder: string }
   { kind: "bug", label: "Bug", placeholder: "What went wrong, and what did you expect?" },
   { kind: "feature", label: "Feature request", placeholder: "What would you like the app to do?" },
 ];
+const FEEDBACK_OPTIONS = FEEDBACK_KINDS.map(
+  (k): { value: FeedbackKind; label: string } => ({ value: k.kind, label: k.label }),
+);
 
 /**
  * A bug report or feature request, sent to PostHog as a "feedback" event
@@ -98,7 +101,7 @@ function Feedback(): React.ReactNode {
         <form onSubmit={send} className="mt-2 flex flex-col gap-2">
           <SegmentedControl
             label="Kind"
-            options={FEEDBACK_KINDS.map((k) => ({ value: k.kind, label: k.label }))}
+            options={FEEDBACK_OPTIONS}
             value={kind}
             onChange={setKind}
           />
@@ -235,6 +238,8 @@ function boostLabel(minutes: number): string {
   return minutes < 60 ? `${minutes}m` : `${minutes / 60}h`;
 }
 
+const BOOST_OPTIONS = BOOST_MINUTES.map((m): { value: number; label: string } => ({ value: m, label: boostLabel(m) }));
+
 const primaryButton = `rounded-xl bg-primary px-3 py-1 font-medium text-primary-fg transition-colors hover:bg-primary/90 disabled:opacity-50 ${focusRing}`;
 const plainButton = `rounded-xl border border-border bg-card px-3 py-1 font-medium transition-colors hover:bg-muted disabled:opacity-50 ${focusRing}`;
 
@@ -306,7 +311,7 @@ function Speed({
           {!on && !lowPower && (
             <SegmentedControl
               label="Length"
-              options={BOOST_MINUTES.map((m) => ({ value: m, label: boostLabel(m) }))}
+              options={BOOST_OPTIONS}
               value={minutes}
               onChange={setMinutes}
               itemClassName="w-10 tabular-nums"
