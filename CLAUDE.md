@@ -43,7 +43,7 @@ CI: `.github/workflows/ci.yml` runs on every PR and push to `main`. A Linux job 
 
 **The change log is built from PR titles.** `scripts/changelog.ts` makes one entry per PR on main's first-parent line, shown in the About window and used as the release notes. PRs that only touch docs, CI or tests, dependency bumps and direct pushes are left out. So PR titles are what users read: write them in plain language.
 
-**Auto-update** (`src-tauri/src/updater.rs`, release builds only) installs a newer release only while "Update automatically" is on and only when it needs no admin password; the background loop must never pop up a password prompt unasked. The app trusts only `plugins.updater.pubkey` in `tauri.conf.json`, which must match the `TAURI_SIGNING_PRIVATE_KEY` secret: losing that key means installed copies can never update again.
+**Auto-update** (`src-tauri/src/updater.rs`, release builds only) installs a newer release only while "Update automatically" is on and only when it needs no admin password; the background loop must never pop up a password prompt unasked. It also never relaunches the app by itself, because a relaunched app comes to the front and takes focus: an installed update starts at the next launch, or when the user clicks the Update button it puts in the main window's title bar. The app trusts only `plugins.updater.pubkey` in `tauri.conf.json`, which must match the `TAURI_SIGNING_PRIVATE_KEY` secret: losing that key means installed copies can never update again.
 
 ## Things to know before changing behaviour
 

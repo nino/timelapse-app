@@ -9,6 +9,7 @@ import { frameUrl, getFrameTime, type FrameRange, type FrameTime } from "./frame
 import { useDayApps } from "./hooks/useDayApps";
 import { useLatestLoad } from "./hooks/useDirectoryChanges";
 import { useEventListener } from "./hooks/useEventListener";
+import { useInstalledUpdate } from "./hooks/useInstalledUpdate";
 import { useDay, useDays } from "./hooks/useLibrary";
 import {
   useDayMatches,
@@ -22,6 +23,7 @@ import { PendingStretches } from "./PendingStretches";
 import { nextStop, previousStop, rangeAt, toStops, type DayMatch, type Stop } from "./search";
 import { savedPlaybackSpeed, savePlaybackSpeed, SpeedPicker, type PlaybackSpeed } from "./SpeedPicker";
 import { fieldFrame, focusRing, segmentButton } from "./ui";
+import { relaunchIntoUpdate } from "./updates";
 import { setViewerPosition, type ViewerPosition } from "./viewerPosition";
 
 // How many other days the find bar names before folding the rest away.
@@ -75,6 +77,7 @@ export function App({
   // day's matches have loaded.
   const [jumpToFirstMatch, setJumpToFirstMatch] = React.useState<string | null>(null);
   const findInput = React.useRef<HTMLInputElement>(null);
+  const installedUpdate = useInstalledUpdate();
 
   // App filter: playback keeps to the stretches where this app was in front.
   // It stays picked across days.
@@ -345,6 +348,20 @@ export function App({
                 </svg>
               </button>
             </div>
+            {installedUpdate !== null && (
+              <button
+                type="button"
+                title={`Relaunch to start version ${installedUpdate}`}
+                onClick={(): void => {
+                  relaunchIntoUpdate().catch((error: unknown) => {
+                    console.error("Error relaunching into the update:", error);
+                  });
+                }}
+                className={`h-7.5 shrink-0 rounded-xl bg-primary px-3 text-sm font-medium text-primary-fg transition-colors hover:bg-primary/90 ${focusRing}`}
+              >
+                Update
+              </button>
+            )}
           </div>
         </div>
 

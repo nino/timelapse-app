@@ -32,7 +32,9 @@ there are no analytics.
   battery) and **Low power** (pause both for a while, even on AC power).
 - **Automatic updates.** Release builds check GitHub for a newer release at
   launch and hourly, and install it while "Update automatically" is on in
-  Settings (⌘,). They never ask for an admin password in the background.
+  Settings (⌘,). They never ask for an admin password in the background,
+  and never relaunch the app by themselves: an installed update starts the
+  next time the app opens, or when you click **Update** in the title bar.
   "Check for Updates…" in the app menu works either way.
 
 ### Keyboard
