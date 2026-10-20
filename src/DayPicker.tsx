@@ -60,21 +60,69 @@ function DayOptions({
     >
       {/* Options are concentric with the list: 16px minus the 1px border
           and 4px padding. */}
-      {[...days].reverse().map((date) => (
-        <ListboxOption
-          key={date}
-          value={date}
-          className="flex h-7 cursor-default items-center justify-between gap-3 rounded-[11px] pr-2.5 pl-1.5 select-none data-focus:bg-muted data-selected:font-semibold"
-        >
-          <span className="flex items-center gap-1.5">
-            <Check />
-            {label(date)}
-          </span>
-          <Status status={statuses.get(date)} />
-        </ListboxOption>
+      {monthsNewestFirst(days).map(({ month, dates }) => (
+        <div key={month} role="group" aria-label={monthLabel(month)}>
+          {/* Not an option, so Headless UI's arrow keys and typeahead skip it. */}
+          <div
+            aria-hidden="true"
+            className="pt-2 pr-2.5 pb-1 pl-6.5 text-xs font-medium text-muted-fg select-none"
+          >
+            {monthLabel(month)}
+          </div>
+          {dates.map((date) => (
+            <ListboxOption
+              key={date}
+              value={date}
+              className="flex h-7 cursor-default items-center justify-between gap-3 rounded-[11px] pr-2.5 pl-1.5 select-none data-focus:bg-muted data-selected:font-semibold"
+            >
+              <span className="flex items-center gap-1.5">
+                <Check />
+                {label(date)}
+              </span>
+              <Status status={statuses.get(date)} />
+            </ListboxOption>
+          ))}
+        </div>
       ))}
     </ListboxOptions>
   );
+}
+
+/**
+ * Days newest first, in runs of one month (`YYYY-MM`). Takes `days` oldest
+ * first, as `list_days` returns them.
+ */
+function monthsNewestFirst(days: Array<string>): Array<{ month: string; dates: Array<string> }> {
+  const groups: Array<{ month: string; dates: Array<string> }> = [];
+  for (let i = days.length - 1; i >= 0; i--) {
+    const date = days[i];
+    const month = date.slice(0, 7);
+    const last = groups.at(-1);
+    if (last?.month === month) last.dates.push(date);
+    else groups.push({ month, dates: [date] });
+  }
+  return groups;
+}
+
+const MONTH_NAMES = [
+  "January",
+  "February",
+  "March",
+  "April",
+  "May",
+  "June",
+  "July",
+  "August",
+  "September",
+  "October",
+  "November",
+  "December",
+];
+
+/** `2026-10` → `October 2026`. */
+function monthLabel(month: string): string {
+  const [year, number] = month.split("-");
+  return `${MONTH_NAMES[Number(number) - 1] ?? number} ${year}`;
 }
 
 const STAGE_WORDS: Record<Stage, string> = { todo: "not started", partial: "partly done", done: "done" };

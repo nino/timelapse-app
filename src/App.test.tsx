@@ -1,5 +1,5 @@
 import { afterAll, beforeEach, describe, expect, it, mock, spyOn } from 'bun:test';
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 
 import * as activity from './activity';
 import { App } from './App';
@@ -215,6 +215,28 @@ describe('App', () => {
       await openDayPicker();
       const options = screen.getAllByRole('option').map((o) => o.textContent?.trim());
       expect(options).toEqual([`${today()} (Today)`, '2024-12-20']);
+      await settleFrameTime();
+    });
+
+    it('groups the days under a header per month', async () => {
+      mockLibrary({ '2026-09-03': 1, '2026-09-30': 1, '2026-10-01': 1, '2026-10-04': 3 });
+      render(<App />);
+      await openDayPicker();
+      const groups = screen.getAllByRole('group');
+      expect(groups.map((g) => g.getAttribute('aria-label'))).toEqual(['October 2026', 'September 2026']);
+      expect(within(groups[1]).getAllByRole('option').map((o) => o.textContent?.trim())).toEqual([
+        '2026-09-30',
+        '2026-09-03',
+      ]);
+      // The headers aren't options, so the arrow keys step straight across them.
+      fireEvent.keyDown(screen.getByRole('listbox'), { key: 'ArrowDown' });
+      await waitFor(() =>
+        expect(screen.getByRole('option', { name: /2026-10-01/ })).toHaveAttribute('data-focus'),
+      );
+      fireEvent.keyDown(screen.getByRole('listbox'), { key: 'ArrowDown' });
+      await waitFor(() =>
+        expect(screen.getByRole('option', { name: /2026-09-30/ })).toHaveAttribute('data-focus'),
+      );
       await settleFrameTime();
     });
 
