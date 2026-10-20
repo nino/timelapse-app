@@ -1,3 +1,4 @@
+import { Popover, PopoverButton, PopoverPanel } from "@headlessui/react";
 import React from "react";
 
 import { toggleActivity } from "./activity";
@@ -72,7 +73,6 @@ export function App({
   const { matches, matchesError } = useDayMatches(selectedDay, query, ocrVersion);
   const stops = React.useMemo(() => toStops(matches ?? []), [matches]);
   const counts = useMatchCounts(query, ocrVersion);
-  const [showAllDays, setShowAllDays] = React.useState(false);
   // A day picked from the "Also on" list opens on its first match once that
   // day's matches have loaded.
   const [jumpToFirstMatch, setJumpToFirstMatch] = React.useState<string | null>(null);
@@ -301,10 +301,7 @@ export function App({
                 aria-label="Find text on screen"
                 placeholder="Find text on screen"
                 value={typed}
-                onChange={(e) => {
-                  setTyped(e.target.value);
-                  setShowAllDays(false);
-                }}
+                onChange={(e) => setTyped(e.target.value)}
                 onKeyDown={(e) => {
                   if (e.key === "Enter") {
                     e.preventDefault();
@@ -368,8 +365,6 @@ export function App({
         <OtherDays
           counts={counts.filter((c) => c.day !== selectedDay)}
           today={today}
-          showAll={showAllDays}
-          onShowAll={() => setShowAllDays(true)}
           onPick={(date) => {
             setSelectedDay(date);
             setJumpToFirstMatch(date);
@@ -589,23 +584,24 @@ const AppMarks = React.memo(function AppMarks({
   );
 });
 
-/** The other days the searched text appears on, as links to them. */
+/**
+ * The other days the searched text appears on, as links to them. The first
+ * few are chips in a row; the rest sit in a scrollable list behind "N more
+ * days", so a word found on hundreds of days never pushes the frame away.
+ */
 function OtherDays({
   counts,
   today,
-  showAll,
-  onShowAll,
   onPick,
 }: {
   counts: Array<{ day: string; count: number }>;
   today: string;
-  showAll: boolean;
-  onShowAll: () => void;
   onPick: (date: string) => void;
 }): React.ReactNode {
   if (counts.length === 0) return null;
-  const shown = showAll ? counts : counts.slice(0, OTHER_DAYS_SHOWN);
-  const hidden = counts.length - shown.length;
+  const shown = counts.slice(0, OTHER_DAYS_SHOWN);
+  const hidden = counts.slice(OTHER_DAYS_SHOWN);
+  const label = (day: string): string => (day === today ? "Today" : day);
   return (
     <nav aria-label="Other days with matches" className="flex flex-wrap items-center gap-2 mt-2 text-sm">
       <span className="text-muted-fg">Also on</span>
@@ -616,14 +612,46 @@ function OtherDays({
           onClick={() => onPick(day)}
           className={`flex items-center gap-1.5 px-2.5 py-0.5 bg-card border border-border rounded-full transition-colors hover:bg-muted ${focusRing}`}
         >
-          {day === today ? "Today" : day}
+          {label(day)}
           <span className="text-muted-fg tabular-nums">{count}</span>
         </button>
       ))}
-      {hidden > 0 && (
-        <button type="button" onClick={onShowAll} className={`rounded-sm font-medium text-fg underline-offset-4 hover:underline ${focusRing}`}>
-          {hidden === 1 ? "1 more day" : `${hidden} more days`}
-        </button>
+      {hidden.length > 0 && (
+        <Popover>
+          <PopoverButton
+            className={`flex items-center gap-1.5 rounded-full px-2.5 py-0.5 font-medium text-fg transition-colors hover:bg-muted data-open:bg-muted ${focusRing}`}
+          >
+            {hidden.length === 1 ? "1 more day" : `${hidden.length} more days`}
+            <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
+              <path d="m2.5 4 2.5 2.5L7.5 4" />
+            </svg>
+          </PopoverButton>
+          {/* Styled like the day picker's list. The `!` beats the max-height
+              Headless UI sets inline, which runs to the window's edge. */}
+          <PopoverPanel
+            anchor={{ to: "bottom start", gap: 4 }}
+            className="z-10 max-h-[min(24rem,var(--anchor-max-height,100vh))]! min-w-44 overflow-y-auto rounded-2xl border border-border bg-card p-1 text-sm text-fg tabular-nums shadow-md outline-none"
+          >
+            {({ close }): React.ReactElement => (
+              <>
+                {hidden.map(({ day, count }) => (
+                  <button
+                    key={day}
+                    type="button"
+                    onClick={() => {
+                      onPick(day);
+                      close();
+                    }}
+                    className="flex h-7 w-full cursor-default items-center justify-between gap-3 rounded-[11px] px-2.5 outline-none hover:bg-muted focus-visible:bg-muted"
+                  >
+                    {label(day)}
+                    <span className="text-muted-fg">{count}</span>
+                  </button>
+                ))}
+              </>
+            )}
+          </PopoverPanel>
+        </Popover>
       )}
     </nav>
   );

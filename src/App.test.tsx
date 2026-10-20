@@ -765,15 +765,24 @@ describe('App', () => {
       expect(position()).toBe('50 / 50');
     });
 
-    it('folds away all but the first few other days', async () => {
-      mockLibrary({ '2026-10-04': 100 });
+    it('keeps all but the first few other days in a list that closes again', async () => {
+      mockLibrary({ '2026-09-02': 50, '2026-10-04': 100 });
       const counts = ['07', '06', '05', '03', '02', '01'].map((d) => ({ day: `2026-09-${d}`, count: 1 }));
-      mockSearch('cargo', {}, counts);
+      mockSearch('cargo', { '2026-09-02': [match(7)] }, counts);
       render(<App />);
       await search('cargo');
       expect(screen.queryByRole('button', { name: /2026-09-02/ })).not.toBeInTheDocument();
-      fireEvent.click(screen.getByRole('button', { name: '2 more days' }));
-      expect(screen.getByRole('button', { name: /2026-09-02/ })).toBeInTheDocument();
+
+      fireEvent.click(screen.getByRole('button', { name: /^2 more days/ }));
+      expect(await screen.findByRole('button', { name: /2026-09-02/ })).toBeInTheDocument();
+      fireEvent.click(screen.getByRole('button', { name: /^2 more days/ }));
+      await waitFor(() => expect(screen.queryByRole('button', { name: /2026-09-02/ })).not.toBeInTheDocument());
+
+      // Picking a day from the list opens it and closes the list.
+      fireEvent.click(screen.getByRole('button', { name: /^2 more days/ }));
+      fireEvent.click(await screen.findByRole('button', { name: /2026-09-02/ }));
+      await waitFor(() => expect(dayPicker()).toHaveTextContent('2026-09-02'));
+      await waitFor(() => expect(screen.queryByRole('button', { name: /2026-09-01/ })).not.toBeInTheDocument());
       await settleFrameTime();
     });
   });
