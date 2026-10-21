@@ -41,8 +41,7 @@ export function ActivityView(): React.ReactNode {
       )}
       {activity ? (
         <>
-          <Power onAcPower={activity.onAcPower} boost={activity.boost} />
-          <Speed
+          <Power
             boost={activity.boost}
             lowPowerUntil={activity.lowPowerUntil}
             onAcPower={activity.onAcPower}
@@ -219,17 +218,6 @@ function ErrorRow({
   );
 }
 
-function Power({ onAcPower, boost }: { onAcPower: boolean | null; boost: Activity["boost"] }): React.ReactNode {
-  if (onAcPower === null) return null;
-  let headline = "On AC power";
-  if (!onAcPower) {
-    headline = boost?.allowBattery
-      ? "On battery: boosting anyway"
-      : "On battery: conversion and OCR wait until the Mac is plugged in";
-  }
-  return <Section title="Power" tone={onAcPower || boost?.allowBattery ? "active" : "paused"} headline={headline} />;
-}
-
 /** Boost and low-power lengths on offer, in minutes. */
 export const BOOST_MINUTES = [10, 20, 30, 60, 120];
 const DEFAULT_BOOST_MINUTES = 20;
@@ -244,12 +232,13 @@ const primaryButton = `rounded-xl bg-primary px-3 py-1 font-medium text-primary-
 const plainButton = `rounded-xl border border-border bg-card px-3 py-1 font-medium transition-colors hover:bg-muted disabled:opacity-50 ${focusRing}`;
 
 /**
- * Boost lets conversion and OCR run at full speed for a while, and on battery
- * too if asked; low-power mode keeps them off for a while, even on AC power.
- * Normally both run at background priority, a batch at most every ten
- * minutes, on AC power only.
+ * Whether the Mac is on AC power, and the boost and low-power controls, in
+ * one card. Boost lets conversion and OCR run at full speed for a while, and
+ * on battery too if asked; low-power mode keeps them off for a while, even on
+ * AC power. Normally both run at background priority, a batch at most every
+ * ten minutes, on AC power only.
  */
-function Speed({
+function Power({
   boost,
   lowPowerUntil,
   onAcPower,
@@ -288,23 +277,30 @@ function Speed({
   };
 
   const batteryChecked = on ? boost.allowBattery : allowBattery;
-  const waitingForPower = on && onAcPower === false && !boost.allowBattery;
-  let headline = "Normal: conversion and OCR go easy on the CPU";
+  const onBattery = onAcPower === false;
+  const waitingForPower = on && onBattery && !boost.allowBattery;
+  // Unknown power (no battery to ask) shows the speed alone.
+  const source = onAcPower === null ? "" : onBattery ? "On battery" : "On AC power";
+  let speed: string;
   if (on) {
     const left = formatDuration((Date.parse(boost.until) - now) / 1000);
-    headline = waitingForPower
-      ? `Boost waiting for AC power (${left} left); tick “Also on battery” to start now`
-      : `Boosting: full speed for another ${left}`;
+    speed = waitingForPower
+      ? `boost waits for AC power (${left} left)`
+      : `boosting for another ${left}`;
   } else if (lowPower) {
-    headline = `Low-power mode: conversion and OCR are off for another ${formatDuration(
-      (Date.parse(lowPowerUntil) - now) / 1000,
-    )}`;
+    speed = `low power for another ${formatDuration((Date.parse(lowPowerUntil) - now) / 1000)}`;
+  } else if (onBattery) {
+    speed = "waiting to be plugged in";
+  } else {
+    speed = "going easy on the CPU";
   }
+  const headline = source ? `${source}, ${speed}` : speed.charAt(0).toUpperCase() + speed.slice(1);
+  const paused = lowPower || (onBattery && !(on && boost.allowBattery));
 
   return (
     <Section
-      title="Speed"
-      tone={waitingForPower || lowPower ? "paused" : on ? "active" : "quiet"}
+      title="Power"
+      tone={paused ? "paused" : "active"}
       headline={headline}
       footer={
         <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-2">
