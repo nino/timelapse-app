@@ -8,7 +8,8 @@ import { focusRing } from "./ui";
  * and the other choices in grey text. The pill's edge is an unblurred ring,
  * not a shadow, because WebKit repaints blurred shadows on every frame of a
  * resize. Its corners are the track's radius less the track's padding, so
- * the two curves run parallel.
+ * the two curves run parallel. The picked choice keeps the same font weight
+ * as the rest, so switching never changes the control's width.
  *
  * The pill is one element behind the choices that slides to the selected one:
  * the selected choice's ref callback moves it there by writing its transform
@@ -65,7 +66,7 @@ export function SegmentedControl<T extends string | number>({
             aria-pressed={selected}
             onClick={(): void => onChange(option.value)}
             className={`relative inline-flex items-center justify-center rounded-[10px] transition-colors ${itemClassName} ${
-              selected ? "font-semibold text-fg" : "text-muted-fg hover:bg-segment-pill/50 hover:text-fg"
+              selected ? "text-fg" : "text-muted-fg hover:bg-segment-pill/50 hover:text-fg"
             } ${focusRing}`}
           >
             {option.label}
