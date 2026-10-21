@@ -164,7 +164,7 @@ describe('ActivityView', () => {
     );
     render(<ActivityView />);
 
-    await waitFor(() => expect(screen.getByTestId('Power-headline')).toHaveTextContent(/On battery/));
+    await waitFor(() => expect(screen.getByTestId('Power-headline')).toHaveTextContent('On battery, waiting to be plugged in'));
     expect(screen.getByTestId('Video conversion-headline')).toHaveTextContent('Paused on battery; next check in 45s');
     expect(screen.getByTestId('OCR-headline')).toHaveTextContent('Paused on battery; next check in 3m 20s');
   });
@@ -281,7 +281,7 @@ describe('ActivityView', () => {
       respond(() => activity({ boost }));
       render(<ActivityView />);
 
-      await waitFor(() => expect(screen.getByTestId('Speed-headline')).toHaveTextContent(/^Normal/));
+      await waitFor(() => expect(screen.getByTestId('Power-headline')).toHaveTextContent('On AC power, going easy on the CPU'));
       fireEvent.click(screen.getByRole('button', { name: '1h' }));
       expect(screen.getByRole('button', { name: '1h' })).toHaveAttribute('aria-pressed', 'true');
       fireEvent.click(screen.getByRole('checkbox', { name: 'Also on battery' }));
@@ -291,7 +291,7 @@ describe('ActivityView', () => {
       expect(invoke).toHaveBeenCalledWith('start_boost', { minutes: 60, allowBattery: true });
       // Asks again straight away rather than at the next poll.
       await waitFor(() =>
-        expect(screen.getByTestId('Speed-headline')).toHaveTextContent('Boosting: full speed for another 1h 00m'),
+        expect(screen.getByTestId('Power-headline')).toHaveTextContent('On AC power, boosting for another 1h 00m'),
       );
       expect(screen.getByRole('button', { name: 'Stop boost' })).toBeInTheDocument();
       expect(screen.queryByRole('button', { name: '1h' })).not.toBeInTheDocument();
@@ -312,7 +312,7 @@ describe('ActivityView', () => {
       render(<ActivityView />);
 
       await waitFor(() =>
-        expect(screen.getByTestId('Speed-headline')).toHaveTextContent('Boosting: full speed for another 2m 05s'),
+        expect(screen.getByTestId('Power-headline')).toHaveTextContent('On AC power, boosting for another 2m 05s'),
       );
       boost = null;
       fireEvent.click(screen.getByRole('button', { name: 'Stop boost' }));
@@ -326,17 +326,19 @@ describe('ActivityView', () => {
       respond(() => activity({ boost, onAcPower: false }));
       render(<ActivityView />);
 
-      await waitFor(() => expect(screen.getByTestId('Power-headline')).toHaveTextContent(/wait until the Mac is plugged in/));
-      expect(screen.getByTestId('Speed-headline')).toHaveTextContent(
-        'Boost waiting for AC power (10m 00s left); tick “Also on battery” to start now',
+      await waitFor(() =>
+        expect(screen.getByTestId('Power-headline')).toHaveTextContent(
+          'On battery, boost waits for AC power (10m 00s left)',
+        ),
       );
       boost = { until: secondsAhead(600), allowBattery: true };
       fireEvent.click(screen.getByRole('checkbox', { name: 'Also on battery' }));
 
       expect(invoke).toHaveBeenCalledWith('set_boost_allow_battery', { allowBattery: true });
-      await waitFor(() => expect(screen.getByTestId('Power-headline')).toHaveTextContent('On battery: boosting anyway'));
+      await waitFor(() =>
+        expect(screen.getByTestId('Power-headline')).toHaveTextContent('On battery, boosting for another 10m 00s'),
+      );
       expect(screen.getByRole('checkbox', { name: 'Also on battery' })).toBeChecked();
-      expect(screen.getByTestId('Speed-headline')).toHaveTextContent('Boosting: full speed for another 10m 00s');
     });
 
     it('shows why a boost could not start', async () => {
@@ -369,8 +371,8 @@ describe('ActivityView', () => {
 
       expect(invoke).toHaveBeenCalledWith('start_low_power', { minutes: 30 });
       await waitFor(() =>
-        expect(screen.getByTestId('Speed-headline')).toHaveTextContent(
-          'Low-power mode: conversion and OCR are off for another 30m 00s',
+        expect(screen.getByTestId('Power-headline')).toHaveTextContent(
+          'On AC power, low power for another 30m 00s',
         ),
       );
       expect(screen.queryByRole('button', { name: 'Boost!' })).not.toBeInTheDocument();
