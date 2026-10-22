@@ -297,12 +297,12 @@ describe('ActivityView', () => {
       expect(screen.queryByRole('button', { name: '1h' })).not.toBeInTheDocument();
     });
 
-    it('defaults to 20 minutes, not on battery', async () => {
+    it('defaults to 30 minutes, not on battery', async () => {
       respond(() => activity());
       render(<ActivityView />);
 
       fireEvent.click(await screen.findByRole('button', { name: 'Boost!' }));
-      expect(invoke).toHaveBeenCalledWith('start_boost', { minutes: 20, allowBattery: false });
+      expect(invoke).toHaveBeenCalledWith('start_boost', { minutes: 30, allowBattery: false });
       await waitFor(() => expect(screen.getByRole('button', { name: 'Boost!' })).toBeEnabled());
     });
 
@@ -365,14 +365,14 @@ describe('ActivityView', () => {
       respond(() => activity({ lowPowerUntil }));
       render(<ActivityView />);
 
-      fireEvent.click(await screen.findByRole('button', { name: '30m' }));
-      lowPowerUntil = secondsAhead(1800);
+      fireEvent.click(await screen.findByRole('button', { name: '24h' }));
+      lowPowerUntil = secondsAhead(24 * 3600);
       fireEvent.click(screen.getByRole('button', { name: 'Low power' }));
 
-      expect(invoke).toHaveBeenCalledWith('start_low_power', { minutes: 30 });
+      expect(invoke).toHaveBeenCalledWith('start_low_power', { minutes: 1440 });
       await waitFor(() =>
         expect(screen.getByTestId('Power-headline')).toHaveTextContent(
-          'On AC power, low power for another 30m 00s',
+          'On AC power, low power for another 24h 00m',
         ),
       );
       expect(screen.queryByRole('button', { name: 'Boost!' })).not.toBeInTheDocument();
