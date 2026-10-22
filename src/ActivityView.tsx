@@ -219,8 +219,8 @@ function ErrorRow({
 }
 
 /** Boost and low-power lengths on offer, in minutes. */
-export const BOOST_MINUTES = [10, 20, 30, 60, 120];
-const DEFAULT_BOOST_MINUTES = 20;
+export const BOOST_MINUTES = [10, 30, 60, 120, 240, 480, 1440];
+const DEFAULT_BOOST_MINUTES = 30;
 
 function boostLabel(minutes: number): string {
   return minutes < 60 ? `${minutes}m` : `${minutes / 60}h`;
