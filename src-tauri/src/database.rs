@@ -14,12 +14,19 @@
 //! `ocr_progress.by_position` is set and `frame_number`/`last_frame` are
 //! 1-based positions in the day's videos; `ocr_done_through` ignores those
 //! rows so the converter never mistakes one for the other.
+//!
+//! The file uses SQLite's rollback journal, so a reader holds up a writer's
+//! commit and a writer holds up everyone. Every connection waits up to
+//! `LOCK_WAIT` for the others; the calls most likely to hold the database
+//! longer (searches, OCR and converter writes, migrations) are timed by a
+//! `Held` guard, which logs any that take `SLOW_HOLD` or more, so a
+//! "database is locked" error can be matched to what held it.
 
 use rusqlite::{Connection, OptionalExtension, Result, Transaction, TransactionBehavior};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use chrono::{DateTime, Utc, Local};
 use crate::menu_app::menu_bar_app;
 
@@ -27,6 +34,56 @@ use crate::menu_app::menu_bar_app;
 /// `add_day_and_ocr` migration created the table with, so that
 /// `lines_matching` finds the same words a search does.
 const OCR_TOKENIZER: &str = "unicode61 remove_diacritics 2";
+
+/// How long a connection waits for another to let go of the database before
+/// failing with "database is locked".
+const LOCK_WAIT: Duration = Duration::from_secs(30);
+
+/// A call that holds the database at least this long is logged as a warning;
+/// one that holds it for `LOCK_WAIT` or more, long enough to make another
+/// connection fail, as an error.
+const SLOW_HOLD: Duration = Duration::from_secs(5);
+
+/// Times a call that holds the database, from creation to drop, and logs it
+/// if it was slow (`SLOW_HOLD`).
+struct Held {
+    what: &'static str,
+    started: Instant,
+}
+
+impl Held {
+    fn new(what: &'static str) -> Self {
+        Held { what, started: Instant::now() }
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        let took = self.started.elapsed();
+        if let Some(event) = slow_hold_event(self.what, took) {
+            event.took(took).record();
+        }
+    }
+}
+
+/// The diagnostics event for a call (`what`) that held the database for
+/// `took`, or `None` if that was quick.
+fn slow_hold_event(what: &'static str, took: Duration) -> Option<crate::diagnostics::Event> {
+    if took >= LOCK_WAIT {
+        Some(crate::diagnostics::error(
+            "database",
+            format!(
+                "{} held the database for {} s, longer than other connections wait for it",
+                what,
+                took.as_secs()
+            ),
+        ))
+    } else if took >= SLOW_HOLD {
+        Some(crate::diagnostics::warn("database", format!("{} held the database for a while", what)))
+    } else {
+        None
+    }
+}
 
 pub struct ScreenshotDatabase {
     conn: Connection,
@@ -72,7 +129,7 @@ impl ScreenshotDatabase {
         // screenshots table, which on a large library is well past rusqlite's 5s
         // default. Another process opening the database meanwhile should wait it
         // out rather than fail with SQLITE_BUSY.
-        conn.busy_timeout(Duration::from_secs(30))?;
+        conn.busy_timeout(LOCK_WAIT)?;
 
         // Create migrations table if it doesn't exist
         conn.execute(
@@ -97,6 +154,7 @@ impl ScreenshotDatabase {
 
         // Run migrations. A migration that shrank the OCR data leaves the
         // freed pages inside the file until it is vacuumed.
+        let _held = Held::new("Opening the database (migrations)");
         if Self::run_migrations(&mut conn)? {
             // Not fatal: the space is reused by later writes either way.
             if let Err(e) = conn.execute_batch("VACUUM") {
@@ -576,6 +634,7 @@ impl ScreenshotDatabase {
         result: Option<(&str, &[LineBox])>,
         by_position: bool,
     ) -> Result<()> {
+        let _held = Held::new("Storing a frame's text");
         let tx = self.conn.unchecked_transaction()?;
         if let Some((text, boxes)) = result {
             Self::store_text(&tx, day, frame_number, text, boxes)?;
@@ -711,6 +770,7 @@ impl ScreenshotDatabase {
         day: &str,
         frames: &[(u32, DateTime<Local>)],
     ) -> Result<()> {
+        let _held = Held::new("Recording a video's frames");
         let tx = self.conn.unchecked_transaction()?;
         tx.execute("DELETE FROM video_frames WHERE video = ?1", [video])?;
         {
@@ -789,6 +849,7 @@ impl ScreenshotDatabase {
         let Some(fts_query) = fts_query(query) else {
             return Ok(Vec::new());
         };
+        let _held = Held::new("Searching OCR text");
 
         let mut statement = self.conn.prepare(
             "SELECT ocr_frames.day, ocr_frames.frame_number,
@@ -820,6 +881,7 @@ impl ScreenshotDatabase {
         let Some(fts_query) = fts_query(query) else {
             return Ok(Vec::new());
         };
+        let _held = Held::new("Searching a day's OCR text");
 
         // A row stands for every frame up to the day's next row, because OCR
         // only writes a row when the screen changed. The day's last row runs
@@ -858,6 +920,7 @@ impl ScreenshotDatabase {
         let Some(fts_query) = fts_query(query) else {
             return Ok(Vec::new());
         };
+        let _held = Held::new("Counting search matches on every day");
 
         let mut statement = self.conn.prepare(
             "WITH hits AS (
@@ -1596,6 +1659,18 @@ mod tests {
 
     fn hit(day: &str, frame_number: u32) -> (String, u32) {
         (day.to_string(), frame_number)
+    }
+
+    #[test]
+    fn test_slow_holds_are_logged_by_how_long_they_took() {
+        let level = |took: Duration| slow_hold_event("Searching", took).map(|event| format!("{:?}", event));
+        assert_eq!(level(Duration::from_secs(4)), None);
+        assert!(level(SLOW_HOLD).unwrap().contains("level: Warn"));
+        // Long enough to make another connection fail: an error, which
+        // reaches PostHog.
+        let error = level(LOCK_WAIT).unwrap();
+        assert!(error.contains("level: Error"), "{}", error);
+        assert!(error.contains("Searching held the database for 30 s"), "{}", error);
     }
 
     fn search(db: &ScreenshotDatabase, query: &str) -> Vec<(String, u32)> {
