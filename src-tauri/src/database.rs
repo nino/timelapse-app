@@ -21,6 +21,13 @@
 //! longer (searches, OCR and converter writes, migrations) are timed by a
 //! `Held` guard, which logs any that take `SLOW_HOLD` or more, so a
 //! "database is locked" error can be matched to what held it.
+//!
+//! OCR and the converter run on background-priority threads, which macOS
+//! throttles hardest, disk writes included. While one of them holds the
+//! database, `Held` lifts its thread to the user-initiated class, so the
+//! capture loop and searches don't wait on a throttled thread. OCR takes its
+//! write lock before timing starts, so its log line separates waiting for
+//! the database from holding it.
 
 use rusqlite::{Connection, OptionalExtension, Result, Transaction, TransactionBehavior};
 use serde::Serialize;
@@ -45,43 +52,106 @@ const LOCK_WAIT: Duration = Duration::from_secs(30);
 const SLOW_HOLD: Duration = Duration::from_secs(5);
 
 /// Times a call that holds the database, from creation to drop, and logs it
-/// if it was slow (`SLOW_HOLD`).
+/// if it was slow (`SLOW_HOLD`). Meanwhile the thread is `Unthrottled`.
 struct Held {
     what: &'static str,
     started: Instant,
+    /// How long the call waited for the database before it held it.
+    waited: Duration,
+    _unthrottled: Unthrottled,
 }
 
 impl Held {
     fn new(what: &'static str) -> Self {
-        Held { what, started: Instant::now() }
+        Held::after_waiting(what, Duration::ZERO)
+    }
+
+    /// A call that already waited `waited` to get the database.
+    fn after_waiting(what: &'static str, waited: Duration) -> Self {
+        if waited >= SLOW_HOLD {
+            crate::diagnostics::warn("database", format!("{} waited for the database for a while", what))
+                .took(waited)
+                .record();
+        }
+        Held { what, started: Instant::now(), waited, _unthrottled: Unthrottled::raise() }
     }
 }
 
 impl Drop for Held {
     fn drop(&mut self) {
         let took = self.started.elapsed();
-        if let Some(event) = slow_hold_event(self.what, took) {
+        if let Some(event) = slow_hold_event(self.what, took, self.waited) {
             event.took(took).record();
         }
     }
 }
 
 /// The diagnostics event for a call (`what`) that held the database for
-/// `took`, or `None` if that was quick.
-fn slow_hold_event(what: &'static str, took: Duration) -> Option<crate::diagnostics::Event> {
+/// `took` after waiting `waited` for it, or `None` if that was quick.
+fn slow_hold_event(what: &'static str, took: Duration, waited: Duration) -> Option<crate::diagnostics::Event> {
     if took >= LOCK_WAIT {
+        let after = if waited >= Duration::from_secs(1) {
+            format!(", after waiting {} s for it", waited.as_secs())
+        } else {
+            String::new()
+        };
         Some(crate::diagnostics::error(
             "database",
             format!(
-                "{} held the database for {} s, longer than other connections wait for it",
+                "{} held the database for {} s{}, longer than other connections wait for it",
                 what,
-                took.as_secs()
+                took.as_secs(),
+                after
             ),
         ))
     } else if took >= SLOW_HOLD {
         Some(crate::diagnostics::warn("database", format!("{} held the database for a while", what)))
     } else {
         None
+    }
+}
+
+/// While alive, keeps the calling thread out of the background and utility
+/// QoS classes, whose disk writes macOS throttles, and then puts it back.
+/// Threads already at a higher class are left alone.
+struct Unthrottled {
+    #[cfg(target_os = "macos")]
+    restore: Option<(libc::qos_class_t, libc::c_int)>,
+}
+
+impl Unthrottled {
+    #[cfg(target_os = "macos")]
+    fn raise() -> Self {
+        use libc::qos_class_t::{QOS_CLASS_UNSPECIFIED, QOS_CLASS_USER_INITIATED, QOS_CLASS_UTILITY};
+        let mut class = QOS_CLASS_UNSPECIFIED;
+        let mut priority = 0;
+        // SAFETY: reads and changes only the calling thread's own class.
+        let restore = unsafe {
+            let throttled = libc::pthread_get_qos_class_np(libc::pthread_self(), &mut class, &mut priority) == 0
+                && class as u32 != QOS_CLASS_UNSPECIFIED as u32
+                && class as u32 <= QOS_CLASS_UTILITY as u32;
+            (throttled && libc::pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0) == 0)
+                .then_some((class, priority))
+        };
+        Unthrottled { restore }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn raise() -> Self {
+        Unthrottled {}
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for Unthrottled {
+    fn drop(&mut self) {
+        if let Some((class, priority)) = self.restore {
+            // SAFETY: only changes the calling thread's own class, back to
+            // what `raise` found.
+            unsafe {
+                libc::pthread_set_qos_class_self_np(class, priority);
+            }
+        }
     }
 }
 
@@ -634,8 +704,11 @@ impl ScreenshotDatabase {
         result: Option<(&str, &[LineBox])>,
         by_position: bool,
     ) -> Result<()> {
-        let _held = Held::new("Storing a frame's text");
-        let tx = self.conn.unchecked_transaction()?;
+        // Take the write lock first, so the log tells waiting for it apart
+        // from holding it.
+        let asked = Instant::now();
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let _held = Held::after_waiting("Storing a frame's text", asked.elapsed());
         if let Some((text, boxes)) = result {
             Self::store_text(&tx, day, frame_number, text, boxes)?;
         }
@@ -1663,14 +1736,19 @@ mod tests {
 
     #[test]
     fn test_slow_holds_are_logged_by_how_long_they_took() {
-        let level = |took: Duration| slow_hold_event("Searching", took).map(|event| format!("{:?}", event));
-        assert_eq!(level(Duration::from_secs(4)), None);
-        assert!(level(SLOW_HOLD).unwrap().contains("level: Warn"));
+        let level = |took: Duration, waited: Duration| {
+            slow_hold_event("Searching", took, waited).map(|event| format!("{:?}", event))
+        };
+        assert_eq!(level(Duration::from_secs(4), Duration::ZERO), None);
+        assert!(level(SLOW_HOLD, Duration::ZERO).unwrap().contains("level: Warn"));
         // Long enough to make another connection fail: an error, which
         // reaches PostHog.
-        let error = level(LOCK_WAIT).unwrap();
+        let error = level(LOCK_WAIT, Duration::ZERO).unwrap();
         assert!(error.contains("level: Error"), "{}", error);
-        assert!(error.contains("Searching held the database for 30 s"), "{}", error);
+        assert!(error.contains("Searching held the database for 30 s, longer"), "{}", error);
+        // Time spent waiting for the database is reported apart.
+        let error = level(LOCK_WAIT, Duration::from_secs(12)).unwrap();
+        assert!(error.contains("for 30 s, after waiting 12 s for it, longer"), "{}", error);
     }
 
     fn search(db: &ScreenshotDatabase, query: &str) -> Vec<(String, u32)> {
