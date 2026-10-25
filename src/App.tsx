@@ -264,7 +264,9 @@ export function App({
       {/* On macOS this is also the title bar (tauri.macos.conf.json overlays the
           traffic lights on it), so it drags the window and leaves room for them.
           Tauri's drag handler cancels the mousedown, so a click there would no
-          longer take focus away from the find field; blur it by hand. */}
+          longer take focus away from the find field; blur it by hand. Nothing in
+          it is selectable except the find field, so double-clicking it to zoom
+          the window doesn't select a label. */}
       <header
         data-tauri-drag-region
         onMouseDown={(e): void => {
@@ -272,7 +274,7 @@ export function App({
             document.activeElement.blur();
           }
         }}
-        className="bg-titlebar px-4 py-2 border-b border-border [[data-platform=macos]_&]:pl-[88px]">
+        className="bg-titlebar px-4 py-2 border-b select-none border-border [[data-platform=macos]_&]:pl-[88px]">
         <div data-tauri-drag-region className="flex items-center gap-4">
           <DayPicker days={days} today={today} value={selectedDay} onChange={setSelectedDay} />
 
@@ -311,7 +313,7 @@ export function App({
                     e.currentTarget.blur();
                   }
                 }}
-                className="flex-1 min-w-0 bg-transparent text-sm outline-none placeholder:text-muted-fg"
+                className="flex-1 min-w-0 bg-transparent text-sm outline-none select-text placeholder:text-muted-fg"
               />
               {query !== "" && (
                 <span className="text-xs text-muted-fg whitespace-nowrap tabular-nums" aria-live="polite">
