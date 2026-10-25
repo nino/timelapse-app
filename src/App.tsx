@@ -272,7 +272,7 @@ export function App({
             document.activeElement.blur();
           }
         }}
-        className="bg-titlebar px-4 py-2 border-b border-border [[data-platform=macos]_&]:pl-[88px]">
+        className="titlebar-gradient px-4 py-2 border-b border-border [[data-platform=macos]_&]:pl-[88px]">
         <div data-tauri-drag-region className="flex items-center gap-4">
           <DayPicker days={days} today={today} value={selectedDay} onChange={setSelectedDay} />
 
