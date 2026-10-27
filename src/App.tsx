@@ -260,7 +260,7 @@ export function App({
   }
 
   return (
-    <main className="h-screen overflow-hidden grid grid-rows-[min-content_1fr_auto] bg-page text-fg">
+    <main className="h-screen overflow-hidden grid grid-rows-[min-content_1fr_auto] bg-page text-fg [[data-vibrancy]_&]:bg-transparent">
       {/* On macOS this is also the title bar (tauri.macos.conf.json overlays the
           traffic lights on it), so it drags the window and leaves room for them.
           Tauri's drag handler cancels the mousedown, so a click there would no
