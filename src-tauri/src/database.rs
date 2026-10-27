@@ -27,7 +27,8 @@
 //! database, `Held` lifts its thread to the user-initiated class, so the
 //! capture loop and searches don't wait on a throttled thread. OCR takes its
 //! write lock before timing starts, so its log line separates waiting for
-//! the database from holding it.
+//! the database from holding it, and names how long writing the text, moving
+//! the progress mark and committing each took.
 
 use rusqlite::{Connection, OptionalExtension, Result, Transaction, TransactionBehavior};
 use serde::Serialize;
@@ -58,6 +59,10 @@ struct Held {
     started: Instant,
     /// How long the call waited for the database before it held it.
     waited: Duration,
+    /// How long each named step took, for the log line of a slow hold.
+    steps: Vec<(&'static str, Duration)>,
+    /// When the last step ended.
+    last: Instant,
     _unthrottled: Unthrottled,
 }
 
@@ -73,35 +78,57 @@ impl Held {
                 .took(waited)
                 .record();
         }
-        Held { what, started: Instant::now(), waited, _unthrottled: Unthrottled::raise() }
+        let now = Instant::now();
+        Held { what, started: now, waited, steps: Vec::new(), last: now, _unthrottled: Unthrottled::raise() }
+    }
+
+    /// Note that step `name` just ended.
+    fn step(&mut self, name: &'static str) {
+        let now = Instant::now();
+        self.steps.push((name, now - self.last));
+        self.last = now;
     }
 }
 
 impl Drop for Held {
     fn drop(&mut self) {
         let took = self.started.elapsed();
-        if let Some(event) = slow_hold_event(self.what, took, self.waited) {
+        if let Some(event) = slow_hold_event(self.what, took, self.waited, &self.steps) {
             event.took(took).record();
         }
     }
 }
 
 /// The diagnostics event for a call (`what`) that held the database for
-/// `took` after waiting `waited` for it, or `None` if that was quick.
-fn slow_hold_event(what: &'static str, took: Duration, waited: Duration) -> Option<crate::diagnostics::Event> {
+/// `took` after waiting `waited` for it, or `None` if that was quick. An
+/// error names how long each of its `steps` took.
+fn slow_hold_event(
+    what: &'static str,
+    took: Duration,
+    waited: Duration,
+    steps: &[(&'static str, Duration)],
+) -> Option<crate::diagnostics::Event> {
     if took >= LOCK_WAIT {
         let after = if waited >= Duration::from_secs(1) {
             format!(", after waiting {} s for it", waited.as_secs())
         } else {
             String::new()
         };
+        let steps = if steps.is_empty() {
+            String::new()
+        } else {
+            let each: Vec<String> =
+                steps.iter().map(|(name, took)| format!("{} {:.1} s", name, took.as_secs_f64())).collect();
+            format!(" ({})", each.join(", "))
+        };
         Some(crate::diagnostics::error(
             "database",
             format!(
-                "{} held the database for {} s{}, longer than other connections wait for it",
+                "{} held the database for {} s{}, longer than other connections wait for it{}",
                 what,
                 took.as_secs(),
-                after
+                after,
+                steps
             ),
         ))
     } else if took >= SLOW_HOLD {
@@ -708,16 +735,20 @@ impl ScreenshotDatabase {
         // from holding it.
         let asked = Instant::now();
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
-        let _held = Held::after_waiting("Storing a frame's text", asked.elapsed());
+        let mut held = Held::after_waiting("Storing a frame's text", asked.elapsed());
         if let Some((text, boxes)) = result {
             Self::store_text(&tx, day, frame_number, text, boxes)?;
+            held.step("text");
         }
         tx.execute(
             "INSERT INTO ocr_progress (day, last_frame, by_position) VALUES (?1, ?2, ?3)
              ON CONFLICT (day) DO UPDATE SET last_frame = max(last_frame, excluded.last_frame)",
             rusqlite::params![day, frame_number, by_position],
         )?;
-        tx.commit()
+        held.step("progress");
+        let committed = tx.commit();
+        held.step("commit");
+        committed
     }
 
     /// Record a frame that OCR's sampling pass over a day read from video
@@ -1737,7 +1768,7 @@ mod tests {
     #[test]
     fn test_slow_holds_are_logged_by_how_long_they_took() {
         let level = |took: Duration, waited: Duration| {
-            slow_hold_event("Searching", took, waited).map(|event| format!("{:?}", event))
+            slow_hold_event("Searching", took, waited, &[]).map(|event| format!("{:?}", event))
         };
         assert_eq!(level(Duration::from_secs(4), Duration::ZERO), None);
         assert!(level(SLOW_HOLD, Duration::ZERO).unwrap().contains("level: Warn"));
@@ -1749,6 +1780,10 @@ mod tests {
         // Time spent waiting for the database is reported apart.
         let error = level(LOCK_WAIT, Duration::from_secs(12)).unwrap();
         assert!(error.contains("for 30 s, after waiting 12 s for it, longer"), "{}", error);
+        // And so is each step's time.
+        let steps = [("text", Duration::from_millis(120)), ("commit", Duration::from_secs(296))];
+        let error = format!("{:?}", slow_hold_event("Storing", LOCK_WAIT, Duration::ZERO, &steps).unwrap());
+        assert!(error.contains("wait for it (text 0.1 s, commit 296.0 s)"), "{}", error);
     }
 
     fn search(db: &ScreenshotDatabase, query: &str) -> Vec<(String, u32)> {
