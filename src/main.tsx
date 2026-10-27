@@ -22,6 +22,14 @@ if (navigator.userAgent.includes("Macintosh")) {
 logUncaughtErrors();
 
 const label = getCurrentWindow().label;
+const isMainWindow = label !== ACTIVITY_WINDOW && label !== SETTINGS_WINDOW && label !== ABOUT_WINDOW;
+
+// On macOS the main window is transparent over the system's sidebar material
+// (tauri.macos.conf.json), and the page leaves the margins beside the frame
+// clear so it shows through. The other windows are opaque.
+if (document.documentElement.dataset.platform === "macos" && isMainWindow) {
+  document.documentElement.dataset.vibrancy = "";
+}
 
 function view(position: ViewerPosition | undefined): React.ReactNode {
   if (label === ACTIVITY_WINDOW) return <ActivityView />;
@@ -34,7 +42,7 @@ function view(position: ViewerPosition | undefined): React.ReactNode {
 // render, so the viewer opens there instead of starting on the newest day and
 // jumping. Without it the viewer opens the newest day.
 function restoredPosition(): Promise<ViewerPosition | undefined> {
-  if (label === ACTIVITY_WINDOW || label === SETTINGS_WINDOW || label === ABOUT_WINDOW) return Promise.resolve(undefined);
+  if (!isMainWindow) return Promise.resolve(undefined);
   return getViewerPosition().catch((error: unknown) => {
     console.error("Could not read the saved viewer position:", error);
     return undefined;

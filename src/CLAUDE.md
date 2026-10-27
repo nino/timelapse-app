@@ -24,6 +24,8 @@
 
 Styling follows Nino's Ninoes design system (`nino/ninoes`), copied in: the tokens (`bg-page`, `bg-card`, `text-fg`, `text-muted-fg`, `border-border`, `bg-primary`, …) are in `@theme` in `App.css` and redefined for dark mode there, so use them instead of raw colours; shared class strings are in `ui.ts`. The colour values are Nino's own higher-contrast "Ultramarine" palette, not Ninoes', with a cyan playhead bar (`--color-playhead`) as the scrubber thumb. Don't use blurred shadows or the squircle `corner-shape`: WebKit repaints a blurred shadow on the CPU on every frame of a window resize, and Chromium paints squircles three times slower. Fonts are bundled with `@fontsource`, never loaded from the network.
 
+On macOS the main window is transparent over the system's native sidebar material (`transparent` and `windowEffects` in `tauri.macos.conf.json`); `main.tsx` sets `data-vibrancy` on `<html>` there, and the page leaves the margins beside the frame without a background so the material shows through. It is drawn by the window server, not by WebKit, so it is not the CSS backdrop blur the performance rule above rules out. Anything that should cover it needs its own background.
+
 ## Tests
 
 `bunfig.toml` preloads `test/happydom.ts` (must load first) and then `test/setup.ts` (jest-dom matchers, Tauri mocks, `URL.createObjectURL` stubs, `cleanup`). Import test APIs from `bun:test`.

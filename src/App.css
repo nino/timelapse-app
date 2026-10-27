@@ -92,6 +92,13 @@ body {
   box-sizing: border-box;
 }
 
+/* The macOS main window's native vibrancy (see main.tsx) shows wherever the
+   page has no background of its own. */
+html[data-vibrancy],
+html[data-vibrancy] body {
+  background: transparent;
+}
+
 /* Performance comes first: no blurred shadows and no squircle corners. WebKit
    paints a blurred box-shadow on the CPU and repaints it on every frame of a
    window resize, which made resizing sluggish, and Chromium's squircle
