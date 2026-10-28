@@ -15,9 +15,11 @@
 //! 1-based positions in the day's videos; `ocr_done_through` ignores those
 //! rows so the converter never mistakes one for the other.
 //!
-//! The file uses SQLite's rollback journal, so a reader holds up a writer's
-//! commit and a writer holds up everyone. Every connection waits up to
-//! `LOCK_WAIT` for the others; the calls most likely to hold the database
+//! The file uses SQLite's write-ahead log (it used a rollback journal until
+//! October 2026, when OCR commits took up to minutes on one Mac and held up
+//! the capture loop meanwhile). Readers and the one writer don't
+//! block each other, and a commit doesn't sync the disk. Every connection
+//! waits up to `LOCK_WAIT` for another writer; the calls most likely to hold the database
 //! longer (searches, OCR and converter writes, migrations) are timed by a
 //! `Held` guard, which logs any that take `SLOW_HOLD` or more, so a
 //! "database is locked" error can be matched to what held it.
@@ -213,7 +215,8 @@ impl ScreenshotDatabase {
             db_path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
-        // Readers wait while a writer commits; a commit is quick.
+        // In WAL mode a reader only waits while a writer sets the log up or
+        // a checkpoint resets it, both quick.
         conn.busy_timeout(Duration::from_secs(5))?;
         Ok(Some(Self { conn }))
     }
@@ -227,6 +230,13 @@ impl ScreenshotDatabase {
         // default. Another process opening the database meanwhile should wait it
         // out rather than fail with SQLITE_BUSY.
         conn.busy_timeout(LOCK_WAIT)?;
+
+        // Write-ahead log, so readers and the writer never wait on each other
+        // and a commit appends to the log without syncing the disk; only the
+        // checkpoints that copy the log back into the file sync it. Kept in
+        // the file, so this only changes something the first time.
+        conn.query_row("PRAGMA journal_mode = WAL", [], |row| row.get::<_, String>(0))?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
 
         // Create migrations table if it doesn't exist
         conn.execute(
@@ -1949,6 +1959,45 @@ mod tests {
         assert_ne!(before, skipped);
         db.record_ocr_frame("2024-01-01", 2, Some(("cargo", &[]))).unwrap();
         assert_ne!(skipped, reader.ocr_version().unwrap());
+        assert_eq!(reader.count_ocr_matches("cargo").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_readers_and_the_writer_do_not_wait_on_each_other() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("test.db");
+        let db = ScreenshotDatabase::new(path.clone()).unwrap();
+        let mode: String = db.conn.query_row("PRAGMA journal_mode", [], |row| row.get(0)).unwrap();
+        assert_eq!(mode, "wal");
+        db.record_ocr_frame("2024-01-01", 1, Some(("cargo", &[]))).unwrap();
+
+        // A reader in the middle of a read doesn't stop a commit...
+        let reader = ScreenshotDatabase::open_read_only(path.clone()).unwrap().unwrap();
+        reader.conn.busy_timeout(Duration::ZERO).unwrap();
+        let mut statement = reader.conn.prepare("SELECT day FROM ocr_frames").unwrap();
+        let mut rows = statement.query([]).unwrap();
+        assert!(rows.next().unwrap().is_some());
+        db.conn.busy_timeout(Duration::ZERO).unwrap();
+        db.record_ocr_frame("2024-01-01", 2, Some(("cargo again", &[]))).unwrap();
+        drop(rows);
+
+        // ...and an open write doesn't stop a read.
+        let tx = Transaction::new_unchecked(&db.conn, TransactionBehavior::Immediate).unwrap();
+        tx.execute("DELETE FROM ocr_frames", []).unwrap();
+        assert_eq!(reader.search_ocr("cargo", 10).unwrap().len(), 2);
+        drop(tx);
+    }
+
+    #[test]
+    fn test_read_only_opens_a_closed_wal_database() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("test.db");
+        let db = ScreenshotDatabase::new(path.clone()).unwrap();
+        db.record_ocr_frame("2024-01-01", 1, Some(("cargo", &[]))).unwrap();
+        // The last connection to close folds the log back into the file and
+        // deletes it.
+        drop(db);
+        let reader = ScreenshotDatabase::open_read_only(path).unwrap().unwrap();
         assert_eq!(reader.count_ocr_matches("cargo").unwrap().len(), 1);
     }
 
