@@ -840,9 +840,11 @@ fn open_main_window<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
         .unwrap_or_default();
     let mut builder = WebviewWindowBuilder::from_config(app, &config)?;
     if let Some(place) = saved_place(app, MAIN_WINDOW) {
-        builder = builder
-            .position(place.x, place.y)
-            .inner_size(place.width, place.height);
+        // A size saved before the window had a minimum may be below it.
+        builder = builder.position(place.x, place.y).inner_size(
+            place.width.max(config.min_width.unwrap_or(0.0)),
+            place.height.max(config.min_height.unwrap_or(0.0)),
+        );
     }
     let window = builder.build()?;
     remember_place(&window.as_ref().window());

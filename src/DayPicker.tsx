@@ -30,14 +30,9 @@ export function DayPicker({
         <>
           <ListboxButton
             aria-label="Day"
-            className={`flex h-7.5 min-w-0 items-center gap-3 rounded-full border border-input bg-field pr-3.5 pl-4 text-sm font-medium tabular-nums ${focusRing}`}
+            className={`flex h-7.5 shrink-0 items-center gap-3 rounded-full whitespace-nowrap border border-input bg-field pr-3.5 pl-4 text-sm font-medium tabular-nums ${focusRing}`}
           >
-            {/* One line: when the toolbar is tight the label ends in "…" rather than wrapping. */}
-            {value === null ? (
-              <span className="truncate text-muted-fg">Select a day…</span>
-            ) : (
-              <span className="truncate">{label(value)}</span>
-            )}
+            {value === null ? <span className="text-muted-fg">Select a day…</span> : label(value)}
             <Chevron />
           </ListboxButton>
           <DayOptions days={days} label={label} open={open} />
