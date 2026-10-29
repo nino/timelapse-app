@@ -259,16 +259,18 @@ export function App({
     );
   }
 
+  // The window's minimum width (tauri.conf.json) is what the toolbar needs with
+  // the find field at its narrowest (min-w-40) and the app filter at its widest
+  // (max-w-48); the pickers keep their full width. minmax(0,1fr) keeps the
+  // column the window's width, so nothing can push the scrubber off the edge.
   return (
-    <main className="h-screen overflow-hidden grid grid-rows-[min-content_1fr_auto] bg-page text-fg [[data-vibrancy]_&]:bg-transparent">
+    <main className="h-screen overflow-hidden grid grid-cols-[minmax(0,1fr)] grid-rows-[min-content_1fr_auto] bg-page text-fg [[data-vibrancy]_&]:bg-transparent">
       {/* On macOS this is also the title bar (tauri.macos.conf.json overlays the
           traffic lights on it), so it drags the window and leaves room for them.
           Tauri's drag handler cancels the mousedown, so a click there would no
           longer take focus away from the find field; blur it by hand. Nothing in
           it is selectable except the find field, so double-clicking it to zoom
-          the window doesn't select a label. min-w-0 lets the toolbar get narrower
-          than its contents, so the pickers shorten their labels instead of the
-          toolbar running off the window. */}
+          the window doesn't select a label. */}
       <header
         data-tauri-drag-region
         onMouseDown={(e): void => {
@@ -276,7 +278,7 @@ export function App({
             document.activeElement.blur();
           }
         }}
-        className="titlebar-gradient min-w-0 px-4 py-2 border-b select-none border-border [[data-platform=macos]_&]:pl-[88px]">
+        className="titlebar-gradient px-4 py-2 border-b select-none border-border [[data-platform=macos]_&]:pl-[88px]">
         <div data-tauri-drag-region className="flex items-center gap-4">
           <DayPicker days={days} today={today} value={selectedDay} onChange={setSelectedDay} />
 
@@ -294,7 +296,7 @@ export function App({
                 if (next !== currentIndex) goTo(next);
               }}
             />
-            <label className={`${fieldFrame} flex items-center gap-2 w-72 h-7.5 px-2.5`}>
+            <label className={`${fieldFrame} flex items-center gap-2 w-72 min-w-40 h-7.5 px-2.5`}>
               <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true" className="shrink-0 text-muted-fg">
                 <circle cx="11" cy="11" r="7" />
                 <path d="m20 20-3.5-3.5" />
