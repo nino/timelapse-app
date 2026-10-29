@@ -266,7 +266,9 @@ export function App({
           Tauri's drag handler cancels the mousedown, so a click there would no
           longer take focus away from the find field; blur it by hand. Nothing in
           it is selectable except the find field, so double-clicking it to zoom
-          the window doesn't select a label. */}
+          the window doesn't select a label. min-w-0 lets the toolbar get narrower
+          than its contents, so the pickers shorten their labels instead of the
+          toolbar running off the window. */}
       <header
         data-tauri-drag-region
         onMouseDown={(e): void => {
@@ -274,7 +276,7 @@ export function App({
             document.activeElement.blur();
           }
         }}
-        className="titlebar-gradient px-4 py-2 border-b select-none border-border [[data-platform=macos]_&]:pl-[88px]">
+        className="titlebar-gradient min-w-0 px-4 py-2 border-b select-none border-border [[data-platform=macos]_&]:pl-[88px]">
         <div data-tauri-drag-region className="flex items-center gap-4">
           <DayPicker days={days} today={today} value={selectedDay} onChange={setSelectedDay} />
 

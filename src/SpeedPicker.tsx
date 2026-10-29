@@ -48,7 +48,7 @@ export function SpeedPicker({
       <ListboxButton
         aria-label="Playback speed"
         title="Playback speed"
-        className={`flex items-center gap-1 pr-2 pl-2.5 text-sm font-medium tabular-nums transition-colors hover:bg-muted ${focusRing} ${className}`}
+        className={`flex items-center gap-1 pr-2 whitespace-nowrap pl-2.5 text-sm font-medium tabular-nums transition-colors hover:bg-muted ${focusRing} ${className}`}
       >
         {value} fps
         <Chevron />

@@ -30,9 +30,14 @@ export function DayPicker({
         <>
           <ListboxButton
             aria-label="Day"
-            className={`flex h-7.5 items-center gap-3 rounded-full border border-input bg-field pr-3.5 pl-4 text-sm font-medium tabular-nums ${focusRing}`}
+            className={`flex h-7.5 min-w-0 items-center gap-3 rounded-full border border-input bg-field pr-3.5 pl-4 text-sm font-medium tabular-nums ${focusRing}`}
           >
-            {value === null ? <span className="text-muted-fg">Select a day…</span> : label(value)}
+            {/* One line: when the toolbar is tight the label ends in "…" rather than wrapping. */}
+            {value === null ? (
+              <span className="truncate text-muted-fg">Select a day…</span>
+            ) : (
+              <span className="truncate">{label(value)}</span>
+            )}
             <Chevron />
           </ListboxButton>
           <DayOptions days={days} label={label} open={open} />
@@ -183,7 +188,7 @@ function Mark({ stage, children }: { stage: Stage; children: React.ReactNode }):
 
 export function Chevron(): React.ReactNode {
   return (
-    <svg viewBox="0 0 16 16" aria-hidden="true" className="size-4 text-muted-fg">
+    <svg viewBox="0 0 16 16" aria-hidden="true" className="size-4 shrink-0 text-muted-fg">
       <path
         d="m4 6 4 4 4-4"
         fill="none"
