@@ -8,7 +8,9 @@ use std::process::Command;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use frame_source::{FrameRange, FrameSource, Source, Tools, CHUNK_FRAMES, READ_AHEAD_FRAMES};
+use frame_source::{
+    FrameRange, FrameSource, Source, Tools, VideoSpan, CHUNK_FRAMES, READ_AHEAD_FRAMES,
+};
 use tempfile::TempDir;
 
 const LEVEL_STEP: usize = 4;
@@ -501,6 +503,44 @@ fn reports_video_frames_that_are_not_decoded_yet() {
             range(long + 1, long + 6)
         ]
     );
+}
+
+#[test]
+fn lists_the_videos_a_day_is_played_from() {
+    let lib = Library::new();
+    let root = lib.root.path();
+    let day_dir = root.join("2026-10-04");
+    fs::create_dir(&day_dir).unwrap();
+    make_video(&root.join("2026-10-04--09-00-00--hourly.mov"), 4, 0);
+    write_shot(&day_dir, "03601.png", b"ten", "2026-10-04 10:00:00");
+    make_video(&root.join("2026-10-04--11-00-00--hourly.mov"), 3, 0);
+    let source = lib.source(u64::MAX);
+
+    let videos = source.day_videos("2026-10-04").unwrap();
+    assert_eq!(videos.frame_count, 8);
+    let span = |start, end, file: &str| VideoSpan {
+        start,
+        end,
+        file: file.to_owned(),
+        fps: 15.0,
+    };
+    assert_eq!(
+        videos.spans,
+        vec![
+            span(0, 4, "2026-10-04--09-00-00--hourly.mov"),
+            span(5, 8, "2026-10-04--11-00-00--hourly.mov"),
+        ]
+    );
+
+    // Only videos in the library root can be looked up, by bare name.
+    assert_eq!(
+        source.video_path("2026-10-04--09-00-00--hourly.mov"),
+        Some(root.join("2026-10-04--09-00-00--hourly.mov"))
+    );
+    assert_eq!(source.video_path("2026-10-04--12-00-00--hourly.mov"), None);
+    assert_eq!(source.video_path("2026-10-04/03601.png"), None);
+    assert_eq!(source.video_path("../2026-10-04--09-00-00--hourly.mov"), None);
+    assert_eq!(source.video_path("screenshots.db"), None);
 }
 
 #[test]

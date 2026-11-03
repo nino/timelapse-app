@@ -6,8 +6,9 @@ import "./App.css";
 import { AppPicker } from "./AppPicker";
 import { mergeCloseRanges, nextInRanges } from "./apps";
 import { DayPicker } from "./DayPicker";
-import { frameUrl, getFrameTime, type FrameRange, type FrameTime } from "./frames";
+import { frameUrl, getFrameTime, type FrameRange, type FrameTime, type VideoSpan } from "./frames";
 import { useDayApps } from "./hooks/useDayApps";
+import { useDayVideos } from "./hooks/useDayVideos";
 import { useLatestLoad } from "./hooks/useDirectoryChanges";
 import { useEventListener } from "./hooks/useEventListener";
 import { useInstalledUpdate } from "./hooks/useInstalledUpdate";
@@ -19,12 +20,14 @@ import {
   useOcrVersion,
 } from "./hooks/useOcrSearch";
 import { usePendingFrames } from "./hooks/usePendingFrames";
+import { useSettings } from "./hooks/useSettings";
 import { useTimeout } from "./hooks/useTimeout";
 import { PendingStretches } from "./PendingStretches";
 import { nextStop, previousStop, rangeAt, toStops, type DayMatch, type Stop } from "./search";
 import { savedPlaybackSpeed, savePlaybackSpeed, SpeedPicker, type PlaybackSpeed } from "./SpeedPicker";
 import { fieldFrame, focusRing, segmentButton } from "./ui";
 import { relaunchIntoUpdate } from "./updates";
+import { VideoFrame } from "./VideoFrame";
 import { setViewerPosition, type ViewerPosition } from "./viewerPosition";
 
 // How many other days the find bar names before folding the rest away.
@@ -200,9 +203,47 @@ export function App({
     goTo(Math.min(frameCount - 1, Math.max(0, currentIndex + direction * step)));
   });
 
+  // Beta: hours kept as video are shown by seeking a <video> of the hour
+  // (`VideoFrame`) instead of asking the frame source to decode them. A video
+  // the page can't play falls back to decoded frames.
+  const settings = useSettings();
+  const videoPlayer = settings?.videoPlayerBeta === true;
+  const dayVideos = useDayVideos(videoPlayer ? day : null);
+  const [failedVideos, setFailedVideos] = React.useState<ReadonlySet<string>>(() => new Set());
+  const videoSpan =
+    dayVideos?.spans.find(
+      (span) => span.start <= currentIndex && currentIndex < span.end && span.end <= frameCount,
+    ) ?? null;
+  const span = videoSpan && !failedVideos.has(videoSpan.file) ? videoSpan : null;
+  // What the video player last finished seeking to, and what it showed.
+  // Cleared once an <img> frame has replaced it.
+  const [videoShown, setVideoShown] = React.useState<{
+    day: string;
+    span: VideoSpan;
+    wanted: number;
+    shown: number;
+  } | null>(null);
+  const spanDay = span ? selectedDay : null;
+  const onVideoShown = React.useCallback(
+    (wanted: number, shown: number): void => {
+      if (spanDay !== null && span !== null) setVideoShown({ day: spanDay, span, wanted, shown });
+    },
+    [spanDay, span],
+  );
+  const videoOnScreen =
+    span !== null && videoShown?.day === selectedDay && videoShown.span.file === span.file;
+
   const wantedSrc =
     selectedDay && frameCount > 0 ? frameUrl(selectedDay, currentIndex) : null;
-  const { src, frameFailed, loaded, settled, onLoad, onError } = useGatedImage(wantedSrc);
+  const heldVideo =
+    videoShown !== null && videoShown.day === selectedDay && !videoOnScreen && videoShown.span.file !== span?.file
+      ? videoShown
+      : null;
+  // While the video player shows the frame, the <img> keeps whatever it last
+  // showed, underneath, until the player has a frame up.
+  const { src, frameFailed, loaded, settled, onLoad, onError } = useGatedImage(
+    span ? undefined : wantedSrc,
+  );
   const [speed, setSpeed] = React.useState<PlaybackSpeed>(savedPlaybackSpeed);
   const { playing, togglePlaying } = usePlayback({
     frameMs: 1000 / speed,
@@ -213,11 +254,15 @@ export function App({
     // The next frame is asked for only once this one is on screen (or has
     // failed), so playback slows down rather than queueing decodes when
     // frames come from video faster than they can be decoded.
-    frameShown: wantedSrc !== null && settled === wantedSrc,
+    frameShown: span
+      ? videoOnScreen && videoShown.wanted === currentIndex
+      : wantedSrc !== null && settled === wantedSrc,
     goTo,
   });
   // Stretches still to be decoded from video are drawn paler on the scrubber.
-  const pendingFrames = usePendingFrames(day, loaded);
+  // The video player needs nothing decoded, and screenshots never do. Not
+  // asked before the settings say which it is.
+  const pendingFrames = usePendingFrames(settings === null || videoPlayer ? null : day, loaded);
   const [frameSize, setFrameSize] = React.useState(DEFAULT_FRAME_SIZE);
   // Big screens get bigger frames; the outlines keep the same look on them.
   const outlineScale = frameSize.width / DEFAULT_FRAME_SIZE.width;
@@ -226,8 +271,10 @@ export function App({
   // Outline the matching lines only once the frame on screen is the one the
   // match was read from, or stands for: until a new frame has loaded, the
   // browser keeps showing the old one.
-  const highlights =
-    currentMatch && loaded === wantedSrc && !frameFailed ? (matchLines ?? []) : [];
+  const frameOnScreen = span
+    ? videoOnScreen && videoShown.shown === currentIndex
+    : loaded === wantedSrc && !frameFailed;
+  const highlights = currentMatch && frameOnScreen ? (matchLines ?? []) : [];
 
   // Capture time of the frame on screen. The last one stays up while the
   // next loads, so scrubbing doesn't flicker "--:--".
@@ -391,6 +438,7 @@ export function App({
                 );
               }
               onLoad();
+              if (!span) setVideoShown(null);
             }}
             onError={onError}
             className={`w-full h-full object-contain absolute inset-0 ${
@@ -398,6 +446,41 @@ export function App({
             }`}
           />
         )}
+        {/* The video last on screen stays up until the next frame is: a new
+            hour's video until it has a frame, an <img> until it has loaded.
+            Keyed by file in one list, so a video moving between the two
+            roles keeps its element and doesn't load again. */}
+        {[
+          heldVideo && (
+            <VideoFrame
+              key={heldVideo.span.file}
+              span={heldVideo.span}
+              index={heldVideo.shown}
+              visible
+              onShown={ignoreShown}
+              onSize={ignoreSize}
+              onError={ignoreError}
+            />
+          ),
+          span && (
+            <VideoFrame
+              key={span.file}
+              span={span}
+              index={currentIndex}
+              visible={videoOnScreen}
+              onShown={onVideoShown}
+              onSize={(size) =>
+                setFrameSize((current) =>
+                  current.width === size.width && current.height === size.height ? current : size,
+                )
+              }
+              onError={() => {
+                console.error(`The video player could not play ${span.file}; showing decoded frames instead.`);
+                setFailedVideos((failed) => new Set(failed).add(span.file));
+              }}
+            />
+          ),
+        ]}
         {highlights.length > 0 && (
           // Same box and aspect fitting as the <img>'s object-contain, so
           // normalized line boxes land on the text.
@@ -423,10 +506,10 @@ export function App({
             ))}
           </svg>
         )}
-        {(!src || frameFailed) && (
+        {(!src || frameFailed) && !videoOnScreen && !heldVideo && (
           <div className="flex items-center justify-center h-full text-muted-fg text-center">
             <p className="text-xl">
-              {frameFailed
+              {frameFailed && !span
                 ? "Could not load this frame"
                 : days.length === 0
                   ? "No screenshots yet"
@@ -496,6 +579,10 @@ export function App({
     </main>
   );
 }
+
+function ignoreShown(): void {}
+function ignoreSize(): void {}
+function ignoreError(): void {}
 
 /** "3 of 31" when on a match, otherwise how many there are. */
 function matchLabel(
@@ -777,12 +864,13 @@ function usePlayback({
 }
 
 /**
- * Show `wanted` in an `<img>`, but never start loading a frame while another
+ * Show `wanted` in an `<img>` (`undefined` to keep what it shows), but never
+ * start loading a frame while another
  * is still loading. Dragging the scrubber across a video day would otherwise
  * queue a decode for every chunk it passes; this way each load that finishes
  * jumps straight to wherever the scrubber is now.
  */
-function useGatedImage(wanted: string | null): {
+function useGatedImage(wanted: string | null | undefined): {
   src: string | null;
   frameFailed: boolean;
   /** The last frame that finished loading successfully. */
@@ -802,8 +890,8 @@ function useGatedImage(wanted: string | null): {
   }>({ src: null, inFlight: false, frameFailed: false, loaded: null, settled: null });
 
   // Nothing loading: show the wanted frame. Otherwise the load that finishes
-  // brings this round again.
-  if (!state.inFlight && wanted !== state.src) {
+  // brings this round again. `undefined` keeps the frame shown.
+  if (wanted !== undefined && !state.inFlight && wanted !== state.src) {
     setState({ ...state, src: wanted, inFlight: wanted !== null });
   }
 

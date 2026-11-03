@@ -65,6 +65,29 @@ export function getPendingFrames(date: string): Promise<PendingFrames> {
   return invoke<PendingFrames>("get_pending_frames", { date });
 }
 
+/** A stretch of a day one video holds frame for frame. Mirrors `VideoSpan` in Rust. */
+export type VideoSpan = {
+  /** Day-wide index of the video's first frame. */
+  start: number;
+  /** Exclusive. */
+  end: number;
+  /** The video's file name in the library root. */
+  file: string;
+  fps: number;
+};
+
+/** Mirrors `DayVideos` in Rust. */
+export type DayVideos = {
+  /** The day's frame count when the spans were found. */
+  frameCount: number;
+  spans: Array<VideoSpan>;
+};
+
+/** The stretches of `date` served from video, for the beta video player. */
+export function getDayVideos(date: string): Promise<DayVideos> {
+  return invoke<DayVideos>("get_day_videos", { date });
+}
+
 /**
  * Calls `handler` with a day's date whenever the frame source has decoded a
  * stretch of it ahead of the viewer, without being asked for a frame there.
@@ -85,4 +108,15 @@ export function frameUrl(date: string, index: number): string {
     ? "http://frames.localhost"
     : "frames://localhost";
   return `${base}/${date}/${index}`;
+}
+
+/**
+ * URL of a library video, served with byte ranges by the `videos` protocol
+ * registered in `src-tauri/src/lib.rs`. Usable directly as a `<video src>`.
+ */
+export function videoUrl(file: string): string {
+  const base = navigator.userAgent.includes("Windows")
+    ? "http://videos.localhost"
+    : "videos://localhost";
+  return `${base}/${encodeURIComponent(file)}`;
 }
