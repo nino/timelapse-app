@@ -160,6 +160,19 @@ describe("VideoSeeker", () => {
     expect(shown).toEqual([[300, 300]]);
   });
 
+  it("finishes a seek that presents no new frame even when asked for more meanwhile", async () => {
+    const { video, seeker, shown, clock } = setup();
+    seeker.want(10);
+    // `seeked` comes, but the frame callback never does.
+    video.seeking = false;
+    video.emit("seeked");
+    clock.now += 16;
+    seeker.want(20);
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    expect(shown).toEqual([[10, 10]]);
+    expect(video.seeks.map((s) => s.frame)).toEqual([10, 20]);
+  });
+
   it("uses seeked and currentTime where there is no frame callback", () => {
     const { video, seeker, shown } = setup(false);
     seeker.want(77);

@@ -706,14 +706,26 @@ fn get_settings(settings: State<'_, SettingsStore>) -> Settings {
     settings.get()
 }
 
+/// Tells every window the settings have changed (`SETTINGS_CHANGED`), so the
+/// main window picks up a change made in the Settings window.
+fn settings_changed(app: &AppHandle, saved: Settings) {
+    if let Err(e) = app.emit(SETTINGS_CHANGED, saved) {
+        eprintln!("Could not report the settings change: {}", e);
+    }
+}
+
 #[tauri::command]
 fn set_update_automatically(
     enabled: bool,
+    app: AppHandle,
     settings: State<'_, SettingsStore>,
     updater: State<'_, UpdaterState>,
 ) -> Result<Settings, String> {
     let saved = settings.update(|s| s.update_automatically = enabled);
     updater.setting_changed();
+    if let Ok(saved) = saved {
+        settings_changed(&app, saved);
+    }
     saved
 }
 
@@ -731,10 +743,15 @@ fn relaunch_into_update(app: AppHandle) {
 }
 
 #[tauri::command]
-fn set_send_error_reports(enabled: bool, settings: State<'_, SettingsStore>) -> Result<Settings, String> {
+fn set_send_error_reports(
+    enabled: bool,
+    app: AppHandle,
+    settings: State<'_, SettingsStore>,
+) -> Result<Settings, String> {
     match settings.update(|s| s.send_error_reports = enabled) {
         Ok(saved) => {
             analytics::set_enabled(enabled);
+            settings_changed(&app, saved);
             Ok(saved)
         }
         Err(e) => {
@@ -753,11 +770,19 @@ fn set_video_player_beta(
     app: AppHandle,
     settings: State<'_, SettingsStore>,
 ) -> Result<Settings, String> {
-    let saved = settings.update(|s| s.video_player_beta = enabled)?;
-    if let Err(e) = app.emit(SETTINGS_CHANGED, saved) {
-        eprintln!("Could not report the settings change: {}", e);
+    match settings.update(|s| s.video_player_beta = enabled) {
+        Ok(saved) => {
+            settings_changed(&app, saved);
+            Ok(saved)
+        }
+        Err(e) => {
+            // The page puts the switch back when saving fails, so take the
+            // change back here too, or the main window (never told) and the
+            // store would disagree with what the switch shows.
+            let _ = settings.update(|s| s.video_player_beta = !enabled);
+            Err(e)
+        }
     }
-    Ok(saved)
 }
 
 /// What the viewer showed when the app last quit.

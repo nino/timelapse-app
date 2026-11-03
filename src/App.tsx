@@ -244,6 +244,13 @@ export function App({
   const { src, frameFailed, loaded, settled, onLoad, onError } = useGatedImage(
     span ? undefined : wantedSrc,
   );
+  // Once the <img> has settled on the wanted frame, the video's last frame
+  // no longer stands in for it. Checked here rather than in `onLoad`: a
+  // failed load must uncover the error, and coming back from a video to the
+  // frame the <img> still shows loads nothing at all.
+  if (!span && videoShown !== null && wantedSrc !== null && settled === wantedSrc) {
+    setVideoShown(null);
+  }
   const [speed, setSpeed] = React.useState<PlaybackSpeed>(savedPlaybackSpeed);
   const { playing, togglePlaying } = usePlayback({
     frameMs: 1000 / speed,
@@ -260,9 +267,8 @@ export function App({
     goTo,
   });
   // Stretches still to be decoded from video are drawn paler on the scrubber.
-  // The video player needs nothing decoded, and screenshots never do. Not
-  // asked before the settings say which it is.
-  const pendingFrames = usePendingFrames(settings === null || videoPlayer ? null : day, loaded);
+  // The video player needs nothing decoded, and screenshots never do.
+  const pendingFrames = usePendingFrames(videoPlayer ? null : day, loaded);
   const [frameSize, setFrameSize] = React.useState(DEFAULT_FRAME_SIZE);
   // Big screens get bigger frames; the outlines keep the same look on them.
   const outlineScale = frameSize.width / DEFAULT_FRAME_SIZE.width;
@@ -438,7 +444,6 @@ export function App({
                 );
               }
               onLoad();
-              if (!span) setVideoShown(null);
             }}
             onError={onError}
             className={`w-full h-full object-contain absolute inset-0 ${
@@ -457,9 +462,9 @@ export function App({
               span={heldVideo.span}
               index={heldVideo.shown}
               visible
-              onShown={ignoreShown}
-              onSize={ignoreSize}
-              onError={ignoreError}
+              onShown={ignore}
+              onSize={ignore}
+              onError={ignore}
             />
           ),
           span && (
@@ -580,9 +585,8 @@ export function App({
   );
 }
 
-function ignoreShown(): void {}
-function ignoreSize(): void {}
-function ignoreError(): void {}
+/** Callbacks of a held video, which reports nothing. */
+function ignore(): void {}
 
 /** "3 of 31" when on a match, otherwise how many there are. */
 function matchLabel(

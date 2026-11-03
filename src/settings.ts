@@ -33,7 +33,7 @@ export function setVideoPlayerBeta(enabled: boolean): Promise<Settings> {
 
 /**
  * Calls `handler` with the new settings whenever the Settings window changes
- * one that other windows act on. Mirrors `SETTINGS_CHANGED` in Rust.
+ * one. Mirrors `SETTINGS_CHANGED` in Rust.
  */
 export function onSettingsChanged(handler: (settings: Settings) => void): Promise<UnlistenFn> {
   return listen<Settings>("settings-changed", (event) => handler(event.payload));

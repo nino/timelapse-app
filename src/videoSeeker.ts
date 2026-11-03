@@ -85,9 +85,11 @@ export class VideoSeeker {
   }
 
   private start(moving = false): void {
-    this.clearTimer();
     const frame = this.wanted;
+    // A running seek keeps its timer: after `seeked` it is what finishes the
+    // seek when no frame callback comes.
     if (frame === null || this.running !== null || this.video.readyState < HAVE_METADATA) return;
+    this.clearTimer();
     if (frame === this.shown) {
       this.callbacks.onShown(frame, frame);
       return;

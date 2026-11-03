@@ -975,7 +975,7 @@ describe('App', () => {
       expect(shownFrame()).toBe(frameUrl('2026-10-01', 299));
       expect(video()).toHaveClass('invisible');
       // Nothing to decode, so nothing is drawn as pending.
-      expect(getPendingFrames).not.toHaveBeenCalled();
+      expect(document.querySelectorAll('[data-pending-stretch]')).toHaveLength(0);
       await settleFrameTime();
     });
 

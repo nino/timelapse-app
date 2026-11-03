@@ -15,12 +15,21 @@ export function useDayVideos(day: Day | null): DayVideos | null {
   const frameCount = day?.frameCount ?? 0;
   const hasVideo = day?.source === "video" || day?.source === "mixed";
 
+  // Today's frame count changes every second, so an answer slower than that
+  // would never count as the latest. Each one is published unless a newer
+  // request has already published, like `usePendingFrames`; an answer for
+  // another day is filtered out below.
+  const asked = React.useRef(0);
+  const published = React.useRef(0);
   const load = React.useCallback(
-    async (isCurrent: () => boolean): Promise<void> => {
+    async (): Promise<void> => {
       if (!date || !hasVideo) return;
+      const mine = ++asked.current;
       try {
         const videos = await getDayVideos(date);
-        if (isCurrent()) setState({ date, videos });
+        if (mine < published.current) return;
+        published.current = mine;
+        setState({ date, videos });
       } catch (error) {
         console.error("Error fetching the day's videos:", error);
       }

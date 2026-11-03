@@ -104,10 +104,12 @@ export function onFramesDecoded(handler: (date: string) => void): Promise<Unlist
  * `http://frames.localhost/…` on Windows.
  */
 export function frameUrl(date: string, index: number): string {
-  const base = navigator.userAgent.includes("Windows")
-    ? "http://frames.localhost"
-    : "frames://localhost";
-  return `${base}/${date}/${index}`;
+  return `${protocolBase("frames")}/${date}/${index}`;
+}
+
+/** Where the app's custom protocol `name` is served on this platform. */
+function protocolBase(name: string): string {
+  return navigator.userAgent.includes("Windows") ? `http://${name}.localhost` : `${name}://localhost`;
 }
 
 /**
@@ -115,8 +117,5 @@ export function frameUrl(date: string, index: number): string {
  * registered in `src-tauri/src/lib.rs`. Usable directly as a `<video src>`.
  */
 export function videoUrl(file: string): string {
-  const base = navigator.userAgent.includes("Windows")
-    ? "http://videos.localhost"
-    : "videos://localhost";
-  return `${base}/${encodeURIComponent(file)}`;
+  return `${protocolBase("videos")}/${encodeURIComponent(file)}`;
 }
