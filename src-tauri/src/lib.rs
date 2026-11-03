@@ -22,10 +22,11 @@ mod ocr_helper;
 mod ocr_readahead;
 mod ocr_tiles;
 mod paths;
+mod previews;
 mod settings;
 mod updater;
 
-use frame_source::{DaySummary, FrameSource, FrameTime, PendingFrames, Tools};
+use frame_source::{DayPreviews, DaySummary, FrameSource, FrameTime, PendingFrames, PreviewStore, Tools};
 use tauri::http::{header, Response, StatusCode};
 
 use std::path::Path;
@@ -68,8 +69,17 @@ const CHECK_FOR_UPDATES: &str = "check-for-updates";
 /// directory rather than in the (possibly synced) library.
 const FRAME_CACHE_CAP_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
+/// Preview packs are disposable too, and kept apart from the frame cache so
+/// that scrubbing through decoded frames never evicts them. The whole
+/// existing library comes to roughly 2.5 GB of them.
+const PREVIEW_CAP_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
 /// Event sent with a day's date when read-ahead has decoded a chunk of it.
 const FRAMES_DECODED: &str = "frames-decoded";
+
+/// Event sent with a day's date when the preview builder has built a pack
+/// for one of its videos.
+const PREVIEWS_BUILT: &str = "previews-built";
 
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 #[tauri::command]
@@ -257,7 +267,15 @@ async fn get_pending_frames(
     with_frame_source(source.inner(), move |s| s.pending(&date)).await
 }
 
-/// The response for a `frames://localhost/<YYYY-MM-DD>/<index>` request.
+/// The preview packs of `date`'s videos, for showing while the scrubber is
+/// dragged. Each is served at `frames://localhost/previews/<name>`.
+#[tauri::command]
+async fn get_day_previews(source: State<'_, FrameSourceState>, date: String) -> Result<DayPreviews, String> {
+    with_frame_source(source.inner(), move |s| s.day_previews(&date)).await
+}
+
+/// The response for a `frames://localhost/<YYYY-MM-DD>/<index>` request, or
+/// for a preview pack at `frames://localhost/previews/<name>`.
 fn frame_response(source: Option<&FrameSource>, path: &str) -> Response<Vec<u8>> {
     let reply = |status: StatusCode, message: String| {
         Response::builder()
@@ -273,6 +291,25 @@ fn frame_response(source: Option<&FrameSource>, path: &str) -> Response<Vec<u8>>
     let (Some(date), Some(index), None) = (parts.next(), parts.next(), parts.next()) else {
         return reply(StatusCode::BAD_REQUEST, format!("expected /<day>/<index>, got {path}"));
     };
+    if date == "previews" {
+        let (status, content_type, body) = match source.preview_pack(index) {
+            Ok(Some(bytes)) => (StatusCode::OK, "application/octet-stream", bytes),
+            Ok(None) => (StatusCode::NOT_FOUND, "text/plain", format!("no preview pack {index}").into_bytes()),
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, "text/plain", e.to_string().into_bytes()),
+        };
+        return Response::builder()
+            .status(status)
+            .header(header::CONTENT_TYPE, content_type)
+            // The page keeps the packs it loaded itself.
+            .header(header::CACHE_CONTROL, "no-store")
+            // The page `fetch`es packs from its own origin (tauri://),
+            // which is another origin to this scheme; an `<img>` needs no
+            // permission, but a fetch does, failures included, or the page
+            // sees a network error instead of the status.
+            .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+            .body(body)
+            .unwrap();
+    }
     let Ok(index) = index.parse::<usize>() else {
         return reply(StatusCode::BAD_REQUEST, format!("not a frame index: {index}"));
     };
@@ -884,6 +921,7 @@ enum Opening {
 /// state is otherwise written a second after the last change.
 pub(crate) fn before_quit<R: Runtime>(app: &AppHandle<R>) {
     converter::kill_running_encode();
+    frame_source::previews::kill_running_build();
     if let Some(state) = app.try_state::<AppStateStore>() {
         state.save_now();
     }
@@ -1162,6 +1200,10 @@ pub fn run() {
             analytics::capture("app started", serde_json::json!({}));
             updater::spawn(app.handle().clone());
 
+            // Shared by the frame source, which serves them, the converter,
+            // which writes them for new videos, and the preview builder.
+            let mut preview_store: Option<Arc<PreviewStore>> = None;
+
             // Create the library up front. The frontend calls readDir on it
             // during its first render, which happens well before the delayed
             // task below builds the Photographer — without this, a first run
@@ -1208,9 +1250,37 @@ pub fn run() {
                                 }
                             })
                         });
+                    // Per profile too. Without it, scrubbing works as before.
+                    preview_store = app
+                        .path()
+                        .app_cache_dir()
+                        .map_err(|e| e.to_string())
+                        .and_then(|dir| {
+                            let dir = dir.join(paths::TIMELAPSE_DIR_NAME).join("previews");
+                            PreviewStore::open(dir, PREVIEW_CAP_BYTES).map_err(|e| e.to_string())
+                        })
+                        .inspect_err(|e| {
+                            diagnostics::warn("previews", format!("Failed to open the preview store: {}", e)).record();
+                        })
+                        .ok()
+                        .map(Arc::new);
+                    let source = source.map(|source| match &preview_store {
+                        Some(store) => source.with_previews(Arc::clone(store)),
+                        None => source,
+                    });
                     match source {
                         Ok(source) => {
-                            app.manage::<FrameSourceState>(Arc::new(source));
+                            let source = Arc::new(source);
+                            app.manage::<FrameSourceState>(Arc::clone(&source));
+                            if preview_store.is_some() {
+                                let app = app.handle().clone();
+                                let boost = Arc::clone(app.state::<BoostState>().inner());
+                                previews::start(source, boost, move |date| {
+                                    if let Err(e) = app.emit(PREVIEWS_BUILT, date) {
+                                        eprintln!("Could not report built previews: {}", e);
+                                    }
+                                });
+                            }
                         }
                         Err(e) => {
                             diagnostics::error("app", format!("Failed to set up the frame source: {}", e)).record();
@@ -1233,6 +1303,7 @@ pub fn run() {
             let state_clone = Arc::clone(&photographer_state.inner());
             let activity = Arc::clone(app.state::<ActivityState>().inner());
             let boost = Arc::clone(app.state::<BoostState>().inner());
+            let converter_previews = preview_store.clone();
 
             tauri::async_runtime::spawn(async move {
                 tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
@@ -1269,6 +1340,7 @@ pub fn run() {
                         )
                         .reporting_to(Arc::clone(&activity))
                         .boosted_by(Arc::clone(&boost))
+                        .with_previews(converter_previews)
                         .start();
 
                         if ocr::start_background_ocr(root, ocr_dir, activity, boost) {
@@ -1298,6 +1370,7 @@ pub fn run() {
             get_day_statuses,
             get_frame_time,
             get_pending_frames,
+            get_day_previews,
             search_ocr,
             search_ocr_day,
             get_day_apps,
@@ -1651,6 +1724,31 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers()[header::CONTENT_TYPE], "image/png");
         assert_eq!(response.body(), b"png bytes");
+    }
+
+    #[test]
+    fn test_frame_response_serves_preview_packs() {
+        let library = TempDir::new().unwrap();
+        let (_cache, source) = frame_source_in(library.path());
+        let (_none, without) = frame_source_in(library.path());
+        let previews = TempDir::new().unwrap();
+        let store = PreviewStore::open(previews.path().to_path_buf(), u64::MAX).unwrap();
+        store.write("v-9", frame_source::PackKind::Full, &[(0, b"jpeg".to_vec())]).unwrap();
+        let source = source.with_previews(Arc::new(store));
+
+        let response = frame_response(Some(&source), "/previews/v-9.full.pack");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN], "*");
+        let pack = frame_source::previews::decode_pack(response.body()).unwrap();
+        assert_eq!(pack, vec![(0, b"jpeg".to_vec())]);
+
+        for path in ["/previews/v-8.full.pack", "/previews/..%2Fv-9.full.pack", "/previews/v-9.full"] {
+            assert_eq!(frame_response(Some(&source), path).status(), StatusCode::NOT_FOUND, "{path}");
+        }
+        assert_eq!(
+            frame_response(Some(&without), "/previews/v-9.full.pack").status(),
+            StatusCode::NOT_FOUND
+        );
     }
 
     #[test]

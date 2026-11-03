@@ -1,8 +1,8 @@
 import React from "react";
 
-import { frameUrl, getPendingFrames, onFramesDecoded, type Day, type PendingFrames } from "../frames";
+import { frameUrl, getPendingFrames, type Day, type PendingFrames } from "../frames";
 import { useLatestLoad } from "./useDirectoryChanges";
-import { useMountEffect } from "./useMountEffect";
+import { useFramesDecoded } from "./useFramesDecoded";
 
 /**
  * The stretches of `day` that would have to be decoded from video before
@@ -13,7 +13,8 @@ import { useMountEffect } from "./useMountEffect";
  * frame the viewer finished loading) was in a pending stretch, since that
  * load decoded its chunk. Loading a frame that was already decoded changes
  * nothing, so it doesn't ask. Also re-asked when the frame source reports
- * that it read ahead into the day.
+ * that it read ahead into the day or built previews for it: a stretch with
+ * full previews no longer counts as pending.
  */
 export function usePendingFrames(day: Day | null, loaded: string | null): PendingFrames | null {
   const [state, setState] = React.useState<{ date: string; pending: PendingFrames } | null>(null);
@@ -33,30 +34,9 @@ export function usePendingFrames(day: Day | null, loaded: string | null): Pendin
     }
   }
 
-  // Read-ahead decodes chunks no frame load asked for. It only reads ahead
-  // into days with video, so listening all along costs nothing, and counting
-  // per day means another day's decodes don't re-ask about this one.
-  const [readAhead, setReadAhead] = React.useState<ReadonlyMap<string, number>>(() => new Map());
-  const readAheadDecodes = date === null ? 0 : (readAhead.get(date) ?? 0);
-  useMountEffect(() => {
-    let stop: (() => void) | null = null;
-    let unmounted = false;
-    onFramesDecoded((decoded) => {
-      setReadAhead((counts) => new Map(counts).set(decoded, (counts.get(decoded) ?? 0) + 1));
-    }).then(
-      (unlisten) => {
-        if (unmounted) unlisten();
-        else stop = unlisten;
-      },
-      (error: unknown) => {
-        console.error("Error listening for decoded frames:", error);
-      },
-    );
-    return (): void => {
-      unmounted = true;
-      stop?.();
-    };
-  });
+  // Read-ahead decodes chunks no frame load asked for, and previews built
+  // in the background make stretches ready too.
+  const readAheadDecodes = useFramesDecoded(date, "decoded") + useFramesDecoded(date, "previews");
 
   // Answers may land out of order. Each one is published unless a newer
   // request has already published, so a burst of requests still shows the

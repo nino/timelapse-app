@@ -73,6 +73,11 @@ export function onFramesDecoded(handler: (date: string) => void): Promise<Unlist
   return listen<string>("frames-decoded", (event) => handler(event.payload));
 }
 
+/** Calls `handler` with a day's date whenever previews of one of its videos are built. */
+export function onPreviewsBuilt(handler: (date: string) => void): Promise<UnlistenFn> {
+  return listen<string>("previews-built", (event) => handler(event.payload));
+}
+
 /**
  * URL of frame `index` of `date`, served by the `frames` protocol registered in
  * `src-tauri/src/lib.rs`. Usable directly as an `<img src>`.
@@ -81,8 +86,10 @@ export function onFramesDecoded(handler: (date: string) => void): Promise<Unlist
  * `http://frames.localhost/…` on Windows.
  */
 export function frameUrl(date: string, index: number): string {
-  const base = navigator.userAgent.includes("Windows")
-    ? "http://frames.localhost"
-    : "frames://localhost";
-  return `${base}/${date}/${index}`;
+  return `${framesBase()}/${date}/${index}`;
+}
+
+/** Where the `frames` protocol is served; see `frameUrl`. */
+export function framesBase(): string {
+  return navigator.userAgent.includes("Windows") ? "http://frames.localhost" : "frames://localhost";
 }
