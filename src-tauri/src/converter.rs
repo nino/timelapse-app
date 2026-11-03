@@ -529,7 +529,8 @@ pub fn convert_batch(
     result
 }
 
-/// The ffmpeg invocation from `timelapse-to-video`, reading `frames_dir` and
+/// The ffmpeg invocation from `timelapse-to-video`, plus a shorter keyframe
+/// interval, reading `frames_dir` and
 /// writing `output`, under the background policy if `background`.
 fn ffmpeg_command(frames_dir: &Path, output: &Path, background: bool) -> Command {
     // On macOS, run ffmpeg under the background QoS policy: the scheduler
@@ -551,7 +552,12 @@ fn ffmpeg_command(frames_dir: &Path, output: &Path, background: bool) -> Command
         .args(["-y", "-loglevel", "error", "-nostats", "-progress", "pipe:1"])
         .args(["-framerate", FRAMERATE, "-i"])
         .arg(frames_dir.join("%05d.png"))
-        .args(["-c:v", "libx265", "-crf", "28", "-preset", "veryslow", "-vf"])
+        .args(["-c:v", "libx265", "-crf", "28", "-preset", "veryslow"])
+        // A keyframe every 2 s instead of x265's default of about every
+        // 17 s: showing a frame that isn't cached decodes from the keyframe
+        // before it, so this caps that at 30 frames. Measured on one of
+        // Nino's hours: files about 19% bigger.
+        .args(["-g", "30", "-vf"])
         .arg(
             "scale=1800:1124:force_original_aspect_ratio=decrease,\
              pad=1800:1124:(ow-iw)/2:(oh-ih)/2:black,format=yuv420p",

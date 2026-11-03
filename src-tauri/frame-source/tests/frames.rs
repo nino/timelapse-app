@@ -503,6 +503,23 @@ fn reports_video_frames_that_are_not_decoded_yet() {
     );
 }
 
+/// Wait for read-ahead's reports until `date`'s undecoded stretches are
+/// `expected`. Read-ahead may decode chunks in any order the viewer's
+/// requests leave it, so tests wait on the outcome, not on a count.
+fn wait_for_pending(
+    source: &FrameSource,
+    decoded: &mpsc::Receiver<String>,
+    date: &str,
+    expected: &[FrameRange],
+) {
+    while source.pending(date).unwrap().ranges != expected {
+        let day = decoded
+            .recv_timeout(Duration::from_secs(60))
+            .expect("read-ahead should decode a chunk");
+        assert_eq!(day, date);
+    }
+}
+
 #[test]
 fn reads_ahead_into_the_next_chunk_before_the_viewer_gets_there() {
     let lib = Library::new();
@@ -516,22 +533,26 @@ fn reads_ahead_into_the_next_chunk_before_the_viewer_gets_there() {
         decoded.send(date.to_owned()).unwrap();
     });
     let range = |start, end| FrameRange { start, end };
-    let wait = || {
-        read_ahead
-            .recv_timeout(Duration::from_secs(60))
-            .expect("read-ahead should decode a chunk")
-    };
 
-    // Mid-chunk, moving forward: nothing to read ahead yet.
+    // Mid-chunk, moving forward: only the chunk being viewed gets decoded.
     source.frame("2024-12-20", 0).unwrap();
     source.frame("2024-12-20", 10).unwrap();
+    wait_for_pending(
+        &source,
+        &read_ahead,
+        "2024-12-20",
+        &[range(CHUNK_FRAMES, 3 * CHUNK_FRAMES)],
+    );
     // Within READ_AHEAD_FRAMES of the next chunk: it gets decoded without
     // being asked for.
-    source.frame("2024-12-20", CHUNK_FRAMES - READ_AHEAD_FRAMES).unwrap();
-    assert_eq!(wait(), "2024-12-20");
-    assert_eq!(
-        source.pending("2024-12-20").unwrap().ranges,
-        vec![range(2 * CHUNK_FRAMES, 3 * CHUNK_FRAMES)]
+    source
+        .frame("2024-12-20", CHUNK_FRAMES - READ_AHEAD_FRAMES)
+        .unwrap();
+    wait_for_pending(
+        &source,
+        &read_ahead,
+        "2024-12-20",
+        &[range(2 * CHUNK_FRAMES, 3 * CHUNK_FRAMES)],
     );
     // And its frames are the right ones.
     assert_frame(
@@ -541,6 +562,47 @@ fn reads_ahead_into_the_next_chunk_before_the_viewer_gets_there() {
         (CHUNK_FRAMES + 7) * LEVEL_STEP % 256,
         lib.scratch.path(),
     );
+}
+
+#[test]
+fn serves_an_undecoded_frame_alone_then_decodes_its_chunk() {
+    let lib = Library::new();
+    make_video(
+        &lib.root.path().join("2024-12-20--09-00-00.mov"),
+        2 * CHUNK_FRAMES,
+        0,
+    );
+    let (decoded, read_ahead) = mpsc::channel();
+    let source = lib.source(u64::MAX).read_ahead(move |date| {
+        decoded.send(date.to_owned()).unwrap();
+    });
+    let range = |start, end| FrameRange { start, end };
+
+    // A frame in the middle of the second chunk, far from a keyframe.
+    let index = CHUNK_FRAMES + 47;
+    assert_frame(
+        &source,
+        "2024-12-20",
+        index,
+        index * LEVEL_STEP % 256,
+        lib.scratch.path(),
+    );
+    // Its chunk is decoded afterwards, so the next frames come from the cache.
+    wait_for_pending(
+        &source,
+        &read_ahead,
+        "2024-12-20",
+        &[range(0, CHUNK_FRAMES)],
+    );
+    assert_frame(
+        &source,
+        "2024-12-20",
+        index + 1,
+        (index + 1) * LEVEL_STEP % 256,
+        lib.scratch.path(),
+    );
+    // Past the end is still an error.
+    assert!(source.frame("2024-12-20", 2 * CHUNK_FRAMES).is_err());
 }
 
 #[test]
@@ -554,15 +616,10 @@ fn reads_back_from_the_end_of_a_day_it_opens_on() {
         decoded.send(date.to_owned()).unwrap();
     });
 
-    // The viewer opens a day on its last frame; the first video's two
-    // chunks are both within reach behind it.
+    // The viewer opens a day on its last frame; that frame's chunk and the
+    // first video's two chunks, both within reach behind it, all get decoded.
     source.frame("2024-12-20", 239).unwrap();
-    for _ in 0..2 {
-        read_ahead
-            .recv_timeout(Duration::from_secs(60))
-            .expect("read-ahead should decode a chunk");
-    }
-    assert_eq!(source.pending("2024-12-20").unwrap().ranges, vec![]);
+    wait_for_pending(&source, &read_ahead, "2024-12-20", &[]);
 }
 
 #[test]
