@@ -295,6 +295,11 @@ export function App({
   // The video player needs nothing decoded, and screenshots never do.
   const pendingFrames = usePendingFrames(videoPlayer ? null : day, loaded);
   const [frameSize, setFrameSize] = React.useState(DEFAULT_FRAME_SIZE);
+  // Kept as is when unchanged, so the outlines don't re-render.
+  const showFrameSize = (size: { width: number; height: number }): void =>
+    setFrameSize((current) =>
+      current.width === size.width && current.height === size.height ? current : size,
+    );
   // Big screens get bigger frames; the outlines keep the same look on them.
   const outlineScale = frameSize.width / DEFAULT_FRAME_SIZE.width;
   const currentMatch: DayMatch | null = matches?.[rangeAt(matches, currentIndex)] ?? null;
@@ -468,11 +473,7 @@ export function App({
             alt={`Frame ${currentIndex + 1}`}
             onLoad={(e) => {
               const { naturalWidth: width, naturalHeight: height } = e.currentTarget;
-              if (width > 0 && height > 0) {
-                setFrameSize((size) =>
-                  size.width === width && size.height === height ? size : { width, height },
-                );
-              }
+              if (width > 0 && height > 0) showFrameSize({ width, height });
               onLoad();
             }}
             onError={onError}
@@ -504,11 +505,7 @@ export function App({
               index={currentIndex}
               visible={videoOnScreen}
               onShown={onVideoShown}
-              onSize={(size) =>
-                setFrameSize((current) =>
-                  current.width === size.width && current.height === size.height ? current : size,
-                )
-              }
+              onSize={showFrameSize}
               onError={() => {
                 console.error(`The video player could not play ${span.file}; showing decoded frames instead.`);
                 setFailedVideos((failed) => new Set(failed).add(span.file));
@@ -648,6 +645,11 @@ function matchLabel(
   return stops.length === 1 ? "1 match" : `${stops.length} matches`;
 }
 
+/** Where the slider puts its thumb's centre for frame `index`, as a percentage of its range. */
+function playheadPercent(index: number, frameCount: number): number {
+  return (Math.min(index, frameCount - 1) / Math.max(frameCount - 1, 1)) * 100;
+}
+
 /** Where the searched text was on screen, drawn just above the scrubber. */
 function MatchMarks({
   stops,
@@ -660,8 +662,7 @@ function MatchMarks({
 }): React.ReactNode {
   if (stops.length === 0 || frameCount === 0) return null;
   const current = rangeAt(stops, currentIndex);
-  // Where the slider puts its thumb's centre for frame `index`.
-  const at = (index: number): number => (Math.min(index, frameCount - 1) / Math.max(frameCount - 1, 1)) * 100;
+  const at = (index: number): number => playheadPercent(index, frameCount);
   return (
     <div
       data-testid="match-marks"
@@ -704,8 +705,7 @@ const AppMarks = React.memo(function AppMarks({
     [ranges, frameCount],
   );
   if (merged.length === 0 || frameCount === 0) return null;
-  // Same mapping as MatchMarks: where the playhead's centre sits for `index`.
-  const at = (index: number): number => (Math.min(index, frameCount - 1) / Math.max(frameCount - 1, 1)) * 100;
+  const at = (index: number): number => playheadPercent(index, frameCount);
   return (
     <div
       data-testid="app-marks"

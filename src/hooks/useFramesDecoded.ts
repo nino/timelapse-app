@@ -1,7 +1,7 @@
 import React from "react";
 
 import { onFramesDecoded, onPreviewsBuilt } from "../frames";
-import { useMountEffect } from "./useMountEffect";
+import { useTauriEvent } from "./useTauriEvent";
 
 /**
  * How many times since this mounted the frame source has reported, for
@@ -12,25 +12,12 @@ import { useMountEffect } from "./useMountEffect";
  */
 export function useFramesDecoded(date: string | null, what: "decoded" | "previews"): number {
   const [counts, setCounts] = React.useState<ReadonlyMap<string, number>>(() => new Map());
-  useMountEffect(() => {
-    let stop: (() => void) | null = null;
-    let unmounted = false;
-    const listen = what === "decoded" ? onFramesDecoded : onPreviewsBuilt;
-    listen((decoded) => {
+  useTauriEvent(
+    what === "decoded" ? onFramesDecoded : onPreviewsBuilt,
+    (decoded: string) => {
       setCounts((current) => new Map(current).set(decoded, (current.get(decoded) ?? 0) + 1));
-    }).then(
-      (unlisten) => {
-        if (unmounted) unlisten();
-        else stop = unlisten;
-      },
-      (error: unknown) => {
-        console.error("Error listening for decoded frames:", error);
-      },
-    );
-    return (): void => {
-      unmounted = true;
-      stop?.();
-    };
-  });
+    },
+    what === "decoded" ? "decoded frames" : "built previews",
+  );
   return date === null ? 0 : (counts.get(date) ?? 0);
 }

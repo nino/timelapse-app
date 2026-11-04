@@ -1,6 +1,6 @@
 import React from "react";
 
-import { getDayVideos, type Day, type DayVideos } from "../frames";
+import { getDayVideos, hasVideo as hasVideoFrames, type Day, type DayVideos } from "../frames";
 import { useLatestLoad } from "./useDirectoryChanges";
 
 /**
@@ -13,7 +13,7 @@ export function useDayVideos(day: Day | null): DayVideos | null {
   const [state, setState] = React.useState<{ date: string; videos: DayVideos } | null>(null);
   const date = day?.date ?? null;
   const frameCount = day?.frameCount ?? 0;
-  const hasVideo = day?.source === "video" || day?.source === "mixed";
+  const hasVideo = hasVideoFrames(day);
 
   // Today's frame count changes every second, so an answer slower than that
   // would never count as the latest. Each one is published unless a newer
