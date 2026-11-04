@@ -25,7 +25,7 @@ import { useTimeout } from "./hooks/useTimeout";
 import { PendingStretches } from "./PendingStretches";
 import { nextStop, previousStop, rangeAt, toStops, type DayMatch, type Stop } from "./search";
 import { savedPlaybackSpeed, savePlaybackSpeed, SpeedPicker, type PlaybackSpeed } from "./SpeedPicker";
-import { fieldFrame, focusRing, segmentButton } from "./ui";
+import { fieldFrame, focusRing, menuItem, menuPanel, segmentButton } from "./ui";
 import { relaunchIntoUpdate } from "./updates";
 import { VideoFrame } from "./VideoFrame";
 import { setViewerPosition, type ViewerPosition } from "./viewerPosition";
@@ -768,11 +768,11 @@ function OtherDays({
               <path d="m2.5 4 2.5 2.5L7.5 4" />
             </svg>
           </PopoverButton>
-          {/* Styled like the day picker's list. The `!` beats the max-height
+          {/* Styled like the dropdowns' lists. The `!` beats the max-height
               Headless UI sets inline, which runs to the window's edge. */}
           <PopoverPanel
             anchor={{ to: "bottom start", gap: 4 }}
-            className="z-10 max-h-[min(24rem,var(--anchor-max-height,100vh))]! min-w-44 overflow-y-auto rounded-2xl border border-border bg-card p-1 text-sm text-fg tabular-nums shadow-md outline-none"
+            className={`${menuPanel} max-h-[min(24rem,var(--anchor-max-height,100vh))]! min-w-44`}
           >
             {({ close }): React.ReactElement => (
               <>
@@ -784,7 +784,7 @@ function OtherDays({
                       onPick(day);
                       close();
                     }}
-                    className="flex h-7 w-full cursor-default items-center justify-between gap-3 rounded-[11px] px-2.5 outline-none hover:bg-muted focus-visible:bg-muted"
+                    className={`${menuItem} w-full justify-between px-2.5 outline-none hover:bg-muted focus-visible:bg-muted`}
                   >
                     {label(day)}
                     <span className="text-muted-fg">{count}</span>
