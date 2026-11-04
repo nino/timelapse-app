@@ -2,7 +2,7 @@ import { Listbox, ListboxButton, ListboxOption, ListboxOptions } from "@headless
 import React from "react";
 
 import { formatFrames, type DayApps } from "./apps";
-import { Check, Chevron } from "./DayPicker";
+import { Check, Chevron, passShortcutsOn } from "./DayPicker";
 import { focusRing } from "./ui";
 
 /**
@@ -26,6 +26,7 @@ export function AppPicker({
     <Listbox value={value} onChange={onChange}>
       <ListboxButton
         aria-label="App"
+        onKeyPressCapture={passShortcutsOn}
         title="Only play the times an app was in front"
         className={`flex h-7.5 max-w-48 shrink-0 items-center gap-2 rounded-xl border border-input bg-field pr-2 pl-2.5 text-sm ${focusRing} ${
           value === null ? "text-muted-fg" : "font-medium text-fg"

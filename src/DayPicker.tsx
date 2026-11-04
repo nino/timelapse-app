@@ -30,6 +30,7 @@ export function DayPicker({
         <>
           <ListboxButton
             aria-label="Day"
+            onKeyPressCapture={passShortcutsOn}
             className={`flex h-7.5 shrink-0 items-center gap-3 rounded-full whitespace-nowrap border border-input bg-field pr-3.5 pl-4 text-sm font-medium tabular-nums ${focusRing}`}
           >
             {value === null ? <span className="text-muted-fg">Select a day…</span> : label(value)}
@@ -179,6 +180,17 @@ function Mark({ stage, children }: { stage: Stage; children: React.ReactNode }):
       </svg>
     </svg>
   );
+}
+
+/**
+ * For every dropdown's `onKeyPressCapture`. Headless UI's ListboxButton
+ * cancels every keypress, and WebKit sends one for ⌘ shortcuts too and keeps
+ * a cancelled one from the menu, so a focused dropdown blocked ⌘H, ⌘Q, ⌥⌘A
+ * and the rest. Stopping ⌘ and Ctrl keypresses before the button sees them
+ * lets them through.
+ */
+export function passShortcutsOn(e: React.KeyboardEvent): void {
+  if (e.metaKey || e.ctrlKey) e.stopPropagation();
 }
 
 export function Chevron(): React.ReactNode {

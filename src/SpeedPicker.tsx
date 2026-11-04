@@ -1,7 +1,7 @@
 import { Listbox, ListboxButton, ListboxOption, ListboxOptions } from "@headlessui/react";
 import React from "react";
 
-import { Check, Chevron } from "./DayPicker";
+import { Check, Chevron, passShortcutsOn } from "./DayPicker";
 import { focusRing } from "./ui";
 
 /** The playback speeds offered, in frames a second. */
@@ -47,6 +47,7 @@ export function SpeedPicker({
     <Listbox value={value} onChange={onChange}>
       <ListboxButton
         aria-label="Playback speed"
+        onKeyPressCapture={passShortcutsOn}
         title="Playback speed"
         className={`flex items-center gap-1 pr-2 whitespace-nowrap pl-2.5 text-sm font-medium tabular-nums transition-colors hover:bg-muted ${focusRing} ${className}`}
       >
