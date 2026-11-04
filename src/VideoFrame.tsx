@@ -67,7 +67,7 @@ export function VideoFrame({
         if (width > 0 && height > 0) onSize({ width, height });
       }}
       onError={onError}
-      className={`w-full h-full object-contain absolute inset-0 ${visible ? "" : "invisible"}`}
+      className={`w-full h-full object-contain absolute inset-0 pointer-events-none ${visible ? "" : "invisible"}`}
     />
   );
 }
