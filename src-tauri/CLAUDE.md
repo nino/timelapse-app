@@ -4,7 +4,7 @@ Each module's `//!` doc comment says how it works; this file is the map and the 
 
 ## Modules
 
-- `lib.rs` — the Tauri commands, the `frames://localhost/<YYYY-MM-DD>/<index>` URI scheme (`http://frames.localhost/…` on Windows), the menu, and `setup()`, which creates the library directory, evicts cache folders over 15 days old, and starts the photographer (after a 1 s delay), OCR and the converter. State-backed commands are thin shims over `*_impl(&PhotographerState, …)` functions, which is what the tests call.
+- `lib.rs` — the Tauri commands, the `frames://localhost/<YYYY-MM-DD>/<index>` URI scheme (`http://frames.localhost/…` on Windows), the menu, and `setup()`, which creates the library directory, evicts cache folders over 15 days old, and starts the photographer (after a 1 s delay), OCR and the converter. Commands with logic worth testing are thin shims over `*_impl` functions that take plain arguments, which is what the tests call.
 - `media.rs` — the `videos://localhost/<file name>` URI scheme for the beta video player: library videos (`FrameSource::video_path`) served in byte ranges, which WebKit's media loader needs.
 - `timelapse.rs` — the `Photographer` capture loop.
 - `database.rs` — `ScreenshotDatabase` over `<library>/screenshots.db`, and its migrations.
@@ -39,7 +39,7 @@ All in `screenshots.db`, keyed by `(day, frame_number)`:
 - **ffmpeg is a separate process.** A running encode is paused with `SIGSTOP` on battery and killed by `kill_running_encode` when the app quits or restarts (`RunEvent::Exit`, and before the updater's `app.restart()`, which skips `Exit`); otherwise it would outlive the app.
 - **Diagnostics are for changes and errors, never one row per frame.** Per-frame things go into a `Tally` written as one summary an hour.
 - **Settings and remembered state.** `settings.json` is shared by dev and release builds, and a new field needs a `#[serde(default)]` value. `state.json` is per profile, because the viewer position names a day in one library.
-- **The frontend's file access is scoped.** `capabilities/default.json`'s `fs:scope` permits both library trees two levels deep, and their `.cache/` three, because the scope is baked in at build time and can't branch on the profile. A new path the frontend needs must be added there, or it fails at runtime, not at build time.
+- **The frontend's file access is scoped.** `capabilities/default.json`'s `fs:scope` permits both library trees two levels deep (the root and the day folders, which the viewer watches), because the scope is baked in at build time and can't branch on the profile. A new path the frontend needs must be added there, or it fails at runtime, not at build time.
 
 ## Tests
 

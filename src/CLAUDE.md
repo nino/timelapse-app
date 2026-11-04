@@ -11,7 +11,6 @@
 - **Previews while dragging.** `hooks/useDayPreviews.ts` loads the open day's preview packs (`previews.ts` parses them) into memory once. While the scrubber is dragged, `App.tsx` shows the nearest preview over the frame and asks for no exact frame until the drag rests on one for 150 ms; after release the preview stays until the exact frame has loaded. Hours still served from screenshots have no previews and drag through exact frames as before.
 - **Beta video player** (Settings → “Play videos in the viewer”, off by default): `VideoFrame.tsx` shows hours kept as video by seeking a paused `<video>` of the hour (`videos:` URLs, `hooks/useDayVideos.ts`) instead of loading decoded frames; `videoSeeker.ts` runs one exact seek at a time (no `fastSeek`: in WKWebView it was no faster and lands up to 250 frames early). A video that won't play falls back to decoded frames. The last video frame stays up until the next frame (new hour's video or `<img>`) is on screen. The main window learns of setting changes from the `settings-changed` event (`hooks/useSettings.ts`).
 - Effects live only in the hooks the lint allowlists (see the root CLAUDE.md). `useLatestLoad` is the one for asking Rust something whenever its inputs change; `useTimeout` covers debouncing and other waits keyed on a value.
-- Don't call `get_screenshot_metadata`: it looks frames up by number alone, which collides across days.
 
 ## Behaviour to keep
 
