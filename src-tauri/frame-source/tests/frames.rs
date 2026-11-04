@@ -5,10 +5,13 @@
 use std::fs;
 use std::path::Path;
 use std::process::Command;
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
-use frame_source::{FrameRange, FrameSource, Source, Tools, CHUNK_FRAMES, READ_AHEAD_FRAMES};
+use frame_source::{
+    FrameRange, FrameSource, PackKind, PreviewJob, PreviewStore, Source, Tools, CHUNK_FRAMES,
+    READ_AHEAD_FRAMES,
+};
 use tempfile::TempDir;
 
 const LEVEL_STEP: usize = 4;
@@ -21,9 +24,10 @@ fn make_video(path: &Path, frames: usize, level_offset: usize) {
         .args(["-v", "error", "-y", "-f", "lavfi", "-i", &filter])
         .args(["-frames:v", &frames.to_string()])
         // Keyframes every 2 s, like a real encode, so seeking has to decode
-        // forward from a keyframe to land on the right frame.
+        // forward from a keyframe to land on the right frame. No scene-cut
+        // keyframes, so the keyframes are known.
         .args([
-            "-c:v", "libx264", "-g", "30", "-pix_fmt", "yuv420p", "-qp", "0",
+            "-c:v", "libx264", "-g", "30", "-sc_threshold", "0", "-pix_fmt", "yuv420p", "-qp", "0",
         ])
         .arg(path)
         .status()
@@ -835,4 +839,116 @@ fn finds_frames_in_recorded_videos_exactly() {
         source.indices_of_frames("2026-10-04", &[3, 11, 1, 10, 4]).unwrap(),
         vec![Some(2), Some(4), Some(0), Some(3), None]
     );
+}
+
+fn preview_source(lib: &Library, previews: &Path) -> FrameSource {
+    let store = PreviewStore::open(previews.to_path_buf(), u64::MAX).unwrap();
+    lib.source(u64::MAX).with_previews(Arc::new(store))
+}
+
+/// Mean luma of each image in a pack, in order, with its frame index.
+fn pack_lumas(bytes: &[u8], scratch: &Path) -> Vec<(usize, usize)> {
+    frame_source::previews::decode_pack(bytes)
+        .expect("a valid pack")
+        .into_iter()
+        .map(|(index, jpeg)| (index, luma(&jpeg, scratch)))
+        .collect()
+}
+
+/// Mean luma of a JPEG as stored. Unlike `gray_level`, the same for 4:2:0
+/// and 4:4:4 JPEGs (previews are 4:4:4), whose conversion to gray differs.
+fn luma(bytes: &[u8], dir: &Path) -> usize {
+    let file = dir.join("luma.jpg");
+    fs::write(&file, bytes).unwrap();
+    let output = Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(&file)
+        .args(["-vf", "scale=1:1", "-f", "rawvideo", "-pix_fmt", "yuvj444p", "-"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    usize::from(output.stdout[0])
+}
+
+/// Checks that each preview in `pack` looks like the exact frame it stands
+/// for, `first_index` being the video's first frame in `date`.
+fn assert_previews_match(
+    source: &FrameSource,
+    date: &str,
+    first_index: usize,
+    pack: &[u8],
+    scratch: &Path,
+) -> Vec<usize> {
+    let levels = pack_lumas(pack, scratch);
+    for &(index, level) in &levels {
+        let exact = luma(&source.frame(date, first_index + index).unwrap().bytes, scratch);
+        assert!(level.abs_diff(exact) <= 3, "preview of {index}: gray {level}, exact frame {exact}");
+    }
+    levels.into_iter().map(|(index, _)| index).collect()
+}
+
+#[test]
+fn builds_previews_around_the_viewer_coarse_first() {
+    let lib = Library::new();
+    let previews = TempDir::new().unwrap();
+    // Grays 32–228, inside video range (16–235): scaling clamps grays
+    // outside it, which real captures never have.
+    make_video(&lib.root.path().join("2024-12-20--09-00-00.mov"), 50, 32);
+    make_video(&lib.root.path().join("2024-12-20--17-05-22.mov"), 40, 40);
+    make_video(&lib.root.path().join("2024-12-19--09-00-00.mov"), 20, 0);
+    let source = preview_source(&lib, previews.path());
+    let scratch = lib.scratch.path();
+    let never = |_: &PreviewJob| false;
+
+    assert_eq!(source.day_previews("2024-12-20").unwrap().packs, vec![]);
+    // Nobody is looking yet: the library pass, newest video first.
+    let job = source.next_preview_job(&never).unwrap();
+    assert_eq!((job.date.as_str(), job.kind), ("2024-12-20", PackKind::Full));
+    assert!(job.video.ends_with("2024-12-20--17-05-22.mov"));
+
+    // Viewing the second video: keyframe packs first, nearest first.
+    source.frame("2024-12-20", 70).unwrap();
+    let mut built = Vec::new();
+    while let Some(job) = source.next_preview_job(&never) {
+        source.build_preview(&job).unwrap();
+        let name = job.video.file_name().unwrap().to_string_lossy().into_owned();
+        built.push((job.date, name, job.kind));
+        if built.len() == 2 {
+            // Coarse packs are served until the full ones exist.
+            let day = source.day_previews("2024-12-20").unwrap();
+            assert!(day.packs.iter().all(|pack| pack.coarse));
+            let pack = source.preview_pack(&day.packs[0].name).unwrap().unwrap();
+            // Only the keyframes, each placed at its own frame.
+            let indices = assert_previews_match(&source, "2024-12-20", 0, &pack, scratch);
+            assert_eq!(indices, vec![0, 30]);
+            // That asked for exact frames, which moved the viewer; put it back.
+            source.frame("2024-12-20", 70).unwrap();
+        }
+    }
+    let kinds: Vec<_> = built.iter().map(|(d, n, k)| (d.as_str(), &n[..19], *k)).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            ("2024-12-20", "2024-12-20--17-05-2", PackKind::Keyframes),
+            ("2024-12-20", "2024-12-20--09-00-0", PackKind::Keyframes),
+            ("2024-12-20", "2024-12-20--17-05-2", PackKind::Full),
+            ("2024-12-20", "2024-12-20--09-00-0", PackKind::Full),
+            ("2024-12-19", "2024-12-19--09-00-0", PackKind::Full),
+        ]
+    );
+
+    let day = source.day_previews("2024-12-20").unwrap();
+    assert_eq!(day.frame_count, 90);
+    assert_eq!(
+        day.packs
+            .iter()
+            .map(|p| (p.first_index, p.frame_count, p.coarse))
+            .collect::<Vec<_>>(),
+        vec![(0, 50, false), (50, 40, false)]
+    );
+    let pack = source.preview_pack(&day.packs[1].name).unwrap().unwrap();
+    let indices = assert_previews_match(&source, "2024-12-20", 50, &pack, scratch);
+    assert_eq!(indices, vec![0, 15, 30]);
+    // Fully previewed, so nothing is drawn as pending.
+    assert_eq!(source.pending("2024-12-20").unwrap().ranges, vec![]);
 }

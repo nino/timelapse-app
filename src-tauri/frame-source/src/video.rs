@@ -336,6 +336,28 @@ fn lower_priority(command: &mut Command) {
 #[cfg(not(unix))]
 fn lower_priority(_command: &mut Command) {}
 
+/// For work nobody is waiting on, such as building previews of old videos:
+/// nice 10, and on macOS also the background policy `taskpolicy -b` applies
+/// (throttled, and kept on the efficiency cores on Apple Silicon), as the
+/// converter's encodes run.
+pub fn idle_priority(command: &mut Command) {
+    lower_priority(command);
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: setpriority is a single system call, safe between fork and
+        // exec; it only changes the process about to exec ffmpeg.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpriority(libc::PRIO_DARWIN_PROCESS, 0, libc::PRIO_DARWIN_BG) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

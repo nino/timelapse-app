@@ -22,6 +22,10 @@
 //!    gone.
 //! 4. Rename the finished video into the library root, where the frame
 //!    source finds it.
+//! 5. Store the preview pack ffmpeg wrote alongside the video in the same
+//!    run (every `PREVIEW_STEP`-th frame, small), which the viewer shows
+//!    while the scrubber is dragged. Old videos get theirs from
+//!    `previews.rs` instead.
 //!
 //! An interrupted batch leaves only a staging folder behind, which the next
 //! run clears.
@@ -30,6 +34,7 @@ use crate::activity::{Activity, Encoding, State};
 use crate::boost::{self, Boost};
 use crate::database::ScreenshotDatabase;
 use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, TimeZone, Timelike};
+use frame_source::previews::{preview_scale, PackKind, PreviewStore, PREVIEW_QUALITY, PREVIEW_STEP};
 use frame_source::filed_at;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -80,6 +85,14 @@ static RUNNING_ENCODE: Mutex<Option<Child>> = Mutex::new(None);
 
 /// Prefix of the staging folders under `.cache`.
 const STAGING_PREFIX: &str = ".convert-";
+
+/// Where in a batch's staging folder ffmpeg writes the preview images.
+const PREVIEWS_DIR: &str = "previews";
+
+/// How the hourly video is scaled and padded; previews start from the same
+/// picture.
+const VIDEO_FILTER: &str = "scale=1800:1124:force_original_aspect_ratio=decrease,\
+     pad=1800:1124:(ow-iw)/2:(oh-ih)/2:black,format=yuv420p";
 
 /// Decides whether OCR has read every PNG of a batch. A batch is converted
 /// only once it passes, and a converted hour's PNGs are deleted only once
@@ -473,6 +486,7 @@ fn clear_stale_staging(root: &Path) -> std::io::Result<()> {
 pub fn convert_batch(
     root: &Path,
     batch: &HourBatch,
+    previews: Option<&PreviewStore>,
     encode: impl FnOnce(&Path, &Path) -> Result<(), ConvertError>,
 ) -> Result<String, ConvertError> {
     let failed = |what: &str, e: std::io::Error| ConvertError::Failed(format!("{}: {}", what, e));
@@ -496,6 +510,7 @@ pub fn convert_batch(
             }
         }
 
+        std::fs::create_dir_all(staging.join(PREVIEWS_DIR)).map_err(|e| failed("Failed to create the previews folder", e))?;
         let staged_video = staging.join("out.mov");
         encode(&staging, &staged_video)?;
 
@@ -522,6 +537,18 @@ pub fn convert_batch(
         }
         std::fs::rename(&staged_video, &published)
             .map_err(|e| failed("Failed to publish video", e))?;
+        if let Some(store) = previews {
+            // Without them the viewer only waits for decodes while dragging
+            // over this hour, and the background builder fills them in.
+            let stored = frame_source::video_key(&published).map_err(|e| e.to_string()).and_then(|key| {
+                store
+                    .write_from_dir(&key, PackKind::Full, &staging.join(PREVIEWS_DIR), |n| Some(n * PREVIEW_STEP))
+                    .map_err(|e| e.to_string())
+            });
+            if let Err(e) = stored {
+                crate::diagnostics::warn("converter", format!("Could not store the previews of {}: {}", video_name, e)).record();
+            }
+        }
         Ok(video_name.clone())
     })();
 
@@ -530,8 +557,10 @@ pub fn convert_batch(
 }
 
 /// The ffmpeg invocation from `timelapse-to-video`, plus a shorter keyframe
-/// interval, reading `frames_dir` and
-/// writing `output`, under the background policy if `background`.
+/// interval, reading `frames_dir` and writing `output`, under the background
+/// policy if `background`. The same run writes every `PREVIEW_STEP`-th frame
+/// as a small JPEG into `frames_dir/previews/`, which costs little next to
+/// the x265 encode because the frames are already decoded.
 fn ffmpeg_command(frames_dir: &Path, output: &Path, background: bool) -> Command {
     // On macOS, run ffmpeg under the background QoS policy: the scheduler
     // throttles it and, on Apple Silicon, keeps it on the efficiency cores,
@@ -558,12 +587,14 @@ fn ffmpeg_command(frames_dir: &Path, output: &Path, background: bool) -> Command
         // before it, so this caps that at 30 frames. Measured on one of
         // Nino's hours: files about 19% bigger.
         .args(["-g", "30", "-vf"])
-        .arg(
-            "scale=1800:1124:force_original_aspect_ratio=decrease,\
-             pad=1800:1124:(ow-iw)/2:(oh-ih)/2:black,format=yuv420p",
-        )
+        .arg(VIDEO_FILTER)
         .args(["-tag:v", "hvc1"])
-        .arg(output);
+        .arg(output)
+        // The second output: options from here on are for it.
+        .arg("-vf")
+        .arg(format!("select=not(mod(n\\,{PREVIEW_STEP})),{VIDEO_FILTER},{}", preview_scale()))
+        .args(["-fps_mode", "passthrough", "-q:v", PREVIEW_QUALITY])
+        .arg(frames_dir.join(PREVIEWS_DIR).join("%05d.jpg"));
     command
 }
 
@@ -794,6 +825,7 @@ fn encode_with_ffmpeg(
 /// Runs batches in the background for as long as it is started.
 pub struct Converter {
     root: PathBuf,
+    previews: Option<Arc<PreviewStore>>,
     running: Arc<AtomicBool>,
     ocr_done: OcrCheck,
     activity: Arc<Activity>,
@@ -804,6 +836,7 @@ impl Converter {
     pub fn with_ocr_check(root: PathBuf, ocr_done: OcrCheck) -> Self {
         Converter {
             root,
+            previews: None,
             running: Arc::new(AtomicBool::new(false)),
             ocr_done,
             activity: Arc::default(),
@@ -814,6 +847,12 @@ impl Converter {
     /// Follow `boost`: while one is on, run at full speed.
     pub fn boosted_by(mut self, boost: Arc<Boost>) -> Self {
         self.boost = boost;
+        self
+    }
+
+    /// Store each new video's previews in `store`.
+    pub fn with_previews(mut self, store: Option<Arc<PreviewStore>>) -> Self {
+        self.previews = store;
         self
     }
 
@@ -833,6 +872,7 @@ impl Converter {
         let ocr_done = Arc::clone(&self.ocr_done);
         let activity = Arc::clone(&self.activity);
         let boost = Arc::clone(&self.boost);
+        let previews = self.previews.clone();
 
         tokio::spawn(async move {
             println!("Starting video conversion background task...");
@@ -849,7 +889,7 @@ impl Converter {
                     deleted_at = Some(Instant::now());
                     delete_converted(&root, &ocr_done, &activity);
                 }
-                let (state, wait) = Self::run_once(&root, &running, &ocr_done, &activity, &boost).await;
+                let (state, wait) = Self::run_once(&root, &running, &ocr_done, &activity, &boost, &previews).await;
                 activity.converter_sleeps(state, wait);
                 // A boost starting or stopping ends the wait early.
                 boost::wait(&mut boost_changes, wait).await;
@@ -875,6 +915,7 @@ impl Converter {
         ocr_done: &OcrCheck,
         activity: &Arc<Activity>,
         boost: &Arc<Boost>,
+        previews: &Option<Arc<PreviewStore>>,
     ) -> (State, Duration) {
         let now = Local::now();
 
@@ -924,8 +965,9 @@ impl Converter {
         let progress = Arc::clone(activity);
         let pauses = Arc::clone(activity);
         let boost_owned = Arc::clone(boost);
+        let previews = previews.clone();
         let result = tokio::task::spawn_blocking(move || {
-            convert_batch(&root_owned, &batch, |frames_dir, output| {
+            convert_batch(&root_owned, &batch, previews.as_deref(), |frames_dir, output| {
                 encode_with_ffmpeg(
                     frames_dir,
                     output,
@@ -1054,7 +1096,10 @@ mod tests {
     /// it was handed.
     fn fake_encode(seen: &mut usize) -> impl FnOnce(&Path, &Path) -> Result<(), ConvertError> + '_ {
         move |frames_dir, output| {
-            *seen = fs::read_dir(frames_dir).unwrap().count();
+            *seen = fs::read_dir(frames_dir)
+                .unwrap()
+                .filter(|entry| entry.as_ref().unwrap().path().extension().is_some_and(|ext| ext == "png"))
+                .count();
             fs::write(output, b"video").unwrap();
             Ok(())
         }
@@ -1280,7 +1325,7 @@ mod tests {
         let batch = find_ready_batches(root, at("2026-10-02", 0, 0)).unwrap().remove(0);
 
         let mut seen = 0;
-        let name = convert_batch(root, &batch, fake_encode(&mut seen)).unwrap();
+        let name = convert_batch(root, &batch, None, fake_encode(&mut seen)).unwrap();
 
         assert_eq!(name, "2026-10-01--09-00-00--hourly.mov");
         assert_eq!(seen, 2, "the gap between 1 and 7 should be closed up");
@@ -1329,7 +1374,7 @@ mod tests {
         let batch = find_ready_batches(root, at("2026-10-02", 0, 0)).unwrap().remove(0);
 
         let mut seen = 0;
-        let name = convert_batch(root, &batch, fake_encode(&mut seen)).unwrap();
+        let name = convert_batch(root, &batch, None, fake_encode(&mut seen)).unwrap();
 
         assert_eq!(
             recorded(root, &name),
@@ -1349,7 +1394,7 @@ mod tests {
         let batch = find_ready_batches(root, at("2026-10-02", 0, 0)).unwrap().remove(0);
 
         let mut seen = 0;
-        let name = convert_batch(root, &batch, fake_encode(&mut seen)).unwrap();
+        let name = convert_batch(root, &batch, None, fake_encode(&mut seen)).unwrap();
 
         assert!(root.join(&name).exists());
         let hours = find_deletable_hours(root, at("2026-10-02", 0, 0), &always(true)).unwrap();
@@ -1366,7 +1411,7 @@ mod tests {
         frame(root, "2026-10-01", 1, at("2026-10-01", 9, 0));
         let batch = find_ready_batches(root, at("2026-10-02", 0, 0)).unwrap().remove(0);
 
-        let _ = convert_batch(root, &batch, |_, _| Err(ConvertError::Interrupted));
+        let _ = convert_batch(root, &batch, None, |_, _| Err(ConvertError::Interrupted));
 
         assert!(!root.join("screenshots.db").exists() || recorded(root, &batch.video_name()).is_empty());
     }
@@ -1401,7 +1446,7 @@ mod tests {
         let a = frame(root, "2026-10-01", 1, at("2026-10-01", 9, 0));
         let batch = find_ready_batches(root, at("2026-10-02", 0, 0)).unwrap().remove(0);
 
-        let result = convert_batch(root, &batch, |_, _| Err(ConvertError::Interrupted));
+        let result = convert_batch(root, &batch, None, |_, _| Err(ConvertError::Interrupted));
 
         assert_eq!(result, Err(ConvertError::Interrupted));
         assert!(a.exists());
@@ -1416,7 +1461,7 @@ mod tests {
         let a = frame(root, "2026-10-01", 1, at("2026-10-01", 9, 0));
         let batch = find_ready_batches(root, at("2026-10-02", 0, 0)).unwrap().remove(0);
 
-        let result = convert_batch(root, &batch, |_, output| {
+        let result = convert_batch(root, &batch, None, |_, output| {
             fs::write(output, b"").unwrap();
             Ok(())
         });
@@ -1436,7 +1481,7 @@ mod tests {
         fs::write(root.join("2026-10-01--09-00-00--hourly.mov"), b"earlier").unwrap();
 
         let mut seen = 0;
-        let result = convert_batch(root, &batch, fake_encode(&mut seen));
+        let result = convert_batch(root, &batch, None, fake_encode(&mut seen));
 
         assert!(matches!(result, Err(ConvertError::Failed(_))));
         assert_eq!(fs::read(root.join("2026-10-01--09-00-00--hourly.mov")).unwrap(), b"earlier");
@@ -1479,7 +1524,7 @@ mod tests {
         let now = at("2026-10-02", 0, 5);
         let batch = find_ready_batches(root, now).unwrap().remove(0);
         let mut seen = 0;
-        convert_batch(root, &batch, fake_encode(&mut seen)).unwrap();
+        convert_batch(root, &batch, None, fake_encode(&mut seen)).unwrap();
         let hours = find_deletable_hours(root, now, &always(true)).unwrap();
         assert!(matches_record(root, &hours[0]).unwrap());
 
@@ -1711,7 +1756,9 @@ mod tests {
         let running = AtomicBool::new(true);
         let progress = Arc::new(std::sync::Mutex::new(Vec::new()));
         let reported = Arc::clone(&progress);
-        let name = convert_batch(root, &batch, |dir, out| {
+        let previews = TempDir::new().unwrap();
+        let store = PreviewStore::open(previews.path().to_path_buf(), u64::MAX).unwrap();
+        let name = convert_batch(root, &batch, Some(&store), |dir, out| {
             encode_with_ffmpeg(dir, out, &running, &Boost::default(), move |frames| reported.lock().unwrap().push(frames), |_| {})
         })
         .unwrap();
@@ -1746,5 +1793,16 @@ mod tests {
             .count();
         assert_eq!(frames, 5, "all five frames, gap closed");
         assert_eq!(fs::read_dir(&day_dir).unwrap().count(), 5, "the PNGs are kept");
+
+        // The same run wrote a preview of every 15th frame: here, the first.
+        let key = frame_source::video_key(&root.join(&name)).unwrap();
+        let pack = store.read(&frame_source::previews::pack_name(&key, PackKind::Full)).unwrap().unwrap();
+        let pack = frame_source::previews::decode_pack(&pack).unwrap();
+        assert_eq!(pack.iter().map(|(index, _)| *index).collect::<Vec<_>>(), vec![0]);
+        let preview = temp.path().join("preview.jpg");
+        fs::write(&preview, &pack[0].1).unwrap();
+        let probe = Command::new(&ffmpeg).args(["-hide_banner", "-i"]).arg(&preview).output().unwrap();
+        let stream = String::from_utf8_lossy(&probe.stderr);
+        assert!(stream.contains("480x300"), "a 480-wide preview: {}", stream);
     }
 }
