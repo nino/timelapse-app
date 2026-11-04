@@ -7,7 +7,9 @@
 //! A day with neither falls back to the old script's whole-day videos
 //! (`YYYY-MM-DD--HH-MM-SS.mov|mp4`), played back to back. Video frames are
 //! decoded a chunk at a time into a size-capped LRU cache, so scrubbing
-//! through a long day only decodes the stretches actually looked at.
+//! through a long day only decodes the stretches actually looked at. A frame
+//! whose chunk isn't decoded yet is decoded on its own first, which is several
+//! times quicker, and read-ahead then decodes its chunk for the frames after it.
 //!
 //! Screenshots win when both exist because they are the originals, and the
 //! only source for the hour still being captured.
@@ -527,6 +529,25 @@ impl FrameSource {
                         .map(|_| ())
                     })
                 };
+                // Not decoded and nobody decoding it: decode just this frame,
+                // which comes back several times sooner than the whole chunk,
+                // and leave the chunk to read-ahead (`queue_read_ahead`).
+                if self.read_ahead.is_some()
+                    && !self.cache.contains(&key, chunk)
+                    && !self.cache.filling(&key, chunk)
+                {
+                    return match video::extract_frame(&self.tools, &file.path, *info, local)? {
+                        Some(bytes) => Ok(Frame {
+                            bytes,
+                            mime: "image/jpeg",
+                        }),
+                        None => Err(Error::OutOfRange {
+                            day: date.to_owned(),
+                            index,
+                            count: segments.iter().map(Segment::len).sum(),
+                        }),
+                    };
+                }
                 let dir = chunk_dir()?;
                 let bytes = match fs::read(dir.join(&name)) {
                     Ok(bytes) => bytes,
@@ -553,11 +574,28 @@ impl FrameSource {
     }
 
     /// Hand the read-ahead thread the undecoded chunks near `index`, in place
-    /// of whatever it still had queued.
+    /// of whatever it still had queued: first the chunk holding `index` if
+    /// `frame_in` served it as a single frame, then the ones nearby.
     fn queue_read_ahead(&self, date: &str, segments: &[Segment], index: usize) {
         let Some(read_ahead) = &self.read_ahead else {
             return;
         };
+        let job = |file: &VideoFile, info: &VideoInfo, chunk: usize| {
+            let key = cache_key(file).ok()?;
+            (!self.cache.contains(&key, chunk) && !self.cache.filling(&key, chunk)).then(|| {
+                read_ahead::Job {
+                    date: date.to_owned(),
+                    key,
+                    chunk,
+                    video: file.path.clone(),
+                    info: *info,
+                }
+            })
+        };
+        let mut jobs = Vec::new();
+        if let Ok((Segment::Video { file, info }, local)) = locate(segments, date, index) {
+            jobs.extend(job(file, info, local / CHUNK_FRAMES));
+        }
         let previous = self
             .last_frame
             .lock()
@@ -567,29 +605,18 @@ impl FrameSource {
         let (back, ahead) = match previous {
             Some(last) if index > last => (0, READ_AHEAD_FRAMES),
             Some(last) if index < last => (READ_AHEAD_FRAMES, 0),
-            Some(_) => return, // the same frame again
+            Some(_) if jobs.is_empty() => return, // the same frame again
+            Some(_) => (0, 0),
             None => (READ_AHEAD_FRAMES, READ_AHEAD_FRAMES),
         };
         let lens: Vec<_> = segments
             .iter()
             .map(|s| (s.len(), matches!(s, Segment::Video { .. })))
             .collect();
-        let mut jobs = Vec::new();
         for (segment, chunk) in chunks_near(&lens, index, back, ahead) {
-            let Segment::Video { file, info } = &segments[segment] else {
-                continue;
-            };
-            let Ok(key) = cache_key(file) else { continue };
-            if self.cache.contains(&key, chunk) {
-                continue;
+            if let Segment::Video { file, info } = &segments[segment] {
+                jobs.extend(job(file, info, chunk));
             }
-            jobs.push(read_ahead::Job {
-                date: date.to_owned(),
-                key,
-                chunk,
-                video: file.path.clone(),
-                info: *info,
-            });
         }
         read_ahead.replace(jobs);
     }
