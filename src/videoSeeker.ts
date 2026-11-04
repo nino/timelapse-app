@@ -4,11 +4,10 @@
  *
  * Only one seek runs at a time: a frame asked for while one is running
  * waits, and only the latest such frame is sought once it has finished, so
- * dragging the scrubber never queues seeks. While the wanted frame keeps
- * changing and is far from the one shown, `fastSeek` jumps to the nearest
- * keyframe, which needs no decoding past it; once the frame has stayed put
- * for `SETTLE_MS`, an exact seek lands on it. Single steps (arrow keys,
- * playback) always seek exactly.
+ * dragging the scrubber never queues seeks. Every seek is exact. Measured in
+ * WKWebView on an M4 Max (2026-11-04), an exact seek takes ~33 ms and a drag
+ * shows a new frame about every display refresh, while `fastSeek` was no
+ * faster and lands on the keyframe before the target, up to 250 frames off.
  *
  * `requestVideoFrameCallback` says which frame was presented; where the
  * browser has none, the `seeked` event and `currentTime` stand in for it.
@@ -20,7 +19,6 @@ export type SeekableVideo = {
   readonly readyState: number;
   readonly seeking: boolean;
   isConnected: boolean;
-  fastSeek?: (time: number) => void;
   requestVideoFrameCallback?: (
     callback: (now: number, metadata: { mediaTime: number }) => void,
   ) => number;
@@ -32,12 +30,6 @@ export type SeekerCallbacks = {
   onShown: (wanted: number, shown: number) => void;
 };
 
-/** A frame asked for within this long of the previous one counts as dragging. */
-export const MOVING_MS = 150;
-/** How long the wanted frame must stay put before a fast seek is corrected. */
-export const SETTLE_MS = 200;
-/** Frames this close to the one shown are always sought exactly. */
-export const NEAR_FRAMES = 30;
 /**
  * How long to wait after `seeked` for the frame callback. A seek to the frame
  * already shown presents nothing new, so the callback may never come.
@@ -52,39 +44,28 @@ export class VideoSeeker {
   /** The frame the running seek is for, and its number. */
   private running: { frame: number; id: number } | null = null;
   private seeks = 0;
-  private lastWantAt = -Infinity;
   private timer: ReturnType<typeof setTimeout> | null = null;
 
   private readonly video: SeekableVideo;
   private readonly fps: number;
   callbacks: SeekerCallbacks;
-  private readonly now: () => number;
 
-  constructor(
-    video: SeekableVideo,
-    fps: number,
-    callbacks: SeekerCallbacks,
-    now: () => number = (): number => performance.now(),
-  ) {
+  constructor(video: SeekableVideo, fps: number, callbacks: SeekerCallbacks) {
     this.video = video;
     this.fps = fps;
     this.callbacks = callbacks;
-    this.now = now;
     video.addEventListener("loadedmetadata", () => this.start());
     video.addEventListener("seeked", () => this.onSeeked());
   }
 
   /** Show frame `frame` of the video (0-based). */
   want(frame: number): void {
-    const now = this.now();
-    const moving = now - this.lastWantAt < MOVING_MS;
-    this.lastWantAt = now;
     if (frame === this.wanted && (this.running !== null || frame === this.shown)) return;
     this.wanted = frame;
-    this.start(moving);
+    this.start();
   }
 
-  private start(moving = false): void {
+  private start(): void {
     const frame = this.wanted;
     // A running seek keeps its timer: after `seeked` it is what finishes the
     // seek when no frame callback comes.
@@ -94,15 +75,11 @@ export class VideoSeeker {
       this.callbacks.onShown(frame, frame);
       return;
     }
-    const far = this.shown === null || Math.abs(frame - this.shown) > NEAR_FRAMES;
-    const fast = moving && far && this.video.fastSeek !== undefined;
     const id = ++this.seeks;
     this.running = { frame, id };
-    // The middle of the frame, so rounding can't land on its neighbour.
-    const time = (frame + 0.5) / this.fps;
     this.video.requestVideoFrameCallback?.((_, metadata) => this.onFrame(id, metadata.mediaTime));
-    if (fast) this.video.fastSeek?.(time);
-    else this.video.currentTime = time;
+    // The middle of the frame, so rounding can't land on its neighbour.
+    this.video.currentTime = (frame + 0.5) / this.fps;
   }
 
   private onFrame(id: number, mediaTime: number): void {
@@ -136,13 +113,8 @@ export class VideoSeeker {
     this.clearTimer();
     if (!this.video.isConnected) return;
     this.callbacks.onShown(running.frame, shown);
-    if (this.wanted !== running.frame) {
-      // Asked for another frame meanwhile: go there, fast if still dragging.
-      this.start(this.now() - this.lastWantAt < MOVING_MS);
-    } else if (shown !== running.frame) {
-      // A fast seek landed on a keyframe: land exactly once the drag stops.
-      this.timer = setTimeout(() => this.start(false), SETTLE_MS);
-    }
+    // Asked for another frame meanwhile: go there.
+    if (this.wanted !== running.frame) this.start();
   }
 
   private frameAt(time: number): number {

@@ -1,10 +1,8 @@
 import { describe, expect, it } from "bun:test";
 
-import { MOVING_MS, SETTLE_MS, VideoSeeker, type SeekableVideo } from "./videoSeeker";
+import { VideoSeeker, type SeekableVideo } from "./videoSeeker";
 
 const FPS = 15;
-// Keyframes every 250 frames, like the converter's x265 encodes.
-const GOP = 250;
 
 /** A paused video that finishes each seek when the test says so. */
 class FakeVideo implements SeekableVideo {
@@ -12,7 +10,8 @@ class FakeVideo implements SeekableVideo {
   readyState = 1;
   seeking = false;
   isConnected = true;
-  seeks: Array<{ kind: "exact" | "fast"; frame: number }> = [];
+  /** The frame each seek asked for. */
+  seeks: Array<number> = [];
   private listeners = new Map<string, Array<() => void>>();
   frameCallbacks: Array<(now: number, metadata: { mediaTime: number }) => void> = [];
 
@@ -22,20 +21,12 @@ class FakeVideo implements SeekableVideo {
     this.withFrameCallback = withFrameCallback;
   }
 
-  fastSeek = (time: number): void => {
-    const keyframe = Math.floor(Math.floor(time * FPS) / GOP) * GOP;
-    this.seeks.push({ kind: "fast", frame: Math.floor(time * FPS) });
-    this.time = keyframe / FPS;
-    this.seeking = true;
-  };
-
   get currentTime(): number {
     return this.time;
   }
 
-  /** An exact seek. */
   set currentTime(time: number) {
-    this.seeks.push({ kind: "exact", frame: Math.floor(time * FPS) });
+    this.seeks.push(Math.floor(time * FPS));
     this.time = time;
     this.seeking = true;
   }
@@ -70,25 +61,22 @@ function setup(withFrameCallback = true): {
   video: FakeVideo;
   seeker: VideoSeeker;
   shown: Array<[number, number]>;
-  clock: { now: number };
 } {
   const video = new FakeVideo(withFrameCallback);
   const shown: Array<[number, number]> = [];
-  const clock = { now: 0 };
   const seeker = new VideoSeeker(
     video,
     FPS,
     { onShown: (wanted, frame): void => void shown.push([wanted, frame]) },
-    (): number => clock.now,
   );
-  return { video, seeker, shown, clock };
+  return { video, seeker, shown };
 }
 
 describe("VideoSeeker", () => {
   it("seeks exactly to the middle of a frame and reports what was shown", () => {
     const { video, seeker, shown } = setup();
     seeker.want(100);
-    expect(video.seeks).toEqual([{ kind: "exact", frame: 100 }]);
+    expect(video.seeks).toEqual([100]);
     expect(video.currentTime).toBeCloseTo(100.5 / FPS);
     video.land();
     expect(shown).toEqual([[100, 100]]);
@@ -102,39 +90,9 @@ describe("VideoSeeker", () => {
     expect(video.seeks).toHaveLength(1);
     video.land();
     expect(shown).toEqual([[10, 10]]);
-    expect(video.seeks.map((s) => s.frame)).toEqual([10, 12]);
+    expect(video.seeks).toEqual([10, 12]);
     video.land();
     expect(shown).toEqual([[10, 10], [12, 12]]);
-  });
-
-  it("jumps to keyframes while dragging far, then lands exactly once the drag stops", async () => {
-    const { video, seeker, shown, clock } = setup();
-    seeker.want(0);
-    video.land();
-    clock.now += 16;
-    seeker.want(900);
-    expect(video.seeks.at(-1)).toEqual({ kind: "fast", frame: 900 });
-    video.land();
-    // Shown the keyframe before frame 900.
-    expect(shown.at(-1)).toEqual([900, 750]);
-    // Nothing else asked for: the exact seek follows after a pause.
-    clock.now += SETTLE_MS;
-    await new Promise((resolve) => setTimeout(resolve, SETTLE_MS + 20));
-    expect(video.seeks.at(-1)).toEqual({ kind: "exact", frame: 900 });
-    video.land();
-    expect(shown.at(-1)).toEqual([900, 900]);
-  });
-
-  it("steps exactly when the frame asked for is near, even in quick succession", () => {
-    const { video, seeker, clock } = setup();
-    seeker.want(500);
-    video.land();
-    for (let frame = 501; frame < 505; frame++) {
-      clock.now += MOVING_MS / 3;
-      seeker.want(frame);
-      video.land();
-    }
-    expect(video.seeks.every((s) => s.kind === "exact")).toBe(true);
   });
 
   it("waits for the video's metadata before seeking", () => {
@@ -144,7 +102,7 @@ describe("VideoSeeker", () => {
     expect(video.seeks).toHaveLength(0);
     video.readyState = 1;
     video.emit("loadedmetadata");
-    expect(video.seeks).toEqual([{ kind: "exact", frame: 42 }]);
+    expect(video.seeks).toEqual([42]);
     video.land();
     expect(shown).toEqual([[42, 42]]);
   });
@@ -161,16 +119,15 @@ describe("VideoSeeker", () => {
   });
 
   it("finishes a seek that presents no new frame even when asked for more meanwhile", async () => {
-    const { video, seeker, shown, clock } = setup();
+    const { video, seeker, shown } = setup();
     seeker.want(10);
     // `seeked` comes, but the frame callback never does.
     video.seeking = false;
     video.emit("seeked");
-    clock.now += 16;
     seeker.want(20);
     await new Promise((resolve) => setTimeout(resolve, 150));
     expect(shown).toEqual([[10, 10]]);
-    expect(video.seeks.map((s) => s.frame)).toEqual([10, 20]);
+    expect(video.seeks).toEqual([10, 20]);
   });
 
   it("uses seeked and currentTime where there is no frame callback", () => {
