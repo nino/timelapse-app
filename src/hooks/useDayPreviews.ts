@@ -1,6 +1,6 @@
 import React from "react";
 
-import type { Day } from "../frames";
+import { hasVideo as hasVideoFrames, type Day } from "../frames";
 import {
   getDayPreviews,
   imageUrl,
@@ -68,7 +68,7 @@ export function useDayPreviews(day: Day | null): DayPreviewLookup | null {
   const [state, setState] = React.useState<{ date: string; packs: Array<PlacedPack> } | null>(null);
   const date = day?.date ?? null;
   const frameCount = day?.frameCount ?? 0;
-  const hasVideo = day?.source === "video" || day?.source === "mixed";
+  const hasVideo = hasVideoFrames(day);
   const built = useFramesDecoded(date, "previews");
 
   const load = React.useCallback(

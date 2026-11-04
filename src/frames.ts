@@ -23,6 +23,11 @@ export type FrameRange = {
   end: number;
 };
 
+/** Whether some of `day`'s frames come from video. */
+export function hasVideo(day: Day | null): boolean {
+  return day?.source === "video" || day?.source === "mixed";
+}
+
 export function listDays(): Promise<Array<string>> {
   return invoke<Array<string>>("list_days");
 }

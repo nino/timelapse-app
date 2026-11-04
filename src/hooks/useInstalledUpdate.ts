@@ -2,6 +2,7 @@ import React from "react";
 
 import { getInstalledUpdate, onUpdateReady } from "../updates";
 import { useMountEffect } from "./useMountEffect";
+import { useTauriEvent } from "./useTauriEvent";
 
 /**
  * The version of an update installed in the background and waiting for a
@@ -10,30 +11,18 @@ import { useMountEffect } from "./useMountEffect";
  */
 export function useInstalledUpdate(): string | null {
   const [version, setVersion] = React.useState<string | null>(null);
+  useTauriEvent(onUpdateReady, setVersion, "updates");
+  // Installed before this window opened, as when it was closed and reopened.
   useMountEffect(() => {
-    let stop: (() => void) | null = null;
     let unmounted = false;
-    onUpdateReady((ready) => setVersion(ready)).then(
-      (unlisten) => {
-        if (unmounted) unlisten();
-        else stop = unlisten;
-      },
-      (error: unknown) => {
-        console.error("Error listening for updates:", error);
-      },
-    );
-    // Installed before this window opened, as when it was closed and reopened.
     getInstalledUpdate().then(
       (installed) => {
         if (!unmounted && installed) setVersion(installed);
       },
-      (error: unknown) => {
-        console.error("Error asking for an installed update:", error);
-      },
+      (error: unknown) => console.error("Error asking for an installed update:", error),
     );
     return (): void => {
       unmounted = true;
-      stop?.();
     };
   });
   return version;

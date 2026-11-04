@@ -1,6 +1,6 @@
 import React from "react";
 
-import { frameUrl, getPendingFrames, type Day, type PendingFrames } from "../frames";
+import { frameUrl, getPendingFrames, hasVideo as hasVideoFrames, type Day, type PendingFrames } from "../frames";
 import { useLatestLoad } from "./useDirectoryChanges";
 import { useFramesDecoded } from "./useFramesDecoded";
 
@@ -21,7 +21,7 @@ export function usePendingFrames(day: Day | null, loaded: string | null): Pendin
   const [decodes, setDecodes] = React.useState(0);
   const date = day?.date ?? null;
   const frameCount = day?.frameCount ?? 0;
-  const hasVideo = day?.source === "video" || day?.source === "mixed";
+  const hasVideo = hasVideoFrames(day);
   const current = hasVideo && state?.date === date ? state.pending : null;
 
   // A finished load of a pending frame means its chunk is decoded now.
