@@ -5,6 +5,7 @@ Each module's `//!` doc comment says how it works; this file is the map and the 
 ## Modules
 
 - `lib.rs` — the Tauri commands, the `frames://localhost/<YYYY-MM-DD>/<index>` URI scheme (`http://frames.localhost/…` on Windows), the menu, and `setup()`, which creates the library directory, evicts cache folders over 15 days old, and starts the photographer (after a 1 s delay), OCR and the converter. State-backed commands are thin shims over `*_impl(&PhotographerState, …)` functions, which is what the tests call.
+- `media.rs` — the `videos://localhost/<file name>` URI scheme for the beta video player: library videos (`FrameSource::video_path`) served in byte ranges, which WebKit's media loader needs.
 - `timelapse.rs` — the `Photographer` capture loop.
 - `database.rs` — `ScreenshotDatabase` over `<library>/screenshots.db`, and its migrations.
 - `ocr.rs`, `ocr_helper.rs`, `ocr_tiles.rs`, `ocr_readahead.rs`, `menu_app.rs` — background OCR with Apple Vision (macOS only), run in a helper process because Vision can break for the rest of a process's life; during a boost, screenshots are read ahead by four helpers at once.

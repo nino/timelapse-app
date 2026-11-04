@@ -4,12 +4,13 @@ import { act, fireEvent, render, screen, waitFor, within } from '@testing-librar
 import { App } from './App';
 import type { DayApps } from './apps';
 import * as frames from './frames';
-import { frameUrl, type Day, type DayStatus } from './frames';
+import { frameUrl, videoUrl, type Day, type DayStatus } from './frames';
 import * as dayAppsHook from './hooks/useDayApps';
 import * as dayPreviewsHook from './hooks/useDayPreviews';
 import * as library from './hooks/useLibrary';
 import * as ocrSearch from './hooks/useOcrSearch';
 import type { DayCount, DayMatch, LineBox } from './search';
+import * as settings from './settings';
 import * as updates from './updates';
 import * as viewerPosition from './viewerPosition';
 
@@ -31,6 +32,8 @@ const useDayPreviews = spyOn(dayPreviewsHook, 'useDayPreviews');
 const getInstalledUpdate = spyOn(updates, 'getInstalledUpdate');
 const onUpdateReady = spyOn(updates, 'onUpdateReady');
 const relaunchIntoUpdate = spyOn(updates, 'relaunchIntoUpdate').mockResolvedValue(undefined);
+const getSettings = spyOn(settings, 'getSettings');
+const getDayVideos = spyOn(frames, 'getDayVideos');
 
 afterAll(() => {
   setViewerPosition.mockRestore();
@@ -48,6 +51,8 @@ afterAll(() => {
   getInstalledUpdate.mockRestore();
   onUpdateReady.mockRestore();
   relaunchIntoUpdate.mockRestore();
+  getSettings.mockRestore();
+  getDayVideos.mockRestore();
 });
 
 /**
@@ -160,6 +165,8 @@ describe('App', () => {
     useDayPreviews.mockReturnValue(null);
     getInstalledUpdate.mockResolvedValue(null);
     onUpdateReady.mockResolvedValue((): void => {});
+    getSettings.mockResolvedValue({ updateAutomatically: true, sendErrorReports: false, videoPlayerBeta: false });
+    getDayVideos.mockResolvedValue({ frameCount: 0, spans: [] });
   });
 
   describe('Library states', () => {
@@ -935,6 +942,100 @@ describe('App', () => {
       getPendingFrames.mockResolvedValue({ frameCount: 300, ranges: [] });
       finishLoading();
       await waitFor(() => expect(stretches()).toHaveLength(0));
+      await settleFrameTime();
+    });
+  });
+
+  describe('Beta video player', () => {
+    const hour = '2026-10-01--09-00-00--hourly.mov';
+
+    function mockVideoDay(videoPlayerBeta: boolean): void {
+      getSettings.mockResolvedValue({ updateAutomatically: true, sendErrorReports: false, videoPlayerBeta });
+      // Frames 0-199 are an hour of video, 200-299 still screenshots.
+      getDayVideos.mockResolvedValue({
+        frameCount: 300,
+        spans: [{ start: 0, end: 200, file: hour, fps: 15 }],
+      });
+      mockLibrary({ '2026-10-01': 300 }, 'mixed');
+    }
+
+    function video(): HTMLVideoElement | null {
+      return document.querySelector('video');
+    }
+
+    it('plays the hours kept as video in a video element when turned on', async () => {
+      mockVideoDay(true);
+      render(<App />);
+      await waitFor(() => expect(shownFrame()).toBe(frameUrl('2026-10-01', 299)));
+      expect(video()).toBeNull();
+      finishLoading();
+      await waitFor(() => expect(getDayVideos).toHaveBeenCalledWith('2026-10-01'));
+      await act(async () => {});
+
+      fireEvent.keyDown(window, { key: 'ArrowLeft', altKey: true });
+      await waitFor(() => expect(video()).not.toBeNull());
+      expect(video()?.getAttribute('src')).toBe(videoUrl(hour));
+      // The last frame stays up underneath until the video has one.
+      expect(shownFrame()).toBe(frameUrl('2026-10-01', 299));
+      expect(video()).toHaveClass('invisible');
+      // Nothing to decode, so nothing is drawn as pending.
+      expect(document.querySelectorAll('[data-pending-stretch]')).toHaveLength(0);
+      await settleFrameTime();
+    });
+
+    it('falls back to decoded frames when the video will not play', async () => {
+      mockVideoDay(true);
+      render(<App />);
+      await waitFor(() => expect(shownFrame()).toBe(frameUrl('2026-10-01', 299)));
+      finishLoading();
+      fireEvent.keyDown(window, { key: 'ArrowLeft', altKey: true });
+      await waitFor(() => expect(video()).not.toBeNull());
+
+      const consoleError = spyOn(console, 'error').mockImplementation(() => {});
+      fireEvent.error(video() as HTMLVideoElement);
+      consoleError.mockRestore();
+      await waitFor(() => expect(video()).toBeNull());
+      await waitFor(() => expect(shownFrame()).toBe(frameUrl('2026-10-01', 199)));
+      await settleFrameTime();
+    });
+
+    it('keeps the last video frame up until the frame after it has loaded', async () => {
+      mockVideoDay(true);
+      render(<App />);
+      await waitFor(() => expect(shownFrame()).toBe(frameUrl('2026-10-01', 299)));
+      finishLoading();
+      await waitFor(() => expect(getDayVideos).toHaveBeenCalledWith('2026-10-01'));
+      await act(async () => {});
+      fireEvent.keyDown(window, { key: 'ArrowLeft', altKey: true });
+      await waitFor(() => expect(video()).not.toBeNull());
+
+      // The video loads and lands on frame 199.
+      const element = video() as HTMLVideoElement;
+      Object.defineProperty(element, 'readyState', { value: 1 });
+      fireEvent(element, new Event('loadedmetadata'));
+      expect(element.currentTime).toBeCloseTo(199.5 / 15);
+      fireEvent(element, new Event('seeked'));
+      await waitFor(() => expect(element).not.toHaveClass('invisible'));
+
+      // Back into the screenshots: the video stays up until the image loads.
+      fireEvent.keyDown(window, { key: 'ArrowRight' });
+      await waitFor(() => expect(shownFrame()).toBe(frameUrl('2026-10-01', 200)));
+      expect(video()).toBe(element);
+      expect(element).not.toHaveClass('invisible');
+      finishLoading();
+      await waitFor(() => expect(video()).toBeNull());
+      await settleFrameTime();
+    });
+
+    it('stays off unless turned on', async () => {
+      mockVideoDay(false);
+      render(<App />);
+      await waitFor(() => expect(shownFrame()).toBe(frameUrl('2026-10-01', 299)));
+      finishLoading();
+      fireEvent.keyDown(window, { key: 'ArrowLeft', altKey: true });
+      await waitFor(() => expect(shownFrame()).toBe(frameUrl('2026-10-01', 199)));
+      expect(video()).toBeNull();
+      expect(getDayVideos).not.toHaveBeenCalled();
       await settleFrameTime();
     });
   });

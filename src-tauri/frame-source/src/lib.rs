@@ -114,6 +114,29 @@ pub struct PendingFrames {
     pub ranges: Vec<FrameRange>,
 }
 
+/// A stretch of a day that one video holds, frame for frame, for a player
+/// that reads the video file itself (the viewer's beta video player): frame
+/// `start + n` of the day is frame `n` of `file`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VideoSpan {
+    pub start: usize,
+    /// Exclusive.
+    pub end: usize,
+    /// The video's file name in the library root.
+    pub file: String,
+    pub fps: f64,
+}
+
+/// What `FrameSource::day_videos` found, with the frame count it found it
+/// against, like `PendingFrames`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DayVideos {
+    pub frame_count: usize,
+    pub spans: Vec<VideoSpan>,
+}
+
 /// One video's preview pack, placed in its day. Mirrors `PreviewPack` in
 /// `src/previews.ts`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -655,6 +678,42 @@ impl FrameSource {
             frame_count: offset,
             ranges: pending,
         })
+    }
+
+    /// The stretches of `date` served from video, in order, with the video
+    /// that holds each. Screenshot hours are left out.
+    pub fn day_videos(&self, date: &str) -> Result<DayVideos, Error> {
+        let segments = self.plan(parse_date(date)?)?;
+        let mut spans = Vec::new();
+        let mut offset = 0;
+        for segment in &segments {
+            if let Segment::Video { file, info } = segment {
+                if let Some(name) = file.path.file_name().and_then(|n| n.to_str()) {
+                    spans.push(VideoSpan {
+                        start: offset,
+                        end: offset + info.frame_count,
+                        file: name.to_owned(),
+                        fps: info.fps,
+                    });
+                }
+            }
+            offset += segment.len();
+        }
+        Ok(DayVideos {
+            frame_count: offset,
+            spans,
+        })
+    }
+
+    /// Where the library video named `name` is, if `name` is a bare file
+    /// name the frame source reads as a video and the file exists. Nothing
+    /// else in the library can be reached through it.
+    pub fn video_path(&self, name: &str) -> Option<PathBuf> {
+        if name.contains(['/', '\\']) || parse_video_name(name).is_none() {
+            return None;
+        }
+        let path = self.root.join(name);
+        path.is_file().then_some(path)
     }
 
     pub fn frame_time(&self, date: &str, index: usize) -> Result<Option<FrameTime>, Error> {

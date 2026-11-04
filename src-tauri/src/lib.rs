@@ -17,6 +17,7 @@ mod database;
 mod day_apps;
 mod menu_app;
 mod diagnostics;
+mod media;
 mod ocr;
 mod ocr_helper;
 mod ocr_readahead;
@@ -26,7 +27,9 @@ mod previews;
 mod settings;
 mod updater;
 
-use frame_source::{DayPreviews, DaySummary, FrameSource, FrameTime, PendingFrames, PreviewStore, Tools};
+use frame_source::{
+    DayPreviews, DaySummary, DayVideos, FrameSource, FrameTime, PendingFrames, PreviewStore, Tools,
+};
 use tauri::http::{header, Response, StatusCode};
 
 use std::path::Path;
@@ -80,6 +83,10 @@ const FRAMES_DECODED: &str = "frames-decoded";
 /// Event sent with a day's date when the preview builder has built a pack
 /// for one of its videos.
 const PREVIEWS_BUILT: &str = "previews-built";
+
+/// Event sent with the new settings whenever one changes, so the main window
+/// picks up a change made in the Settings window.
+const SETTINGS_CHANGED: &str = "settings-changed";
 
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 #[tauri::command]
@@ -265,6 +272,16 @@ async fn get_pending_frames(
     date: String,
 ) -> Result<PendingFrames, String> {
     with_frame_source(source.inner(), move |s| s.pending(&date)).await
+}
+
+/// The stretches of `date` served from video and the video each comes from,
+/// for the beta video player, which plays them from `videos:` URLs.
+#[tauri::command]
+async fn get_day_videos(
+    source: State<'_, FrameSourceState>,
+    date: String,
+) -> Result<DayVideos, String> {
+    with_frame_source(source.inner(), move |s| s.day_videos(&date)).await
 }
 
 /// The preview packs of `date`'s videos, for showing while the scrubber is
@@ -728,14 +745,26 @@ fn get_settings(settings: State<'_, SettingsStore>) -> Settings {
     settings.get()
 }
 
+/// Tells every window the settings have changed (`SETTINGS_CHANGED`), so the
+/// main window picks up a change made in the Settings window.
+fn settings_changed(app: &AppHandle, saved: Settings) {
+    if let Err(e) = app.emit(SETTINGS_CHANGED, saved) {
+        eprintln!("Could not report the settings change: {}", e);
+    }
+}
+
 #[tauri::command]
 fn set_update_automatically(
     enabled: bool,
+    app: AppHandle,
     settings: State<'_, SettingsStore>,
     updater: State<'_, UpdaterState>,
 ) -> Result<Settings, String> {
     let saved = settings.update(|s| s.update_automatically = enabled);
     updater.setting_changed();
+    if let Ok(saved) = saved {
+        settings_changed(&app, saved);
+    }
     saved
 }
 
@@ -753,16 +782,43 @@ fn relaunch_into_update(app: AppHandle) {
 }
 
 #[tauri::command]
-fn set_send_error_reports(enabled: bool, settings: State<'_, SettingsStore>) -> Result<Settings, String> {
+fn set_send_error_reports(
+    enabled: bool,
+    app: AppHandle,
+    settings: State<'_, SettingsStore>,
+) -> Result<Settings, String> {
     match settings.update(|s| s.send_error_reports = enabled) {
         Ok(saved) => {
             analytics::set_enabled(enabled);
+            settings_changed(&app, saved);
             Ok(saved)
         }
         Err(e) => {
             // The page puts the switch back when saving fails, so take the
             // change back here too rather than send with the switch shown off.
             let _ = settings.update(|s| s.send_error_reports = !enabled);
+            Err(e)
+        }
+    }
+}
+
+/// Turns the beta video player on or off, and tells the main window.
+#[tauri::command]
+fn set_video_player_beta(
+    enabled: bool,
+    app: AppHandle,
+    settings: State<'_, SettingsStore>,
+) -> Result<Settings, String> {
+    match settings.update(|s| s.video_player_beta = enabled) {
+        Ok(saved) => {
+            settings_changed(&app, saved);
+            Ok(saved)
+        }
+        Err(e) => {
+            // The page puts the switch back when saving fails, so take the
+            // change back here too, or the main window (never told) and the
+            // store would disagree with what the switch shows.
+            let _ = settings.update(|s| s.video_player_beta = !enabled);
             Err(e)
         }
     }
@@ -1162,6 +1218,24 @@ pub fn run() {
                 responder.respond(frame_response(source.as_deref(), &path));
             });
         })
+        .register_asynchronous_uri_scheme_protocol("videos", |ctx, request, responder| {
+            let source = ctx
+                .app_handle()
+                .try_state::<FrameSourceState>()
+                .map(|state| Arc::clone(state.inner()));
+            let name = request.uri().path().trim_start_matches('/').to_owned();
+            let range = request
+                .headers()
+                .get(header::RANGE)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            // A range is a few megabytes read from disk; keep it off the
+            // webview's thread all the same.
+            tauri::async_runtime::spawn_blocking(move || {
+                let path = source.and_then(|source| source.video_path(&name));
+                responder.respond(media::video_response(path.as_deref(), range.as_deref()));
+            });
+        })
         .setup(|app| {
             app.manage(SettingsStore::load(app.path().app_config_dir().ok()));
             // Per profile, like the library: the viewer position names a day
@@ -1350,6 +1424,7 @@ pub fn run() {
             get_day_statuses,
             get_frame_time,
             get_pending_frames,
+            get_day_videos,
             get_day_previews,
             search_ocr,
             search_ocr_day,
@@ -1372,6 +1447,7 @@ pub fn run() {
             get_installed_update,
             relaunch_into_update,
             set_send_error_reports,
+            set_video_player_beta,
             get_viewer_position,
             set_viewer_position,
             grow_settings_window

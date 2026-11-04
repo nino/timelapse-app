@@ -589,6 +589,9 @@ fn ffmpeg_command(frames_dir: &Path, output: &Path, background: bool) -> Command
         .args(["-g", "30", "-vf"])
         .arg(VIDEO_FILTER)
         .args(["-tag:v", "hvc1"])
+        // The index at the front, so a player reading the file in ranges (the
+        // viewer's beta video player) finds it without walking the file.
+        .args(["-movflags", "+faststart"])
         .arg(output)
         // The second output: options from here on are for it.
         .arg("-vf")
