@@ -5,7 +5,6 @@
   "windows": ["main"],
   "permissions": [
     "core:default",
-    "opener:default",
     "fs:default",
     "fs:allow-watch",
     "fs:allow-unwatch",
@@ -18,15 +17,9 @@
         { "path": "$HOME/Timelapse" },
         { "path": "$HOME/Timelapse/*" },
         { "path": "$HOME/Timelapse/*/*" },
-        { "path": "$HOME/Timelapse/.cache" },
-        { "path": "$HOME/Timelapse/.cache/*" },
-        { "path": "$HOME/Timelapse/.cache/*/*" },
         { "path": "$HOME/Timelapse_dev" },
         { "path": "$HOME/Timelapse_dev/*" },
-        { "path": "$HOME/Timelapse_dev/*/*" },
-        { "path": "$HOME/Timelapse_dev/.cache" },
-        { "path": "$HOME/Timelapse_dev/.cache/*" },
-        { "path": "$HOME/Timelapse_dev/.cache/*/*" }
+        { "path": "$HOME/Timelapse_dev/*/*" }
       ]
     }
   ]

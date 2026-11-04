@@ -74,7 +74,7 @@ Everything is in `~/Timelapse`:
 | `YYYY-MM-DD--HH-MM-SS--hourly.mov` | One video per converted hour, named after its first frame |
 | `screenshots.db` | SQLite: capture times, front app and window, OCR text and its search index |
 | `diagnostics.db` | A log of state changes, errors and hourly summaries, kept for 30 days, for troubleshooting |
-| `.cache/` | Decoded video frames for the viewer; folders unused for 15 days are removed |
+| `.cache/` | Staging folders for the hour being converted; older versions kept decoded frames here, and folders unused for 15 days are removed |
 
 Older whole-day videos from the earlier `timelapse-to-video` scripts in the same
 folder are picked up too, and their text is read from the video.

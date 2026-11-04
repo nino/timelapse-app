@@ -20,12 +20,11 @@
 //! does it wait 60 s. Errors also go to a bounded in-memory log.
 
 use active_win_pos_rs::get_active_window;
-use chrono::{DateTime, Utc, Local};
+use chrono::{Utc, Local};
 use fast_image_resize::images::{CroppedImageMut, ImageRef};
 use fast_image_resize::{FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer};
 use image::{ImageFormat, RgbImage};
 use screenshots::Screen;
-use serde::{Deserialize, Serialize};
 use std::{
     borrow::Cow,
     path::PathBuf,
@@ -36,12 +35,6 @@ use thiserror::Error;
 use tokio::time::{sleep, Duration};
 use crate::activity::{Activity, FAILURES_BEFORE_BACKOFF};
 use crate::database::{FrontWindow, ScreenshotDatabase};
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ErrorLogEntry {
-    pub timestamp: DateTime<Utc>,
-    pub error_message: String,
-}
 
 #[derive(Error, Debug)]
 pub enum Error {
@@ -70,7 +63,6 @@ pub enum Error {
 pub struct Photographer {
     timelapse_root_path: PathBuf,
     running: Arc<AtomicBool>,
-    error_logs: Arc<Mutex<Vec<ErrorLogEntry>>>,
     db: Arc<Mutex<ScreenshotDatabase>>,
     activity: Arc<Activity>,
 }
@@ -97,7 +89,6 @@ impl Photographer {
         Ok(Photographer {
             timelapse_root_path,
             running: Arc::new(AtomicBool::new(false)),
-            error_logs: Arc::new(Mutex::new(Vec::new())),
             db: Arc::new(Mutex::new(db)),
             activity: Arc::default(),
         })
@@ -115,7 +106,6 @@ impl Photographer {
 
         let timelapse_root_path = self.timelapse_root_path.clone();
         let running_clone = Arc::clone(&running);
-        let error_logs_clone = Arc::clone(&self.error_logs);
         let db_clone = Arc::clone(&self.db);
         let activity = Arc::clone(&self.activity);
 
@@ -150,20 +140,6 @@ impl Photographer {
                         failures_in_a_row += 1;
                         tally.count("failed", 1);
                         activity.capture_failed(error.to_string());
-
-                        // Log the error
-                        let entry = ErrorLogEntry {
-                            timestamp: Utc::now(),
-                            error_message: error.to_string(),
-                        };
-
-                        if let Ok(mut logs) = error_logs_clone.lock() {
-                            logs.push(entry);
-                            if logs.len() > 10000 {
-                                logs.remove(0);
-                            }
-                        }
-
                         tally.report_if_due();
                         sleep(retry_delay(failures_in_a_row)).await;
                     }
@@ -177,33 +153,11 @@ impl Photographer {
         running
     }
 
+    /// Capture runs for the life of the app; only the tests stop it, before
+    /// the loop can take a screenshot.
+    #[cfg(test)]
     pub fn stop(&self) {
         self.running.store(false, Ordering::SeqCst);
-    }
-
-    pub fn get_error_logs(&self) -> Vec<ErrorLogEntry> {
-        self.error_logs
-            .lock()
-            .map(|logs| logs.clone())
-            .unwrap_or_default()
-    }
-
-    pub fn clear_error_logs(&self) {
-        if let Ok(mut logs) = self.error_logs.lock() {
-            logs.clear();
-        }
-    }
-
-    pub fn get_screenshot_metadata(
-        &self,
-        frame_number: u32,
-        day: Option<&str>,
-    ) -> Result<Option<(String, String)>, Error> {
-        if let Ok(db_guard) = self.db.lock() {
-            Ok(db_guard.get_screenshot_by_frame(frame_number, day)?)
-        } else {
-            Err(Error::DatabaseError(rusqlite::Error::InvalidQuery))
-        }
     }
 
     /// Create today's folder if needed, and return its name and path.
@@ -772,7 +726,6 @@ mod tests {
 
         let photographer = photographer.unwrap();
         assert!(!photographer.running.load(Ordering::SeqCst));
-        assert_eq!(photographer.get_error_logs().len(), 0);
         // The database is created eagerly under the given root.
         assert!(temp_dir.path().join("screenshots.db").exists());
     }
@@ -798,61 +751,6 @@ mod tests {
         // Stop the photographer
         photographer.stop();
         assert!(!photographer.running.load(Ordering::SeqCst));
-    }
-
-    #[test]
-    fn test_photographer_error_logs() {
-        let temp_dir = TempDir::new().unwrap();
-        let photographer = Photographer::new_in(temp_dir.path().to_path_buf()).unwrap();
-
-        // Initially should have no error logs
-        assert_eq!(photographer.get_error_logs().len(), 0);
-
-        // Add an error log manually (simulating what would happen during operation)
-        {
-            let mut logs = photographer.error_logs.lock().unwrap();
-            logs.push(ErrorLogEntry {
-                timestamp: Utc::now(),
-                error_message: "Test error".to_string(),
-            });
-        }
-
-        // Verify we can retrieve the error log
-        let logs = photographer.get_error_logs();
-        assert_eq!(logs.len(), 1);
-        assert_eq!(logs[0].error_message, "Test error");
-
-        // Clear error logs
-        photographer.clear_error_logs();
-        assert_eq!(photographer.get_error_logs().len(), 0);
-    }
-
-    #[test]
-    fn test_photographer_error_logs_limit() {
-        let temp_dir = TempDir::new().unwrap();
-        let photographer = Photographer::new_in(temp_dir.path().to_path_buf()).unwrap();
-
-        // Add more than 10000 error logs
-        {
-            let mut logs = photographer.error_logs.lock().unwrap();
-            for i in 0..10002 {
-                logs.push(ErrorLogEntry {
-                    timestamp: Utc::now(),
-                    error_message: format!("Error {}", i),
-                });
-
-                // Simulate the limiting behavior from the actual code
-                if logs.len() > 10000 {
-                    logs.remove(0);
-                }
-            }
-        }
-
-        // Should be limited to 10000
-        let logs = photographer.get_error_logs();
-        assert_eq!(logs.len(), 10000);
-        // First error should be "Error 2" (0 and 1 should have been removed)
-        assert_eq!(logs[0].error_message, "Error 2");
     }
 
     #[test]
@@ -1007,23 +905,6 @@ mod tests {
             reason: "resize failed".to_string(),
         };
         assert_eq!(error.to_string(), "Unable to resize screenshot /test/path because: resize failed");
-    }
-
-    #[test]
-    fn test_error_log_entry_serialization() {
-        let entry = ErrorLogEntry {
-            timestamp: Utc::now(),
-            error_message: "Test error message".to_string(),
-        };
-
-        // Test serialization
-        let json = serde_json::to_string(&entry);
-        assert!(json.is_ok());
-
-        // Test deserialization
-        let deserialized: Result<ErrorLogEntry, _> = serde_json::from_str(&json.unwrap());
-        assert!(deserialized.is_ok());
-        assert_eq!(deserialized.unwrap().error_message, "Test error message");
     }
 
     /// An RGBA capture of `image`, rows packed.

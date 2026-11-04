@@ -1,10 +1,10 @@
 //! The Tauri app: commands, the `frames:` URI scheme, the menu, and `setup()`,
 //! which starts the photographer, OCR and the video converter.
 //!
-//! Each command that needs the photographer is a thin shim over a
-//! `*_impl(&PhotographerState, …)` function. `tauri::State` wraps a private
-//! reference with no public constructor, so that split is what lets the tests
-//! call the logic directly.
+//! Commands with logic worth testing are thin shims over `*_impl` functions
+//! that take plain arguments. `tauri::State` wraps a private reference with no
+//! public constructor, so that split is what lets the tests call the logic
+//! directly.
 
 mod activity;
 mod analytics;
@@ -38,7 +38,7 @@ use tauri::menu::{Menu, MenuItem, MenuItemKind, PredefinedMenuItem, WINDOW_SUBME
 use tauri::{AppHandle, Emitter, Manager, Runtime, State, WebviewUrl, WebviewWindowBuilder};
 use activity::{Activity, Snapshot};
 use app_state::{AppStateStore, Rect, ViewerPosition};
-use database::{OcrHit, OcrProgress, ScreenshotDatabase};
+use database::{OcrProgress, ScreenshotDatabase};
 use serde::Serialize;
 use settings::{Settings, SettingsStore};
 use timelapse::Photographer;
@@ -88,12 +88,6 @@ const PREVIEWS_BUILT: &str = "previews-built";
 /// picks up a change made in the Settings window.
 const SETTINGS_CHANGED: &str = "settings-changed";
 
-// Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-#[tauri::command]
-fn greet(name: &str) -> String {
-    format!("Hello, {}! You've been greeted from Rust!", name)
-}
-
 /// The directory under `$HOME` this build uses. Rust is the single source of
 /// truth for it: the frontend asks at startup rather than deriving its own
 /// answer, so the capture loop and the viewer can never disagree.
@@ -102,115 +96,10 @@ fn get_timelapse_root_name() -> String {
     paths::TIMELAPSE_DIR_NAME.to_string()
 }
 
-// The state-backed commands below are thin shims over these functions.
-// `tauri::State` is a newtype around a private reference with no public
-// constructor, so it cannot be built outside a running Tauri app — keeping the
-// logic in plain functions is what makes it reachable from unit tests.
-
-fn start_timelapse_impl(
-    state: &PhotographerState,
-    make_photographer: impl FnOnce() -> Result<Photographer, String>,
-) -> Result<String, String> {
-    let mut photographer_guard = state.lock().map_err(|e| e.to_string())?;
-
-    if photographer_guard.is_none() {
-        let photographer = make_photographer()?;
-        photographer.start();
-        *photographer_guard = Some(photographer);
-        Ok("Timelapse started successfully".to_string())
-    } else {
-        Err("Timelapse is already running".to_string())
-    }
-}
-
-fn stop_timelapse_impl(state: &PhotographerState) -> Result<String, String> {
-    let mut photographer_guard = state.lock().map_err(|e| e.to_string())?;
-
-    if let Some(photographer) = photographer_guard.take() {
-        photographer.stop();
-        Ok("Timelapse stopped successfully".to_string())
-    } else {
-        Err("Timelapse is not running".to_string())
-    }
-}
-
-fn is_timelapse_running_impl(state: &PhotographerState) -> Result<bool, String> {
+/// Whether the photographer has been started.
+fn is_capturing(state: &PhotographerState) -> Result<bool, String> {
     let photographer_guard = state.lock().map_err(|e| e.to_string())?;
     Ok(photographer_guard.is_some())
-}
-
-fn get_error_logs_impl(
-    state: &PhotographerState,
-) -> Result<Vec<timelapse::ErrorLogEntry>, String> {
-    let photographer_guard = state.lock().map_err(|e| e.to_string())?;
-
-    if let Some(photographer) = &*photographer_guard {
-        Ok(photographer.get_error_logs())
-    } else {
-        Ok(Vec::new())
-    }
-}
-
-fn clear_error_logs_impl(state: &PhotographerState) -> Result<String, String> {
-    let photographer_guard = state.lock().map_err(|e| e.to_string())?;
-
-    if let Some(photographer) = &*photographer_guard {
-        photographer.clear_error_logs();
-        Ok("Error logs cleared successfully".to_string())
-    } else {
-        Err("Timelapse is not running".to_string())
-    }
-}
-
-fn get_screenshot_metadata_impl(
-    state: &PhotographerState,
-    frame_number: u32,
-    day: Option<&str>,
-) -> Result<Option<(String, String)>, String> {
-    let photographer_guard = state.lock().map_err(|e| e.to_string())?;
-
-    if let Some(photographer) = &*photographer_guard {
-        photographer
-            .get_screenshot_metadata(frame_number, day)
-            .map_err(|e| e.to_string())
-    } else {
-        Err("Timelapse is not running".to_string())
-    }
-}
-
-#[tauri::command]
-async fn start_timelapse(
-    state: State<'_, PhotographerState>,
-    activity: State<'_, ActivityState>,
-) -> Result<String, String> {
-    let activity = Arc::clone(activity.inner());
-    start_timelapse_impl(state.inner(), || {
-        Photographer::new()
-            .map(|photographer| photographer.reporting_to(activity))
-            .map_err(|e| e.to_string())
-    })
-}
-
-#[tauri::command]
-async fn stop_timelapse(state: State<'_, PhotographerState>) -> Result<String, String> {
-    stop_timelapse_impl(state.inner())
-}
-
-#[tauri::command]
-async fn is_timelapse_running(state: State<'_, PhotographerState>) -> Result<bool, String> {
-    is_timelapse_running_impl(state.inner())
-}
-
-#[tauri::command]
-async fn get_error_logs(
-    state: State<'_, PhotographerState>,
-) -> Result<Vec<timelapse::ErrorLogEntry>, String> {
-    get_error_logs_impl(state.inner())
-}
-
-#[tauri::command]
-async fn clear_error_logs(state: State<'_, PhotographerState>) -> Result<String, String> {
-    clear_error_logs_impl(state.inner())
 }
 
 /// Run blocking work (ffmpeg, SQLite) off the async runtime's worker threads.
@@ -344,27 +233,6 @@ fn frame_response(source: Option<&FrameSource>, path: &str) -> Response<Vec<u8>>
         }
         Err(e) => reply(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
-}
-
-#[tauri::command]
-async fn get_screenshot_metadata(
-    state: State<'_, PhotographerState>,
-    frame_number: u32,
-    day: Option<String>,
-) -> Result<Option<(String, String)>, String> {
-    get_screenshot_metadata_impl(state.inner(), frame_number, day.as_deref())
-}
-
-/// Search the OCR text of every screenshot in `<root>`, newest first.
-fn search_ocr_impl(root: &Path, query: &str, limit: u32) -> Result<Vec<OcrHit>, String> {
-    let db = ScreenshotDatabase::new(root.join("screenshots.db")).map_err(|e| e.to_string())?;
-    db.search_ocr(query, limit).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-async fn search_ocr(query: String, limit: Option<u32>) -> Result<Vec<OcrHit>, String> {
-    let timelapse_root = paths::timelapse_root().ok_or("Unable to find home directory")?;
-    search_ocr_impl(&timelapse_root, &query, limit.unwrap_or(100))
 }
 
 /// Where one OCR match sits on a day's scrubber.
@@ -608,12 +476,6 @@ fn evict_old_cache_impl(root: &Path) -> Result<String, String> {
     Ok(format!("Removed {} old cache folders", removed_count))
 }
 
-#[tauri::command]
-async fn evict_old_cache() -> Result<String, String> {
-    let timelapse_root = paths::timelapse_root().ok_or("Unable to find home directory")?;
-    evict_old_cache_impl(&timelapse_root)
-}
-
 /// What capture, conversion and OCR are doing right now. It only reads
 /// memory (and, every few seconds, the power source), so the Activity window
 /// can poll it.
@@ -623,7 +485,7 @@ async fn get_activity(
     photographer: State<'_, PhotographerState>,
     boost: State<'_, BoostState>,
 ) -> Result<Snapshot, String> {
-    let capturing = is_timelapse_running_impl(photographer.inner())?;
+    let capturing = is_capturing(photographer.inner())?;
     let activity = Arc::clone(activity.inner());
     let low_power_until = boost.low_power_until();
     let boost = boost.status();
@@ -1183,7 +1045,6 @@ pub fn run() {
 
     builder
         .plugin(tauri_plugin_fs::init())
-        .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_dialog::init())
         .manage(photographer_state)
@@ -1363,9 +1224,11 @@ pub fn run() {
                 tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
 
                 // Evict old cache entries on startup
-                match evict_old_cache().await {
-                    Ok(msg) => println!("Cache eviction: {}", msg),
-                    Err(e) => eprintln!("Failed to evict old cache: {}", e),
+                if let Some(root) = paths::timelapse_root() {
+                    match evict_old_cache_impl(&root) {
+                        Ok(msg) => println!("Cache eviction: {}", msg),
+                        Err(e) => eprintln!("Failed to evict old cache: {}", e),
+                    }
                 }
 
                 match Photographer::new() {
@@ -1410,15 +1273,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            greet,
             get_timelapse_root_name,
-            start_timelapse,
-            stop_timelapse,
-            is_timelapse_running,
-            get_error_logs,
-            clear_error_logs,
-            evict_old_cache,
-            get_screenshot_metadata,
             list_days,
             get_day,
             get_day_statuses,
@@ -1426,7 +1281,6 @@ pub fn run() {
             get_pending_frames,
             get_day_videos,
             get_day_previews,
-            search_ocr,
             search_ocr_day,
             get_day_apps,
             get_match_lines,
@@ -1470,164 +1324,6 @@ mod tests {
     use tempfile::TempDir;
 
     const DAY: Duration = Duration::from_secs(24 * 60 * 60);
-
-    /// A photographer rooted in a temp dir, so nothing here reads or writes the
-    /// real `~/Timelapse`. The `TempDir` is returned so the caller keeps it
-    /// alive for the duration of the test.
-    fn temp_photographer() -> (TempDir, Photographer) {
-        let temp_dir = TempDir::new().unwrap();
-        let photographer = Photographer::new_in(temp_dir.path().to_path_buf()).unwrap();
-        (temp_dir, photographer)
-    }
-
-    /// State holding an already-registered (but never started) photographer.
-    fn running_state() -> (TempDir, PhotographerState) {
-        let (temp_dir, photographer) = temp_photographer();
-        (temp_dir, Arc::new(Mutex::new(Some(photographer))))
-    }
-
-    fn idle_state() -> PhotographerState {
-        Arc::new(Mutex::new(None))
-    }
-
-    #[test]
-    fn test_greet() {
-        let result = greet("Alice");
-        assert_eq!(result, "Hello, Alice! You've been greeted from Rust!");
-
-        let result = greet("Bob");
-        assert_eq!(result, "Hello, Bob! You've been greeted from Rust!");
-    }
-
-    // `start` calls `tokio::spawn`, which panics outside a runtime. What keeps
-    // the spawned capture loop from taking a screenshot is the
-    // `stop_timelapse_impl` below: it clears `running` before this test reaches
-    // any yield point, so the loop exits the first time it is polled. Do not
-    // add an `.await` between the start and the stop.
-    #[tokio::test]
-    async fn test_start_timelapse_success() {
-        let temp_dir = TempDir::new().unwrap();
-        let root = temp_dir.path().to_path_buf();
-        let state = idle_state();
-
-        let result = start_timelapse_impl(&state, || {
-            Photographer::new_in(root).map_err(|e| e.to_string())
-        });
-
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), "Timelapse started successfully");
-
-        // Verify photographer was created
-        assert!(state.lock().unwrap().is_some());
-
-        stop_timelapse_impl(&state).unwrap();
-    }
-
-    #[test]
-    fn test_start_timelapse_already_running() {
-        let (_temp_dir, state) = running_state();
-
-        // The factory must not run when one is already registered.
-        let result = start_timelapse_impl(&state, || {
-            panic!("should not build a second photographer");
-        });
-
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), "Timelapse is already running");
-    }
-
-    #[test]
-    fn test_stop_timelapse_success() {
-        let (_temp_dir, state) = running_state();
-
-        let result = stop_timelapse_impl(&state);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), "Timelapse stopped successfully");
-
-        // Verify photographer was removed
-        assert!(state.lock().unwrap().is_none());
-    }
-
-    #[test]
-    fn test_stop_timelapse_not_running() {
-        let state = idle_state();
-
-        let result = stop_timelapse_impl(&state);
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), "Timelapse is not running");
-    }
-
-    #[test]
-    fn test_is_timelapse_running() {
-        let state = idle_state();
-
-        // Initially not running
-        assert!(!is_timelapse_running_impl(&state).unwrap());
-
-        // Register a photographer
-        let (_temp_dir, photographer) = temp_photographer();
-        *state.lock().unwrap() = Some(photographer);
-        assert!(is_timelapse_running_impl(&state).unwrap());
-
-        // Stop it again
-        stop_timelapse_impl(&state).unwrap();
-        assert!(!is_timelapse_running_impl(&state).unwrap());
-    }
-
-    #[test]
-    fn test_get_error_logs_when_running() {
-        let (_temp_dir, state) = running_state();
-
-        let result = get_error_logs_impl(&state);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap().len(), 0);
-    }
-
-    #[test]
-    fn test_get_error_logs_when_not_running() {
-        let state = idle_state();
-
-        let result = get_error_logs_impl(&state);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap().len(), 0);
-    }
-
-    #[test]
-    fn test_clear_error_logs_success() {
-        let (_temp_dir, state) = running_state();
-
-        let result = clear_error_logs_impl(&state);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), "Error logs cleared successfully");
-    }
-
-    #[test]
-    fn test_clear_error_logs_not_running() {
-        let state = idle_state();
-
-        let result = clear_error_logs_impl(&state);
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), "Timelapse is not running");
-    }
-
-    #[test]
-    fn test_get_screenshot_metadata_not_running() {
-        let state = idle_state();
-
-        let result = get_screenshot_metadata_impl(&state, 1, None);
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), "Timelapse is not running");
-    }
-
-    #[test]
-    fn test_get_screenshot_metadata_unknown_frame() {
-        let (_temp_dir, state) = running_state();
-
-        // Nothing has been captured into this temp library yet.
-        let result = get_screenshot_metadata_impl(&state, 1, None);
-        assert!(result.is_ok());
-        assert!(result.unwrap().is_none());
-    }
 
     /// A temp library root with an empty `.cache` inside it. The `TempDir` is
     /// returned so the caller keeps it alive for the duration of the test.
@@ -1933,18 +1629,5 @@ mod tests {
             count_ocr_matches_impl(temp_dir.path(), "cargo").unwrap(),
             vec![DayCount { day: "2024-01-01".to_string(), count: 1 }]
         );
-    }
-
-    #[test]
-    fn test_search_ocr_reads_the_library_database() {
-        let temp_dir = TempDir::new().unwrap();
-        let db = ScreenshotDatabase::new(temp_dir.path().join("screenshots.db")).unwrap();
-        db.record_ocr_frame("2024-01-01", 4, Some(("cargo test", &[]))).unwrap();
-
-        let hits = search_ocr_impl(temp_dir.path(), "cargo", 10).unwrap();
-        assert_eq!(hits.len(), 1);
-        assert_eq!((hits[0].day.as_str(), hits[0].frame_number), ("2024-01-01", 4));
-
-        assert!(search_ocr_impl(temp_dir.path(), "nothing", 10).unwrap().is_empty());
     }
 }
