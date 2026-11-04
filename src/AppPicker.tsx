@@ -1,9 +1,9 @@
-import { Listbox, ListboxButton, ListboxOption, ListboxOptions } from "@headlessui/react";
+import { Listbox, ListboxButton, ListboxOptions } from "@headlessui/react";
 import React from "react";
 
 import { formatFrames, type DayApps } from "./apps";
-import { Check, Chevron, passShortcutsOn } from "./DayPicker";
-import { focusRing } from "./ui";
+import { Chevron, DropdownOption, passShortcutsOn } from "./Dropdown";
+import { dropdownButton, menuPanel } from "./ui";
 
 /**
  * The app filter beside the find bar, built like the day picker: "All apps",
@@ -28,7 +28,7 @@ export function AppPicker({
         aria-label="App"
         onKeyPressCapture={passShortcutsOn}
         title="Only play the times an app was in front"
-        className={`flex h-7.5 max-w-48 shrink-0 items-center gap-2 rounded-xl border border-input bg-field pr-2 pl-2.5 text-sm ${focusRing} ${
+        className={`${dropdownButton} max-w-48 pl-3 ${
           value === null ? "text-muted-fg" : "font-medium text-fg"
         }`}
       >
@@ -43,7 +43,7 @@ export function AppPicker({
       </ListboxButton>
       <ListboxOptions
         anchor={{ to: "bottom end", gap: 4 }}
-        className="z-10 max-h-96 w-64 overflow-y-auto rounded-2xl border border-border bg-card p-1 text-sm text-fg shadow-md outline-none"
+        className={`${menuPanel} w-64`}
       >
         <AppOption value={null} label="All apps" />
         {missing && <AppOption value={value} label={value} detail="Not on this day" />}
@@ -70,15 +70,11 @@ function AppOption({
   detail?: string;
 }): React.ReactNode {
   return (
-    <ListboxOption
-      value={value}
-      className="flex h-7 cursor-default items-center gap-2 rounded-[11px] pr-2.5 pl-1.5 select-none data-focus:bg-muted data-selected:font-semibold"
-    >
-      <Check />
+    <DropdownOption value={value}>
       <span className="min-w-0 flex-1 truncate">{label}</span>
       {detail !== undefined && (
-        <span className="shrink-0 text-xs font-normal text-muted-fg tabular-nums">{detail}</span>
+        <span className="shrink-0 text-xs font-normal text-muted-fg">{detail}</span>
       )}
-    </ListboxOption>
+    </DropdownOption>
   );
 }
