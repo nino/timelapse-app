@@ -458,6 +458,11 @@ export function App({
 
       <div className="relative overflow-hidden">
         {src && (
+          // No pointer events on the frame (nor the video, nor the preview):
+          // the mouse resting on an image makes WebKit run Live Text on it,
+          // and on a text-heavy frame the overlay it adds is laid out again
+          // on every step of a window resize, which froze resizing for up to
+          // seconds at a time.
           <img
             src={src}
             alt={`Frame ${currentIndex + 1}`}
@@ -471,7 +476,7 @@ export function App({
               onLoad();
             }}
             onError={onError}
-            className={`w-full h-full object-contain absolute inset-0 ${
+            className={`w-full h-full object-contain absolute inset-0 pointer-events-none ${
               frameFailed ? "invisible" : ""
             }`}
           />

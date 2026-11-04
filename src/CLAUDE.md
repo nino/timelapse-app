@@ -20,6 +20,7 @@
 - **Playback** asks for the next frame only once the current one has loaded or failed, so a slow decode slows playback instead of queueing requests. It stops at the day's last frame, when another day opens, and when the window is hidden; play on the last frame starts the day over. The fps choice (default 15) is remembered in `localStorage`.
 - **App filter.** The app picker beside the find bar (`AppPicker.tsx`, data from `get_day_apps` via `hooks/useDayApps.ts`) lists the day's apps; picking one marks its stretches under the scrubber and playback plays only those, jumping the gaps. Scrubbing and arrow keys still reach every frame. The pick stays across days.
 - **Update button.** `hooks/useInstalledUpdate.ts` shows an Update button at the right of the title bar once Rust has installed an update in the background; clicking it relaunches. Nothing relaunches the app unasked, because a relaunched app takes focus.
+- **No pointer events on the frame.** The frame `<img>`, the video and the scrub preview are `pointer-events-none`. When the mouse rests on an image, WebKit runs Live Text on it, and on a text-heavy frame it lays its text overlay out again on every step of a window resize, which froze resizing for seconds.
 - **Find bar.** Matches are marked above the scrubber, back-to-back matches merge into one stop, Enter/Shift+Enter step through them, and the matching lines of the frame on screen are outlined. Searches re-run only when `get_ocr_version` changes, not on every capture.
 
 ## Styling

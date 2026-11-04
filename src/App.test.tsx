@@ -217,6 +217,15 @@ describe('App', () => {
       expect(position()).toBe('3 / 3');
     });
 
+    it('keeps the mouse off the frame, so WebKit never runs Live Text on it', async () => {
+      // Live Text's overlay on a text-heavy frame froze window resizing.
+      mockLibrary({ '2026-10-04': 3 });
+      render(<App />);
+      await waitFor(() => expect(shownFrame()).toBe(frameUrl('2026-10-04', 2)));
+      expect(image()).toHaveClass('pointer-events-none');
+      await settleFrameTime();
+    });
+
     it('lists days newest first and marks today', async () => {
       mockLibrary({ '2024-12-20': 10, [today()]: 3 });
       render(<App />);
