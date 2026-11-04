@@ -1,7 +1,6 @@
 import { Popover, PopoverButton, PopoverPanel } from "@headlessui/react";
 import React from "react";
 
-import { toggleActivity } from "./activity";
 import "./App.css";
 import { AppPicker } from "./AppPicker";
 import { mergeCloseRanges, nextInRanges } from "./apps";
@@ -167,15 +166,6 @@ export function App({
     e.preventDefault();
     findInput.current?.focus();
     findInput.current?.select();
-  });
-
-  // ⌥⌘A toggles the Activity window. That is the menu's shortcut, but it
-  // didn't reach the menu while a dropdown had focus, so the page handles it
-  // and keeps it from the menu; Rust ignores a second toggle straight after.
-  useEventListener("keydown", (e) => {
-    if (e.code !== "KeyA" || !e.metaKey || !e.altKey || e.ctrlKey || e.shiftKey) return;
-    e.preventDefault();
-    void toggleActivity();
   });
 
   // Keyboard: ←/→ by 1, Shift by 10, Option by 100; ⌘←/⌘→ (Ctrl elsewhere)

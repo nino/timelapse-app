@@ -1,7 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it, mock, spyOn } from 'bun:test';
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 
-import * as activity from './activity';
 import { App } from './App';
 import type { DayApps } from './apps';
 import * as frames from './frames';
@@ -29,7 +28,6 @@ const getPendingFrames = spyOn(frames, 'getPendingFrames');
 const setViewerPosition = spyOn(viewerPosition, 'setViewerPosition');
 const useDayApps = spyOn(dayAppsHook, 'useDayApps');
 const useDayPreviews = spyOn(dayPreviewsHook, 'useDayPreviews');
-const toggleActivity = spyOn(activity, 'toggleActivity').mockResolvedValue(undefined);
 const getInstalledUpdate = spyOn(updates, 'getInstalledUpdate');
 const onUpdateReady = spyOn(updates, 'onUpdateReady');
 const relaunchIntoUpdate = spyOn(updates, 'relaunchIntoUpdate').mockResolvedValue(undefined);
@@ -47,7 +45,6 @@ afterAll(() => {
   getPendingFrames.mockRestore();
   useDayApps.mockRestore();
   useDayPreviews.mockRestore();
-  toggleActivity.mockRestore();
   getInstalledUpdate.mockRestore();
   onUpdateReady.mockRestore();
   relaunchIntoUpdate.mockRestore();
@@ -686,13 +683,16 @@ describe('App', () => {
       await settleFrameTime();
     });
 
-    it('toggles the Activity window on Option+Cmd+A, also from a dropdown', async () => {
+    // WebKit sends a keypress for ⌘ shortcuts and keeps a cancelled one from
+    // the menu, so a dropdown that cancelled them blocked ⌘H, ⌥⌘A and co.
+    it('leaves Cmd shortcuts to the menu while a dropdown has focus', async () => {
       mockLibrary({ '2026-10-04': 100 });
       render(<App />);
-      toggleActivity.mockClear();
-      const event = fireEvent.keyDown(dayPicker(), { key: 'å', code: 'KeyA', metaKey: true, altKey: true });
-      expect(event).toBe(false);
-      expect(toggleActivity).toHaveBeenCalledTimes(1);
+      for (const name of ['Day', 'App', 'Playback speed']) {
+        const button = screen.getByRole('button', { name });
+        expect(fireEvent.keyPress(button, { key: 'h', charCode: 104, keyCode: 104, which: 104, metaKey: true })).toBe(true);
+        expect(fireEvent.keyPress(button, { key: 'a', charCode: 97, keyCode: 97, which: 97, ctrlKey: true })).toBe(true);
+      }
       await settleFrameTime();
     });
 
