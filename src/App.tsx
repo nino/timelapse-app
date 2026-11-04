@@ -9,6 +9,7 @@ import { DayPicker } from "./DayPicker";
 import { frameUrl, getFrameTime, type FrameRange, type FrameTime, type VideoSpan } from "./frames";
 import { useDayApps } from "./hooks/useDayApps";
 import { useDayVideos } from "./hooks/useDayVideos";
+import { useDayPreviews } from "./hooks/useDayPreviews";
 import { useLatestLoad } from "./hooks/useDirectoryChanges";
 import { useEventListener } from "./hooks/useEventListener";
 import { useInstalledUpdate } from "./hooks/useInstalledUpdate";
@@ -37,6 +38,9 @@ const DEFAULT_FRAME_SIZE = { width: 1800, height: 1124 };
 // How long the viewer must stay on a frame before it is remembered for the
 // next launch, so a scrub doesn't save every frame it passes.
 const SAVE_POSITION_DELAY_MS = 500;
+// How long the scrubber must stay on a frame while dragged before the exact
+// frame is asked for; until then a preview stands in for it.
+const DRAG_PAUSE_MS = 150;
 
 export function App({
   initialPosition,
@@ -203,6 +207,31 @@ export function App({
     goTo(Math.min(frameCount - 1, Math.max(0, currentIndex + direction * step)));
   });
 
+  // While the scrubber is dragged over video, a small preview of the nearest
+  // second is shown at once, and the exact frame is only asked for once the
+  // drag pauses on a frame for DRAG_PAUSE_MS. So dragging never waits on a
+  // decode, and doesn't queue one per stretch it passes. The preview stays
+  // up after the drag ends until the exact frame has loaded.
+  const previews = useDayPreviews(day);
+  const [pointerDown, setPointerDown] = React.useState(false);
+  const [scrubbing, setScrubbing] = React.useState(false);
+  const [restingIndex, setRestingIndex] = React.useState<number | null>(null);
+  useTimeout(
+    () => setRestingIndex(currentIndex),
+    pointerDown ? DRAG_PAUSE_MS : null,
+    `${selectedDay}/${currentIndex}`,
+  );
+  useEventListener("pointerup", () => setPointerDown(false));
+  useEventListener("pointercancel", () => setPointerDown(false));
+  // A release outside the window may never arrive as a pointerup; left set,
+  // every later move would hold back the exact frame.
+  useEventListener("blur", () => setPointerDown(false));
+  const previewSrc = scrubbing ? (previews?.at(currentIndex) ?? null) : null;
+  const moving = pointerDown && restingIndex !== currentIndex;
+
+  const wantedSrc =
+    selectedDay && frameCount > 0 ? frameUrl(selectedDay, currentIndex) : null;
+
   // Beta: hours kept as video are shown by seeking a <video> of the hour
   // (`VideoFrame`) instead of asking the frame source to decode them. A video
   // the page can't play falls back to decoded frames.
@@ -233,8 +262,6 @@ export function App({
   const videoOnScreen =
     span !== null && videoShown?.day === selectedDay && videoShown.span.file === span.file;
 
-  const wantedSrc =
-    selectedDay && frameCount > 0 ? frameUrl(selectedDay, currentIndex) : null;
   const heldVideo =
     videoShown !== null && videoShown.day === selectedDay && !videoOnScreen && videoShown.span.file !== span?.file
       ? videoShown
@@ -243,6 +270,7 @@ export function App({
   // showed, underneath, until the player has a frame up.
   const { src, frameFailed, loaded, settled, onLoad, onError } = useGatedImage(
     span ? undefined : wantedSrc,
+    moving && previewSrc !== null,
   );
   // Once the <img> has settled on the wanted frame, the video's last frame
   // no longer stands in for it. Checked here rather than in `onLoad`: a
@@ -251,6 +279,13 @@ export function App({
   if (!span && videoShown !== null && wantedSrc !== null && settled === wantedSrc) {
     setVideoShown(null);
   }
+  // Released, and the exact frame is in (or failed, or the video player has
+  // it): back to frames only. Over a video hour the beta player needs no
+  // previews.
+  if (scrubbing && !pointerDown && (span !== null || settled === wantedSrc)) {
+    setScrubbing(false);
+  }
+  const showPreview = span === null && previewSrc !== null && loaded !== wantedSrc;
   const [speed, setSpeed] = React.useState<PlaybackSpeed>(savedPlaybackSpeed);
   const { playing, togglePlaying } = usePlayback({
     frameMs: 1000 / speed,
@@ -486,6 +521,16 @@ export function App({
             />
           ),
         ]}
+        {showPreview && (
+          // Same box and fitting as the frame, which it covers until the
+          // frame catches up. Upscaled from 480 wide, so softer.
+          <img
+            src={previewSrc}
+            alt=""
+            data-testid="scrub-preview"
+            className="w-full h-full object-contain absolute inset-0 pointer-events-none"
+          />
+        )}
         {highlights.length > 0 && (
           // Same box and aspect fitting as the <img>'s object-contain, so
           // normalized line boxes land on the text.
@@ -568,6 +613,11 @@ export function App({
               max={Math.max(0, frameCount - 1)}
               value={currentIndex}
               onChange={(e) => goTo(parseInt(e.target.value, 10))}
+              onPointerDown={(): void => {
+                setPointerDown(true);
+                setScrubbing(true);
+                setRestingIndex(currentIndex);
+              }}
               disabled={frameCount === 0}
               className="relative block w-full h-2 rounded-full appearance-none cursor-pointer
                          disabled:opacity-50 disabled:cursor-not-allowed"
@@ -872,9 +922,10 @@ function usePlayback({
  * start loading a frame while another
  * is still loading. Dragging the scrubber across a video day would otherwise
  * queue a decode for every chunk it passes; this way each load that finishes
- * jumps straight to wherever the scrubber is now.
+ * jumps straight to wherever the scrubber is now. While `hold` is set, no new
+ * load starts at all (a preview is standing in).
  */
-function useGatedImage(wanted: string | null | undefined): {
+function useGatedImage(wanted: string | null | undefined, hold: boolean): {
   src: string | null;
   frameFailed: boolean;
   /** The last frame that finished loading successfully. */
@@ -895,7 +946,7 @@ function useGatedImage(wanted: string | null | undefined): {
 
   // Nothing loading: show the wanted frame. Otherwise the load that finishes
   // brings this round again. `undefined` keeps the frame shown.
-  if (wanted !== undefined && !state.inFlight && wanted !== state.src) {
+  if (wanted !== undefined && !state.inFlight && !hold && wanted !== state.src) {
     setState({ ...state, src: wanted, inFlight: wanted !== null });
   }
 

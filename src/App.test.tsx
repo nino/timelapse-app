@@ -7,6 +7,7 @@ import type { DayApps } from './apps';
 import * as frames from './frames';
 import { frameUrl, videoUrl, type Day, type DayStatus } from './frames';
 import * as dayAppsHook from './hooks/useDayApps';
+import * as dayPreviewsHook from './hooks/useDayPreviews';
 import * as library from './hooks/useLibrary';
 import * as ocrSearch from './hooks/useOcrSearch';
 import type { DayCount, DayMatch, LineBox } from './search';
@@ -28,6 +29,7 @@ const useOcrVersion = spyOn(ocrSearch, 'useOcrVersion');
 const getPendingFrames = spyOn(frames, 'getPendingFrames');
 const setViewerPosition = spyOn(viewerPosition, 'setViewerPosition');
 const useDayApps = spyOn(dayAppsHook, 'useDayApps');
+const useDayPreviews = spyOn(dayPreviewsHook, 'useDayPreviews');
 const toggleActivity = spyOn(activity, 'toggleActivity').mockResolvedValue(undefined);
 const getInstalledUpdate = spyOn(updates, 'getInstalledUpdate');
 const onUpdateReady = spyOn(updates, 'onUpdateReady');
@@ -47,6 +49,7 @@ afterAll(() => {
   useOcrVersion.mockRestore();
   getPendingFrames.mockRestore();
   useDayApps.mockRestore();
+  useDayPreviews.mockRestore();
   toggleActivity.mockRestore();
   getInstalledUpdate.mockRestore();
   onUpdateReady.mockRestore();
@@ -162,6 +165,7 @@ describe('App', () => {
     setViewerPosition.mockResolvedValue(undefined);
     useDayStatuses.mockReturnValue(new Map());
     useDayApps.mockReturnValue(null);
+    useDayPreviews.mockReturnValue(null);
     getInstalledUpdate.mockResolvedValue(null);
     onUpdateReady.mockResolvedValue((): void => {});
     getSettings.mockResolvedValue({ updateAutomatically: true, sendErrorReports: false, videoPlayerBeta: false });
@@ -1032,6 +1036,85 @@ describe('App', () => {
       await waitFor(() => expect(shownFrame()).toBe(frameUrl('2026-10-01', 199)));
       expect(video()).toBeNull();
       expect(getDayVideos).not.toHaveBeenCalled();
+      await settleFrameTime();
+    });
+  });
+
+  describe('Previews while dragging', () => {
+    /** A preview for every 15th frame, named after it. */
+    function mockPreviews(): void {
+      useDayPreviews.mockReturnValue({ at: (index) => `blob:preview-${Math.round(index / 15) * 15}` });
+    }
+
+    function preview(): HTMLImageElement | null {
+      return screen.queryByTestId('scrub-preview') as HTMLImageElement | null;
+    }
+
+    function slider(): HTMLInputElement {
+      return screen.getByRole('slider') as HTMLInputElement;
+    }
+
+    function drag(to: number): void {
+      fireEvent.change(slider(), { target: { value: String(to) } });
+    }
+
+    it('shows the nearest preview while dragging and holds the exact frame back', async () => {
+      mockPreviews();
+      mockLibrary({ '2026-10-01': 300 }, 'video');
+      render(<App />);
+      await settleFrameTime();
+      finishLoading();
+      expect(shownFrame()).toBe(frameUrl('2026-10-01', 299));
+      expect(preview()).toBeNull();
+
+      fireEvent.pointerDown(slider());
+      drag(100);
+      expect(preview()?.getAttribute('src')).toBe('blob:preview-105');
+      drag(40);
+      expect(preview()?.getAttribute('src')).toBe('blob:preview-45');
+      // Still moving: no exact frame asked for.
+      expect(shownFrame()).toBe(frameUrl('2026-10-01', 299));
+
+      // Paused on a frame: the exact frame loads and replaces the preview.
+      await waitFor(() => expect(shownFrame()).toBe(frameUrl('2026-10-01', 40)));
+      expect(preview()).not.toBeNull();
+      finishLoading();
+      expect(preview()).toBeNull();
+      await settleFrameTime();
+    });
+
+    it('keeps the preview after release until the exact frame is in, then lets go', async () => {
+      mockPreviews();
+      mockLibrary({ '2026-10-01': 300 }, 'video');
+      render(<App />);
+      await settleFrameTime();
+      finishLoading();
+
+      fireEvent.pointerDown(slider());
+      drag(200);
+      fireEvent.pointerUp(window);
+      expect(shownFrame()).toBe(frameUrl('2026-10-01', 200));
+      expect(preview()?.getAttribute('src')).toBe('blob:preview-195');
+      finishLoading();
+      expect(preview()).toBeNull();
+
+      // Arrow keys after the drag show exact frames only.
+      fireEvent.keyDown(window, { key: 'ArrowLeft' });
+      expect(preview()).toBeNull();
+      await settleFrameTime();
+    });
+
+    it('drags through exact frames where there are no previews', async () => {
+      mockLibrary({ '2026-10-01': 300 });
+      render(<App />);
+      await settleFrameTime();
+      finishLoading();
+
+      fireEvent.pointerDown(slider());
+      drag(100);
+      expect(preview()).toBeNull();
+      expect(shownFrame()).toBe(frameUrl('2026-10-01', 100));
+      fireEvent.pointerUp(window);
       await settleFrameTime();
     });
   });
