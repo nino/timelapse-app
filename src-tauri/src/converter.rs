@@ -33,9 +33,10 @@
 use crate::activity::{Activity, Encoding, State};
 use crate::boost::{self, Boost};
 use crate::database::ScreenshotDatabase;
+use crate::power::on_ac_power;
 use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, TimeZone, Timelike};
 use frame_source::previews::{preview_scale, PackKind, PreviewStore, PREVIEW_QUALITY, PREVIEW_STEP};
-use frame_source::filed_at;
+use frame_source::{filed_at, parse_day, parse_screenshot_name};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -70,9 +71,6 @@ const ON_BATTERY_POLL: Duration = Duration::from_secs(60);
 /// How long to wait before looking again when there is nothing to convert
 /// during a boost, when OCR may finish an hour at any moment.
 const BOOSTED_IDLE_POLL: Duration = Duration::from_secs(30);
-
-/// How often a running encode re-checks the power source.
-const ENCODE_POWER_CHECK: Duration = Duration::from_secs(30);
 
 /// How often a running encode checks the stop flag and whether a boost
 /// started or ended.
@@ -163,65 +161,9 @@ impl std::fmt::Display for ConvertError {
     }
 }
 
-/// Whether the machine is drawing from AC power.
-///
-/// On macOS this asks `pmset`; if that fails the answer is `false`, so an
-/// unreadable power state never leads to encoding on battery. Other platforms
-/// have no battery check and always report `true`.
-pub fn on_ac_power() -> bool {
-    if cfg!(target_os = "macos") {
-        let reading = Command::new("pmset")
-            .args(["-g", "ps"])
-            .output()
-            .ok()
-            .filter(|output| output.status.success())
-            .and_then(|output| parse_pmset_power_source(&String::from_utf8_lossy(&output.stdout)));
-        log_power_change(reading);
-        reading.unwrap_or(false)
-    } else {
-        true
-    }
-}
-
-/// Log a change in the power source, or in whether it could be read at all.
-/// Several loops ask, so the last reading is shared.
-fn log_power_change(reading: Option<bool>) {
-    use std::sync::atomic::AtomicU8;
-    // 0: not read yet, 1: unreadable, 2: battery, 3: AC.
-    static LAST: AtomicU8 = AtomicU8::new(0);
-    let code = match reading {
-        None => 1,
-        Some(false) => 2,
-        Some(true) => 3,
-    };
-    if LAST.swap(code, Ordering::Relaxed) != code {
-        match reading {
-            None => crate::diagnostics::warn("power", "Could not read the power source").record(),
-            Some(false) => crate::diagnostics::info("power", "On battery").record(),
-            Some(true) => crate::diagnostics::info("power", "On AC power").record(),
-        }
-    }
-}
-
-/// Parse the first line of `pmset -g ps`, e.g. `Now drawing from 'AC Power'`.
-/// Returns `None` when the output does not name a power source.
-fn parse_pmset_power_source(output: &str) -> Option<bool> {
-    let first_line = output.lines().next()?;
-    let source = first_line.split('\'').nth(1)?;
-    Some(source == "AC Power")
-}
-
 /// Is `name` a day folder name (`YYYY-MM-DD`)?
 pub(crate) fn is_day_folder_name(name: &str) -> bool {
-    parse_day_folder_name(name).is_some()
-}
-
-/// The date of a day folder name (`YYYY-MM-DD`).
-fn parse_day_folder_name(name: &str) -> Option<NaiveDate> {
-    if name.len() != 10 {
-        return None;
-    }
-    NaiveDate::parse_from_str(name, "%Y-%m-%d").ok()
+    parse_day(name).is_some()
 }
 
 /// Whether clock hour `hour` of `date` ended, with `LATE_WRITE_GRACE_SECS`
@@ -237,11 +179,6 @@ fn hour_has_ended(date: NaiveDate, hour: u32, now: DateTime<Local>) -> bool {
         // filed in it, but fall back to wall-clock time all the same.
         None => start + chrono::Duration::hours(1) + grace <= now.naive_local(),
     }
-}
-
-/// Frame number of a screenshot file name such as `00042.png`.
-fn frame_number(file_name: &str) -> Option<u32> {
-    file_name.strip_suffix(".png")?.parse().ok()
 }
 
 /// Find every hour that is ready to convert, oldest first.
@@ -376,7 +313,7 @@ fn find_ended_hours(root: &Path, now: DateTime<Local>) -> std::io::Result<Vec<En
         .filter_map(|entry| entry.ok())
         .filter(|entry| entry.file_type().map(|t| t.is_dir()).unwrap_or(false))
         .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
-        .filter_map(|name| parse_day_folder_name(&name).map(|date| (name, date)))
+        .filter_map(|name| parse_day(&name).map(|date| (name, date)))
         .collect();
     days.sort();
 
@@ -385,7 +322,7 @@ fn find_ended_hours(root: &Path, now: DateTime<Local>) -> std::io::Result<Vec<En
 
         let mut frames: Vec<Frame> = Vec::new();
         for entry in std::fs::read_dir(&day_dir)?.filter_map(|entry| entry.ok()) {
-            let Some(number) = entry.file_name().to_str().and_then(frame_number) else {
+            let Some(number) = entry.file_name().to_str().and_then(parse_screenshot_name) else {
                 continue;
             };
             let Ok(modified) = entry.metadata().and_then(|m| m.modified()) else {
@@ -443,7 +380,7 @@ fn find_ended_hours(root: &Path, now: DateTime<Local>) -> std::io::Result<Vec<En
 pub fn remove_empty_day_folders(root: &Path, now: DateTime<Local>) -> std::io::Result<usize> {
     let mut removed = 0;
     for entry in std::fs::read_dir(root)?.filter_map(|entry| entry.ok()) {
-        let Some(date) = entry.file_name().to_str().and_then(parse_day_folder_name) else {
+        let Some(date) = entry.file_name().to_str().and_then(parse_day) else {
             continue;
         };
         // Yesterday's folder can still be about to receive the frame taken
@@ -790,7 +727,6 @@ fn encode_with_ffmpeg(
     // The child is reaped only once it has exited, after which `check` is no
     // longer called, so its pid stays its own while `check` uses it.
     let pid = child.id();
-    let mut power: Option<(Instant, bool)> = None;
     wait_or_kill(
         &RUNNING_ENCODE,
         child,
@@ -803,19 +739,8 @@ fn encode_with_ffmpeg(
             if boosted_now != boosted {
                 boosted = boosted_now;
                 set_background(pid, !boosted);
-                // Look at the power again: the boost may allow battery, or
-                // its end may forbid it.
-                power = None;
             }
-            let may_work = boost.may_work(|| match power {
-                Some((at, on_ac)) if at.elapsed() < ENCODE_POWER_CHECK => on_ac,
-                _ => {
-                    let on_ac = on_ac_power();
-                    power = Some((Instant::now(), on_ac));
-                    on_ac
-                }
-            });
-            if may_work {
+            if boost.may_work(on_ac_power) {
                 Control::Run
             } else {
                 Control::Pause
@@ -1106,18 +1031,6 @@ mod tests {
             fs::write(output, b"video").unwrap();
             Ok(())
         }
-    }
-
-    #[test]
-    fn parses_pmset_power_source() {
-        let ac = "Now drawing from 'AC Power'\n -InternalBattery-0 (id=1)\t100%; charged; 0:00 remaining present: true\n";
-        let battery = "Now drawing from 'Battery Power'\n -InternalBattery-0 (id=1)\t80%; discharging\n";
-        let ups = "Now drawing from 'UPS Power'\n";
-        assert_eq!(parse_pmset_power_source(ac), Some(true));
-        assert_eq!(parse_pmset_power_source(battery), Some(false));
-        assert_eq!(parse_pmset_power_source(ups), Some(false));
-        assert_eq!(parse_pmset_power_source(""), None);
-        assert_eq!(parse_pmset_power_source("something else"), None);
     }
 
     #[test]
