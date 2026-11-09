@@ -113,8 +113,8 @@ export function SettingsView(): React.ReactNode {
               <span>
                 <span className="font-medium">Send error reports</span>
                 <span className="mt-0.5 block text-muted-fg">
-                  Sends error messages and the app version to the developer, to help fix bugs. Never your
-                  screenshots, their text or window titles.
+                  Sends error messages, the app version and how far behind background work is to the
+                  developer, to help fix bugs. Never your screenshots, their text or window titles.
                 </span>
               </span>
             </label>

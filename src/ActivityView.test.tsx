@@ -164,7 +164,7 @@ describe('ActivityView', () => {
     );
     render(<ActivityView />);
 
-    await waitFor(() => expect(screen.getByTestId('Power-headline')).toHaveTextContent('On battery, waiting to be plugged in'));
+    await waitFor(() => expect(screen.getByTestId('Power-headline')).toHaveTextContent('On battery, videos wait to be plugged in'));
     expect(screen.getByTestId('Video conversion-headline')).toHaveTextContent('Paused on battery; next check in 45s');
     expect(screen.getByTestId('OCR-headline')).toHaveTextContent('Paused on battery; next check in 3m 20s');
   });

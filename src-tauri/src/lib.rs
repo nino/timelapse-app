@@ -9,6 +9,7 @@
 mod activity;
 mod analytics;
 mod app_state;
+mod backlog;
 mod boost;
 mod converter;
 mod day_status;
@@ -1260,6 +1261,7 @@ pub fn run() {
                         .with_previews(converter_previews)
                         .start();
 
+                        backlog::start(root.clone(), Arc::clone(&activity), Arc::clone(&boost));
                         if ocr::start_background_ocr(root, ocr_dir, activity, boost) {
                             println!("OCR started");
                         } else {
