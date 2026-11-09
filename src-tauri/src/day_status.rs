@@ -100,12 +100,43 @@ pub fn remaining_work(
     db: Option<&ScreenshotDatabase>,
     video_frames_left: Option<&HashMap<String, u64>>,
 ) -> std::io::Result<RemainingWork> {
+    remaining_work_and_oldest(root, db, video_frames_left).map(|(work, _)| work)
+}
+
+/// The oldest screenshot each job still has to do, as `(day, frame number)`,
+/// for how far behind it is (`backlog.rs`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Oldest {
+    /// The oldest screenshot OCR hasn't read. Days that only exist as video
+    /// don't count: nothing waits on them.
+    pub ocr: Option<(String, u32)>,
+    /// The oldest screenshot not yet in a video.
+    pub video: Option<(String, u32)>,
+}
+
+/// `remaining_work`, and the oldest screenshot each job still has to do.
+pub fn remaining_work_and_oldest(
+    root: &Path,
+    db: Option<&ScreenshotDatabase>,
+    video_frames_left: Option<&HashMap<String, u64>>,
+) -> std::io::Result<(RemainingWork, Oldest)> {
     let (progress, days) = scan(root, db)?;
     let mut work = RemainingWork::default();
+    let mut oldest = Oldest::default();
     for (date, folder) in &days {
-        if !folder.screenshots.is_empty() {
+        if let Some(first) = folder.screenshots.iter().copied().min() {
             work.video.days += 1;
             work.video.frames += folder.screenshots.len() as u64;
+            oldest.video.get_or_insert_with(|| (date.clone(), first));
+        }
+        if oldest.ocr.is_none() {
+            let done = match progress.get(date) {
+                Some((OcrProgress::FrameNumber(done), _, _)) => *done,
+                _ => 0,
+            };
+            if let Some(first) = folder.screenshots.iter().copied().filter(|&n| n > done).min() {
+                oldest.ocr = Some((date.clone(), first));
+            }
         }
         if ocr_stage(date, folder, &progress, db) == Stage::Done {
             continue;
@@ -126,7 +157,7 @@ pub fn remaining_work(
             None => work.ocr.uncounted_days += 1,
         }
     }
-    Ok(work)
+    Ok((work, oldest))
 }
 
 /// Every day in `root` that has frames, oldest first, with what its folder
@@ -368,6 +399,17 @@ mod tests {
         );
         // Before OCR has counted any old video.
         assert_eq!(remaining_work(root, Some(&db), None).unwrap().ocr.uncounted_days, 2);
+
+        // OCR's oldest unread screenshot is today's second; the oldest
+        // screenshot still waiting for a video is 2026-10-02's first.
+        let (_, oldest) = remaining_work_and_oldest(root, Some(&db), None).unwrap();
+        assert_eq!(
+            oldest,
+            Oldest {
+                ocr: Some(("2026-10-03".to_string(), 2)),
+                video: Some(("2026-10-02".to_string(), 3601)),
+            }
+        );
     }
 
     #[test]

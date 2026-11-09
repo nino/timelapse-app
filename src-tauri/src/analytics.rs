@@ -8,11 +8,13 @@
 //! PostHog project key is public); dev builds, tests and local `tauri build`s
 //! never do.
 //!
-//! What is sent: "app started" with the version, OS and architecture, and
+//! What is sent: "app started" with the version, OS and architecture,
 //! every error the diagnostics log records (`diagnostics::Level::Error`:
 //! background failures, panics and the page's uncaught errors), as a PostHog
 //! exception with its source and message (home folder replaced by `~`,
-//! capped at `MAX_MESSAGE` characters). Nothing from the library leaves the
+//! capped at `MAX_MESSAGE` characters), and once an hour a "backlog" event
+//! with how far behind OCR and video conversion are (`backlog.rs`: counts,
+//! ages and the power state). Nothing from the library leaves the
 //! machine: no frames, no OCR text, no window titles. Events carry a random id,
 //! made on the first send and kept in the config directory until reports are
 //! turned off, and create no person profile.

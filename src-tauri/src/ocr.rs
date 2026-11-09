@@ -4,9 +4,12 @@
 //! recognition on each PNG whose screen has changed since the last frame it
 //! read, stores the text in `screenshots.db` for full-text search, and moves
 //! that day's progress mark forward (see `ScreenshotDatabase::record_ocr_frame`).
-//! It only works while the machine is on AC power (or during a boost that
-//! allows battery, see `boost.rs`), like the video converter, and the converter in turn only converts and deletes PNGs that the progress
-//! mark covers (`ocr_check`).
+//! On battery it still reads new screenshots, at background priority and in
+//! a batch every few minutes, so the converter (which only encodes on AC
+//! power) finds them read once the Mac is plugged in; everything else waits
+//! for AC power or a boost that allows battery (see `boost.rs`). Low-power
+//! mode stops it altogether. The converter only converts and deletes PNGs
+//! that the progress mark covers (`ocr_check`).
 //!
 //! Days that only exist as video (the old script's whole-day videos, whose
 //! screenshots were deleted before OCR existed) are read from the videos
@@ -45,7 +48,8 @@ const IDLE_SLEEP: Duration = Duration::from_secs(60);
 /// A pass at least this long is logged on its own (`log_pass`).
 const LONG_PASS: Duration = Duration::from_secs(60);
 
-/// How long to wait before re-checking the power source while on battery.
+/// How long to wait before looking for new screenshots again while on
+/// battery.
 const BATTERY_SLEEP: Duration = Duration::from_secs(5 * 60);
 
 /// How many frames to read between power-source checks. At 0.1–0.3 s for an
@@ -1155,6 +1159,31 @@ fn set_thread_priority(boosted: bool) {
     let _ = boosted;
 }
 
+/// How much OCR may do right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Allowed {
+    /// Everything: new screenshots, then days that only exist as video.
+    All,
+    /// On battery: new screenshots only, at background priority with one
+    /// recognizer, so that the converter can start as soon as the Mac is
+    /// plugged in instead of waiting for OCR to catch up first.
+    ScreenshotsOnly,
+    /// Nothing, in low-power mode.
+    Nothing,
+}
+
+/// What `boost` and the power source allow. Only asks `on_ac_power` when
+/// that decides it.
+fn allowed(boost: &Boost, on_ac_power: impl FnOnce() -> bool) -> Allowed {
+    if boost.may_work(on_ac_power) {
+        Allowed::All
+    } else if boost.is_low_power() {
+        Allowed::Nothing
+    } else {
+        Allowed::ScreenshotsOnly
+    }
+}
+
 fn run_forever(worker: &mut OcrWorker, boost: &Boost) {
     let activity = Arc::clone(&worker.activity);
     let recognizers = worker.recognizers();
@@ -1166,37 +1195,49 @@ fn run_forever(worker: &mut OcrWorker, boost: &Boost) {
     let mut boosted = false;
     let mut tally = crate::diagnostics::Tally::new("ocr");
     // Asked before each pass and every `FRAMES_PER_POWER_CHECK` frames, so a
-    // boost's start and end reach a pass in progress within seconds.
-    let mut keep_going = || {
-        if boost.is_on() != boosted {
-            boosted = !boosted;
+    // boost's start and end, and the power source changing, reach a pass in
+    // progress within seconds. A boost that waits for AC power doesn't boost
+    // OCR on battery.
+    let mut may_go = |need: Allowed| {
+        let now = allowed(boost, on_ac_power);
+        let boost_now = boost.is_on() && now == Allowed::All;
+        if boost_now != boosted {
+            boosted = boost_now;
             set_thread_priority(boosted);
             recognizers.store(if boosted { BOOSTED_RECOGNIZERS } else { 1 }, Ordering::Relaxed);
         }
-        boost.may_work(on_ac_power)
+        match need {
+            Allowed::All => now == Allowed::All,
+            _ => now != Allowed::Nothing,
+        }
     };
     loop {
-        if !keep_going() {
-            if let Some(left) = boost.low_power_left() {
-                sleep(State::LowPower, left);
-                continue;
-            }
-            let wait = if boost.is_on() { crate::boost::BOOSTED_POWER_POLL } else { BATTERY_SLEEP };
-            sleep(State::OnBattery, wait);
+        if !may_go(Allowed::ScreenshotsOnly) {
+            let left = boost.low_power_left().unwrap_or(BATTERY_SLEEP);
+            sleep(State::LowPower, left);
             continue;
         }
+        let on_battery = !may_go(Allowed::All);
 
         // New screenshots first: the converter is waiting on them.
         let started = Instant::now();
-        let screenshots = worker.run_pass(SystemTime::now(), usize::MAX, &mut keep_going);
+        let screenshots = worker.run_pass(SystemTime::now(), usize::MAX, &mut || may_go(Allowed::ScreenshotsOnly));
         let result = match screenshots {
-            Ok(summary) if summary.handled() == 0 && !summary.stalled => worker
-                .run_video_pass(VIDEO_FRAMES_PER_PASS, &mut keep_going)
+            Ok(summary) if summary.handled() == 0 && !summary.stalled && !on_battery => worker
+                .run_video_pass(VIDEO_FRAMES_PER_PASS, &mut || may_go(Allowed::All))
                 .map(|summary| ("video frames", summary)),
             Ok(summary) => Ok(("screenshots", summary)),
             Err(error) => Err(error.to_string()),
         };
         let took = started.elapsed();
+        // On battery, new screenshots are read in a batch every few minutes
+        // rather than every minute, which wakes the CPU less often. A boost
+        // waiting for AC power looks sooner, so plugging in starts it.
+        let idle = match (on_battery, boost.is_on()) {
+            (false, _) => IDLE_SLEEP,
+            (true, false) => BATTERY_SLEEP,
+            (true, true) => crate::boost::BOOSTED_POWER_POLL,
+        };
         match result {
             Ok((kind, summary)) if summary.handled() > 0 || summary.stalled => {
                 println!(
@@ -1213,11 +1254,11 @@ fn run_forever(worker: &mut OcrWorker, boost: &Boost) {
             }
             Ok(_) => {
                 tally.report_if_due();
-                sleep(State::Idle, IDLE_SLEEP)
+                sleep(State::Idle, idle)
             }
             Err(error) => {
                 activity.ocr_failed(format!("Pass failed: {}", error));
-                sleep(State::Idle, IDLE_SLEEP);
+                sleep(State::Idle, idle);
             }
         }
     }
@@ -1414,6 +1455,21 @@ mod tests {
 
     const DAY_1: &str = "2024-01-01";
     const DAY_2: &str = "2024-01-02";
+
+    #[test]
+    fn on_battery_ocr_reads_screenshots_only() {
+        let boost = Boost::default();
+        assert_eq!(allowed(&boost, || true), Allowed::All);
+        assert_eq!(allowed(&boost, || false), Allowed::ScreenshotsOnly);
+
+        boost.start(Duration::from_secs(60), false);
+        assert_eq!(allowed(&boost, || false), Allowed::ScreenshotsOnly, "a boost that waits for AC power");
+        boost.set_allow_battery(true);
+        assert_eq!(allowed(&boost, || false), Allowed::All);
+
+        boost.start_low_power(Duration::from_secs(60));
+        assert_eq!(allowed(&boost, || true), Allowed::Nothing);
+    }
 
     /// Returns one line naming the file it was given, and remembers the call.
     struct FakeRecognizer {

@@ -2,9 +2,10 @@
 //!
 //! Normally both run at background priority (ffmpeg under `taskpolicy -b`,
 //! the OCR thread at the background QoS class), batches start at most every
-//! ten minutes, and nothing runs on battery. While a boost is on, ffmpeg and
-//! OCR run at normal priority, batches follow each other straight away, and,
-//! if the boost allows it, they also run on battery.
+//! ten minutes, and on battery only OCR of new screenshots runs (`ocr.rs`).
+//! While a boost is on, ffmpeg and OCR run at normal priority, batches
+//! follow each other straight away, and, if the boost allows it, they also
+//! run at full speed on battery.
 //!
 //! Low-power mode is the opposite: for a while, conversion and OCR don't run
 //! at all, even on AC power, and a running encode is paused as it is on
