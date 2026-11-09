@@ -14,6 +14,7 @@ Each module's `//!` doc comment says how it works; this file is the map and the 
 - `previews.rs` — builds the packs old videos lack, one at a time at background priority and only while conversion may run: the open day first, outward from the viewer, then the rest of the library until the store is nearly full.
 - `day_status.rs` — how far OCR and video conversion have got with each day (not started, partly done, done), for the day picker, and how many days and frames each has left, for the Activity window; from directory listings, `ocr_progress` and OCR's own count of video-only days, never by probing a video.
 - `day_apps.rs` — which app was in front across a day (recorded window, else the OCR'd menu bar), as scrubber stretches for the app filter.
+- `power.rs` — whether the machine is on AC power, one `pmset` reading shared by every loop and reused for 10 s.
 - `activity.rs`, `boost.rs` — what the Activity window shows, and Boost / Low power mode, which change how hard conversion and OCR may work.
 - `backlog.rs` — logs once an hour how far behind OCR and video conversion are (frames left, age of the oldest screenshot each still has to do).
 - `diagnostics.rs` — `<library>/diagnostics.db`, a log for Nino to upload when something looks wrong.
@@ -31,7 +32,7 @@ All in `screenshots.db`, keyed by `(day, frame_number)`:
 
 ## Things to know before changing behaviour
 
-- **Filename format is load-bearing.** Screenshots are `NNNNN.png` (5-digit, zero-padded). `next_filename` returns the day folder's highest number plus one, and the frame source parses the same format (`parse_screenshot_name`). If you change one, change both. Numbering has gaps (old black frames, files removed by hand), so nothing may assume it is contiguous; the converter hard-links frames into a gapless sequence for ffmpeg.
+- **Filename format is load-bearing.** Screenshots are `NNNNN.png` (5-digit, zero-padded). `next_filename` returns the day folder's highest number plus one, and everything else that reads the format (the frame source, the converter, OCR) uses `frame_source::parse_screenshot_name`. If you change one, change both. `next_filename` also counts `.jpg` names, so a leftover JPEG never has its number reused. Numbering has gaps (old black frames, files removed by hand), so nothing may assume it is contiguous; the converter hard-links frames into a gapless sequence for ffmpeg.
 - **All-black frames are never written.** A black frame is dropped before it is saved, and its number is reused by the next capture.
 - **Write files atomically.** A frame is saved to `.NNNNN.png.tmp` and renamed into place; a video is renamed into the library root only once complete; a decoded chunk is staged in `.<chunk>.partial/`; a preview pack is written to `.<name>.<n>.tmp`. Temp names are dotfiles with other extensions, so nothing that lists frames or videos picks them up.
 - **Videos are a day source, not a separate list.** `library::parse_video_name` (frame-source) knows the two name formats, hourly (`YYYY-MM-DD--HH-MM-SS--hourly[-N].mov`, named after the first frame's time) and the old script's whole-day ones (named after the capture day and when the script ran, so not a start time). Anything new that writes videos must use one of them.

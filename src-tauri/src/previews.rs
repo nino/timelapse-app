@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use frame_source::{FrameSource, PackKind};
 
 use crate::boost::Boost;
-use crate::converter::on_ac_power;
+use crate::power::on_ac_power;
 
 /// How long to wait before looking again when nothing is missing, unless
 /// the viewer opens another day first.
@@ -25,10 +25,6 @@ const IDLE_POLL: Duration = Duration::from_secs(10 * 60);
 
 /// How long to wait before looking at the power again when it says no.
 const ON_BATTERY_POLL: Duration = Duration::from_secs(60);
-
-/// How long a power reading is trusted between packs, which can take a
-/// fraction of a second each.
-const POWER_CHECK: Duration = Duration::from_secs(30);
 
 /// Start the builder. `on_built` is called with the day after each pack, so
 /// the viewer can load it.
@@ -44,21 +40,11 @@ pub fn start(source: Arc<FrameSource>, boost: Arc<Boost>, on_built: impl Fn(&str
 fn run(source: &FrameSource, boost: &Boost, on_built: &dyn Fn(&str)) {
     // Packs that failed this run, so a broken video isn't retried forever.
     let mut failed: HashSet<(PathBuf, PackKind)> = HashSet::new();
-    let mut power: Option<(Instant, bool)> = None;
     let mut seen_viewer = 0;
     loop {
-        let may_work = boost.may_work(|| match power {
-            Some((at, on_ac)) if at.elapsed() < POWER_CHECK => on_ac,
-            _ => {
-                let on_ac = on_ac_power();
-                power = Some((Instant::now(), on_ac));
-                on_ac
-            }
-        });
-        if !may_work {
+        if !boost.may_work(on_ac_power) {
             // A boost or Low power mode starting or ending wakes this early.
             boost.sleep(ON_BATTERY_POLL);
-            power = None;
             continue;
         }
         let job = source.next_preview_job(&|job| failed.contains(&(job.video.clone(), job.kind)));

@@ -24,6 +24,7 @@ mod ocr_helper;
 mod ocr_readahead;
 mod ocr_tiles;
 mod paths;
+mod power;
 mod previews;
 mod settings;
 mod updater;
@@ -491,7 +492,7 @@ async fn get_activity(
     let low_power_until = boost.low_power_until();
     let boost = boost.status();
     run_blocking(move || {
-        let mut snapshot = activity.snapshot(capturing, converter::on_ac_power);
+        let mut snapshot = activity.snapshot(capturing, power::on_ac_power);
         snapshot.boost = boost;
         snapshot.low_power_until = low_power_until;
         Ok(snapshot)

@@ -38,7 +38,7 @@ use cache::ChunkCache;
 use gate::Gate;
 use library::{Shot, VideoFile, VideoKind};
 pub use previews::{PackKind, PreviewStore};
-pub use library::{filed_at, parse_screenshot_name, parse_video_name};
+pub use library::{filed_at, parse_day, parse_screenshot_name, parse_video_name};
 use read_ahead::ReadAhead;
 pub use video::{RawFrame, Tools};
 use video::{Priority, VideoInfo};

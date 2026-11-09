@@ -30,10 +30,11 @@
 
 use crate::activity::{Activity, State};
 use crate::boost::Boost;
-use crate::converter::{is_day_folder_name, on_ac_power, OcrCheck, HourBatch};
+use crate::converter::{is_day_folder_name, OcrCheck, HourBatch};
+use crate::power::on_ac_power;
 use crate::database::{DayOcrProgress, LineBox, OcrProgress, ScreenshotDatabase};
 use crate::ocr_readahead::ReadAhead;
-use frame_source::{DayVideo, FrameSource, RawFrame};
+use frame_source::{parse_screenshot_name, DayVideo, FrameSource, RawFrame};
 use image::{imageops, GrayImage};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -219,11 +220,6 @@ pub fn ocr_check(root: &Path) -> OcrCheck {
             .map(|db| ocr_covers(&db, &batch.day, frame_numbers))
             .unwrap_or(false)
     })
-}
-
-/// The number in an `NNNNN.png` path.
-fn frame_number(path: &Path) -> Option<u32> {
-    path.file_name()?.to_str()?.strip_suffix(".png")?.parse().ok()
 }
 
 /// A greyscale thumbnail used to decide whether the screen changed.
@@ -1334,7 +1330,7 @@ fn day_folders(root: &Path) -> std::io::Result<Vec<String>> {
 fn frames_after(day_dir: &Path, done_through: u32) -> std::io::Result<Vec<(u32, PathBuf)>> {
     let mut frames: Vec<(u32, PathBuf)> = std::fs::read_dir(day_dir)?
         .filter_map(|entry| entry.ok())
-        .filter_map(|entry| Some((frame_number(&entry.path())?, entry.path())))
+        .filter_map(|entry| Some((parse_screenshot_name(entry.file_name().to_str()?)?, entry.path())))
         .filter(|(number, _)| *number > done_through)
         .collect();
     frames.sort();
