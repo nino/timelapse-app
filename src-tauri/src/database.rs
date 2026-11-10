@@ -232,9 +232,8 @@ impl ScreenshotDatabase {
 
         // Write-ahead log, so readers and the writer never wait on each other
         // and a commit appends to the log without syncing the disk; only the
-        // checkpoints that copy the log back into the file sync it. Kept in
-        // the file, so this only changes something the first time.
-        conn.query_row("PRAGMA journal_mode = WAL", [], |row| row.get::<_, String>(0))?;
+        // checkpoints that copy the log back into the file sync it.
+        Self::use_write_ahead_log(&conn)?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
 
         // Create migrations table if it doesn't exist
@@ -269,6 +268,32 @@ impl ScreenshotDatabase {
         }
 
         Ok(Self { conn })
+    }
+
+    /// Switch the file to the write-ahead log. The mode is kept in the file,
+    /// so this only changes something on the first open after an upgrade.
+    ///
+    /// Switching needs every other connection out of the file, and SQLite
+    /// answers "busy" at once instead of calling the busy handler, so several
+    /// connections opening an old file together (as at app launch) retry here
+    /// for up to `LOCK_WAIT`.
+    fn use_write_ahead_log(conn: &Connection) -> Result<()> {
+        let started = Instant::now();
+        loop {
+            let mode: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+            if mode.eq_ignore_ascii_case("wal") {
+                return Ok(());
+            }
+            match conn.query_row("PRAGMA journal_mode = WAL", [], |row| row.get::<_, String>(0)) {
+                Ok(_) => {}
+                Err(rusqlite::Error::SqliteFailure(e, _))
+                    if e.code == rusqlite::ErrorCode::DatabaseBusy && started.elapsed() < LOCK_WAIT =>
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     /// Run all pending migrations. Returns whether the file should be
