@@ -556,8 +556,8 @@ pub fn convert_batch(
     result
 }
 
-/// The ffmpeg invocation from `timelapse-to-video`, plus a shorter keyframe
-/// interval, reading `frames_dir` and writing `output`, under the background
+/// The ffmpeg invocation from `timelapse-to-video`, with a faster preset and
+/// a shorter keyframe interval, reading `frames_dir` and writing `output`, under the background
 /// policy if `background`. The same run writes every `PREVIEW_STEP`-th frame
 /// as a small JPEG into `frames_dir/previews/`, which costs little next to
 /// the x265 encode because the frames are already decoded.
@@ -581,7 +581,12 @@ fn ffmpeg_command(frames_dir: &Path, output: &Path, background: bool) -> Command
         .args(["-y", "-loglevel", "error", "-nostats", "-progress", "pipe:1"])
         .args(["-framerate", FRAMERATE, "-i"])
         .arg(frames_dir.join("%05d.png"))
-        .args(["-c:v", "libx265", "-crf", "28", "-preset", "veryslow"])
+        // `slower` rather than the script's `veryslow`: at background
+        // priority a `veryslow` encode took about an hour per hour of
+        // screenshots, so a backlog never shrank (the hourly backlog log,
+        // November 2026). On a synthetic text-scrolling test `slower` took
+        // 28% less time for a file 0.5% bigger.
+        .args(["-c:v", "libx265", "-crf", "28", "-preset", "slower"])
         // A keyframe every 2 s instead of x265's default of about every
         // 17 s: showing a frame that isn't cached decodes from the keyframe
         // before it, so this caps that at 30 frames. Measured on one of
