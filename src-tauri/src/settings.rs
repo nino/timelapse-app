@@ -17,6 +17,9 @@ pub struct Settings {
     /// Send errors and an "app started" event to PostHog (`analytics.rs`).
     /// Off unless someone turns it on.
     pub send_error_reports: bool,
+    /// Beta: show hours kept as video by playing the video file in the
+    /// page, seeking to each frame, instead of decoding frames with ffmpeg.
+    pub video_player_beta: bool,
 }
 
 impl Default for Settings {
@@ -24,6 +27,7 @@ impl Default for Settings {
         Settings {
             update_automatically: true,
             send_error_reports: false,
+            video_player_beta: false,
         }
     }
 }
@@ -95,6 +99,8 @@ mod tests {
         assert!(store.get().update_automatically);
         // Error reports are opt-in.
         assert!(!store.get().send_error_reports);
+        // Betas too.
+        assert!(!store.get().video_player_beta);
     }
 
     #[test]

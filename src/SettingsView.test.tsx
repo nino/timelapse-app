@@ -90,4 +90,19 @@ describe('SettingsView', () => {
     expect(box).toBeChecked();
     expect(invoke).toHaveBeenCalledWith('set_send_error_reports', { enabled: true });
   });
+
+  it('turns the beta video player on and off', async () => {
+    const saved = { updateAutomatically: true, sendErrorReports: false, videoPlayerBeta: false };
+    answer(async (cmd, args) =>
+      cmd === 'get_settings' ? saved : { ...saved, videoPlayerBeta: (args as { enabled: boolean }).enabled },
+    );
+    render(<SettingsView />);
+
+    const box = await screen.findByRole('checkbox', { name: /Play videos in the viewer/ });
+    expect(box).not.toBeChecked();
+    fireEvent.click(box);
+
+    expect(box).toBeChecked();
+    expect(invoke).toHaveBeenCalledWith('set_video_player_beta', { enabled: true });
+  });
 });

@@ -1,0 +1,151 @@
+import { describe, expect, it } from "bun:test";
+
+import { VideoSeeker, type SeekableVideo } from "./videoSeeker";
+
+const FPS = 15;
+
+/** A paused video that finishes each seek when the test says so. */
+class FakeVideo implements SeekableVideo {
+  private time = 0;
+  readyState = 1;
+  seeking = false;
+  isConnected = true;
+  /** The frame each seek asked for. */
+  seeks: Array<number> = [];
+  private listeners = new Map<string, Array<() => void>>();
+  frameCallbacks: Array<(now: number, metadata: { mediaTime: number }) => void> = [];
+
+  private readonly withFrameCallback: boolean;
+
+  constructor(withFrameCallback = true) {
+    this.withFrameCallback = withFrameCallback;
+  }
+
+  get currentTime(): number {
+    return this.time;
+  }
+
+  set currentTime(time: number) {
+    this.seeks.push(Math.floor(time * FPS));
+    this.time = time;
+    this.seeking = true;
+  }
+
+  get requestVideoFrameCallback():
+    | ((callback: (now: number, metadata: { mediaTime: number }) => void) => number)
+    | undefined {
+    if (!this.withFrameCallback) return undefined;
+    return (callback): number => this.frameCallbacks.push(callback);
+  }
+
+  addEventListener(type: string, listener: () => void): void {
+    this.listeners.set(type, [...(this.listeners.get(type) ?? []), listener]);
+  }
+
+  /** The running seek finishes: `seeked`, then the new frame is presented. */
+  land(): void {
+    this.seeking = false;
+    this.emit("seeked");
+    const callbacks = this.frameCallbacks;
+    this.frameCallbacks = [];
+    const mediaTime = Math.floor(this.time * FPS) / FPS;
+    for (const callback of callbacks) callback(0, { mediaTime });
+  }
+
+  emit(type: string): void {
+    for (const listener of this.listeners.get(type) ?? []) listener();
+  }
+}
+
+function setup(withFrameCallback = true): {
+  video: FakeVideo;
+  seeker: VideoSeeker;
+  shown: Array<[number, number]>;
+} {
+  const video = new FakeVideo(withFrameCallback);
+  const shown: Array<[number, number]> = [];
+  const seeker = new VideoSeeker(
+    video,
+    FPS,
+    { onShown: (wanted, frame): void => void shown.push([wanted, frame]) },
+  );
+  return { video, seeker, shown };
+}
+
+describe("VideoSeeker", () => {
+  it("seeks exactly to the middle of a frame and reports what was shown", () => {
+    const { video, seeker, shown } = setup();
+    seeker.want(100);
+    expect(video.seeks).toEqual([100]);
+    expect(video.currentTime).toBeCloseTo(100.5 / FPS);
+    video.land();
+    expect(shown).toEqual([[100, 100]]);
+  });
+
+  it("runs one seek at a time and then goes to the latest frame asked for", () => {
+    const { video, seeker, shown } = setup();
+    seeker.want(10);
+    seeker.want(11);
+    seeker.want(12);
+    expect(video.seeks).toHaveLength(1);
+    video.land();
+    expect(shown).toEqual([[10, 10]]);
+    expect(video.seeks).toEqual([10, 12]);
+    video.land();
+    expect(shown).toEqual([[10, 10], [12, 12]]);
+  });
+
+  it("waits for the video's metadata before seeking", () => {
+    const { video, seeker, shown } = setup();
+    video.readyState = 0;
+    seeker.want(42);
+    expect(video.seeks).toHaveLength(0);
+    video.readyState = 1;
+    video.emit("loadedmetadata");
+    expect(video.seeks).toEqual([42]);
+    video.land();
+    expect(shown).toEqual([[42, 42]]);
+  });
+
+  it("ignores a frame presented while the seek is still running", () => {
+    const { video, seeker, shown } = setup();
+    seeker.want(300);
+    // The page shows the video's first frame before the seek gets anywhere.
+    video.seeking = true;
+    for (const callback of video.frameCallbacks.splice(0)) callback(0, { mediaTime: 0 });
+    expect(shown).toEqual([]);
+    video.land();
+    expect(shown).toEqual([[300, 300]]);
+  });
+
+  it("finishes a seek that presents no new frame even when asked for more meanwhile", async () => {
+    const { video, seeker, shown } = setup();
+    seeker.want(10);
+    // `seeked` comes, but the frame callback never does.
+    video.seeking = false;
+    video.emit("seeked");
+    seeker.want(20);
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    expect(shown).toEqual([[10, 10]]);
+    expect(video.seeks).toEqual([10, 20]);
+  });
+
+  it("uses seeked and currentTime where there is no frame callback", () => {
+    const { video, seeker, shown } = setup(false);
+    seeker.want(77);
+    video.land();
+    expect(shown).toEqual([[77, 77]]);
+  });
+
+  it("reports at once when the frame asked for is already shown", () => {
+    const { video, seeker, shown } = setup();
+    seeker.want(5);
+    video.land();
+    seeker.want(6);
+    video.land();
+    seeker.want(5);
+    video.land();
+    expect(shown).toEqual([[5, 5], [6, 6], [5, 5]]);
+    expect(video.seeks).toHaveLength(3);
+  });
+});

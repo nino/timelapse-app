@@ -1,13 +1,14 @@
 import { Popover, PopoverButton, PopoverPanel } from "@headlessui/react";
 import React from "react";
 
-import { toggleActivity } from "./activity";
 import "./App.css";
 import { AppPicker } from "./AppPicker";
 import { mergeCloseRanges, nextInRanges } from "./apps";
 import { DayPicker } from "./DayPicker";
-import { frameUrl, getFrameTime, type FrameRange, type FrameTime } from "./frames";
+import { frameUrl, getFrameTime, type FrameRange, type FrameTime, type VideoSpan } from "./frames";
 import { useDayApps } from "./hooks/useDayApps";
+import { useDayVideos } from "./hooks/useDayVideos";
+import { useDayPreviews } from "./hooks/useDayPreviews";
 import { useLatestLoad } from "./hooks/useDirectoryChanges";
 import { useEventListener } from "./hooks/useEventListener";
 import { useInstalledUpdate } from "./hooks/useInstalledUpdate";
@@ -19,12 +20,14 @@ import {
   useOcrVersion,
 } from "./hooks/useOcrSearch";
 import { usePendingFrames } from "./hooks/usePendingFrames";
+import { useSettings } from "./hooks/useSettings";
 import { useTimeout } from "./hooks/useTimeout";
 import { PendingStretches } from "./PendingStretches";
 import { nextStop, previousStop, rangeAt, toStops, type DayMatch, type Stop } from "./search";
 import { savedPlaybackSpeed, savePlaybackSpeed, SpeedPicker, type PlaybackSpeed } from "./SpeedPicker";
-import { fieldFrame, focusRing, segmentButton } from "./ui";
+import { fieldFrame, focusRing, menuItem, menuPanel, segmentButton } from "./ui";
 import { relaunchIntoUpdate } from "./updates";
+import { VideoFrame } from "./VideoFrame";
 import { setViewerPosition, type ViewerPosition } from "./viewerPosition";
 
 // How many other days the find bar names before folding the rest away.
@@ -34,6 +37,9 @@ const DEFAULT_FRAME_SIZE = { width: 1800, height: 1124 };
 // How long the viewer must stay on a frame before it is remembered for the
 // next launch, so a scrub doesn't save every frame it passes.
 const SAVE_POSITION_DELAY_MS = 500;
+// How long the scrubber must stay on a frame while dragged before the exact
+// frame is asked for; until then a preview stands in for it.
+const DRAG_PAUSE_MS = 150;
 
 export function App({
   initialPosition,
@@ -165,15 +171,6 @@ export function App({
     findInput.current?.select();
   });
 
-  // ⌥⌘A toggles the Activity window. That is the menu's shortcut, but it
-  // didn't reach the menu while a dropdown had focus, so the page handles it
-  // and keeps it from the menu; Rust ignores a second toggle straight after.
-  useEventListener("keydown", (e) => {
-    if (e.code !== "KeyA" || !e.metaKey || !e.altKey || e.ctrlKey || e.shiftKey) return;
-    e.preventDefault();
-    void toggleActivity();
-  });
-
   // Keyboard: ←/→ by 1, Shift by 10, Option by 100; ⌘←/⌘→ (Ctrl elsewhere)
   // to the previous/next day.
   useEventListener("keydown", (e) => {
@@ -200,9 +197,85 @@ export function App({
     goTo(Math.min(frameCount - 1, Math.max(0, currentIndex + direction * step)));
   });
 
+  // While the scrubber is dragged over video, a small preview of the nearest
+  // second is shown at once, and the exact frame is only asked for once the
+  // drag pauses on a frame for DRAG_PAUSE_MS. So dragging never waits on a
+  // decode, and doesn't queue one per stretch it passes. The preview stays
+  // up after the drag ends until the exact frame has loaded.
+  const previews = useDayPreviews(day);
+  const [pointerDown, setPointerDown] = React.useState(false);
+  const [scrubbing, setScrubbing] = React.useState(false);
+  const [restingIndex, setRestingIndex] = React.useState<number | null>(null);
+  useTimeout(
+    () => setRestingIndex(currentIndex),
+    pointerDown ? DRAG_PAUSE_MS : null,
+    `${selectedDay}/${currentIndex}`,
+  );
+  useEventListener("pointerup", () => setPointerDown(false));
+  useEventListener("pointercancel", () => setPointerDown(false));
+  // A release outside the window may never arrive as a pointerup; left set,
+  // every later move would hold back the exact frame.
+  useEventListener("blur", () => setPointerDown(false));
+  const previewSrc = scrubbing ? (previews?.at(currentIndex) ?? null) : null;
+  const moving = pointerDown && restingIndex !== currentIndex;
+
   const wantedSrc =
     selectedDay && frameCount > 0 ? frameUrl(selectedDay, currentIndex) : null;
-  const { src, frameFailed, loaded, settled, onLoad, onError } = useGatedImage(wantedSrc);
+
+  // Beta: hours kept as video are shown by seeking a <video> of the hour
+  // (`VideoFrame`) instead of asking the frame source to decode them. A video
+  // the page can't play falls back to decoded frames.
+  const settings = useSettings();
+  const videoPlayer = settings?.videoPlayerBeta === true;
+  const dayVideos = useDayVideos(videoPlayer ? day : null);
+  const [failedVideos, setFailedVideos] = React.useState<ReadonlySet<string>>(() => new Set());
+  const videoSpan =
+    dayVideos?.spans.find(
+      (span) => span.start <= currentIndex && currentIndex < span.end && span.end <= frameCount,
+    ) ?? null;
+  const span = videoSpan && !failedVideos.has(videoSpan.file) ? videoSpan : null;
+  // What the video player last finished seeking to, and what it showed.
+  // Cleared once an <img> frame has replaced it.
+  const [videoShown, setVideoShown] = React.useState<{
+    day: string;
+    span: VideoSpan;
+    wanted: number;
+    shown: number;
+  } | null>(null);
+  const spanDay = span ? selectedDay : null;
+  const onVideoShown = React.useCallback(
+    (wanted: number, shown: number): void => {
+      if (spanDay !== null && span !== null) setVideoShown({ day: spanDay, span, wanted, shown });
+    },
+    [spanDay, span],
+  );
+  const videoOnScreen =
+    span !== null && videoShown?.day === selectedDay && videoShown.span.file === span.file;
+
+  const heldVideo =
+    videoShown !== null && videoShown.day === selectedDay && !videoOnScreen && videoShown.span.file !== span?.file
+      ? videoShown
+      : null;
+  // While the video player shows the frame, the <img> keeps whatever it last
+  // showed, underneath, until the player has a frame up.
+  const { src, frameFailed, loaded, settled, onLoad, onError } = useGatedImage(
+    span ? undefined : wantedSrc,
+    moving && previewSrc !== null,
+  );
+  // Once the <img> has settled on the wanted frame, the video's last frame
+  // no longer stands in for it. Checked here rather than in `onLoad`: a
+  // failed load must uncover the error, and coming back from a video to the
+  // frame the <img> still shows loads nothing at all.
+  if (!span && videoShown !== null && wantedSrc !== null && settled === wantedSrc) {
+    setVideoShown(null);
+  }
+  // Released, and the exact frame is in (or failed, or the video player has
+  // it): back to frames only. Over a video hour the beta player needs no
+  // previews.
+  if (scrubbing && !pointerDown && (span !== null || settled === wantedSrc)) {
+    setScrubbing(false);
+  }
+  const showPreview = span === null && previewSrc !== null && loaded !== wantedSrc;
   const [speed, setSpeed] = React.useState<PlaybackSpeed>(savedPlaybackSpeed);
   const { playing, togglePlaying } = usePlayback({
     frameMs: 1000 / speed,
@@ -213,12 +286,20 @@ export function App({
     // The next frame is asked for only once this one is on screen (or has
     // failed), so playback slows down rather than queueing decodes when
     // frames come from video faster than they can be decoded.
-    frameShown: wantedSrc !== null && settled === wantedSrc,
+    frameShown: span
+      ? videoOnScreen && videoShown.wanted === currentIndex
+      : wantedSrc !== null && settled === wantedSrc,
     goTo,
   });
   // Stretches still to be decoded from video are drawn paler on the scrubber.
-  const pendingFrames = usePendingFrames(day, loaded);
+  // The video player needs nothing decoded, and screenshots never do.
+  const pendingFrames = usePendingFrames(videoPlayer ? null : day, loaded);
   const [frameSize, setFrameSize] = React.useState(DEFAULT_FRAME_SIZE);
+  // Kept as is when unchanged, so the outlines don't re-render.
+  const showFrameSize = (size: { width: number; height: number }): void =>
+    setFrameSize((current) =>
+      current.width === size.width && current.height === size.height ? current : size,
+    );
   // Big screens get bigger frames; the outlines keep the same look on them.
   const outlineScale = frameSize.width / DEFAULT_FRAME_SIZE.width;
   const currentMatch: DayMatch | null = matches?.[rangeAt(matches, currentIndex)] ?? null;
@@ -226,8 +307,10 @@ export function App({
   // Outline the matching lines only once the frame on screen is the one the
   // match was read from, or stands for: until a new frame has loaded, the
   // browser keeps showing the old one.
-  const highlights =
-    currentMatch && loaded === wantedSrc && !frameFailed ? (matchLines ?? []) : [];
+  const frameOnScreen = span
+    ? videoOnScreen && videoShown.shown === currentIndex
+    : loaded === wantedSrc && !frameFailed;
+  const highlights = currentMatch && frameOnScreen ? (matchLines ?? []) : [];
 
   // Capture time of the frame on screen. The last one stays up while the
   // next loads, so scrubbing doesn't flicker "--:--".
@@ -259,8 +342,12 @@ export function App({
     );
   }
 
+  // The window's minimum width (tauri.conf.json) is what the toolbar needs with
+  // the find field at its narrowest (min-w-40) and the app filter at its widest
+  // (max-w-48); the pickers keep their full width. minmax(0,1fr) keeps the
+  // column the window's width, so nothing can push the scrubber off the edge.
   return (
-    <main className="h-screen overflow-hidden grid grid-rows-[min-content_1fr_auto] bg-page text-fg [[data-vibrancy]_&]:bg-transparent">
+    <main className="h-screen overflow-hidden grid grid-cols-[minmax(0,1fr)] grid-rows-[min-content_1fr_auto] bg-page text-fg [[data-vibrancy]_&]:bg-transparent">
       {/* On macOS this is also the title bar (tauri.macos.conf.json overlays the
           traffic lights on it), so it drags the window and leaves room for them.
           Tauri's drag handler cancels the mousedown, so a click there would no
@@ -292,7 +379,7 @@ export function App({
                 if (next !== currentIndex) goTo(next);
               }}
             />
-            <label className={`${fieldFrame} flex items-center gap-2 w-72 h-7.5 px-2.5`}>
+            <label className={`${fieldFrame} flex items-center gap-2 w-72 min-w-40 h-7.5 px-2.5`}>
               <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true" className="shrink-0 text-muted-fg">
                 <circle cx="11" cy="11" r="7" />
                 <path d="m20 20-3.5-3.5" />
@@ -376,22 +463,64 @@ export function App({
 
       <div className="relative overflow-hidden">
         {src && (
+          // No pointer events on the frame (nor the video, nor the preview):
+          // the mouse resting on an image makes WebKit run Live Text on it,
+          // and on a text-heavy frame the overlay it adds is laid out again
+          // on every step of a window resize, which froze resizing for up to
+          // seconds at a time.
           <img
             src={src}
             alt={`Frame ${currentIndex + 1}`}
             onLoad={(e) => {
               const { naturalWidth: width, naturalHeight: height } = e.currentTarget;
-              if (width > 0 && height > 0) {
-                setFrameSize((size) =>
-                  size.width === width && size.height === height ? size : { width, height },
-                );
-              }
+              if (width > 0 && height > 0) showFrameSize({ width, height });
               onLoad();
             }}
             onError={onError}
-            className={`w-full h-full object-contain absolute inset-0 ${
+            className={`w-full h-full object-contain absolute inset-0 pointer-events-none ${
               frameFailed ? "invisible" : ""
             }`}
+          />
+        )}
+        {/* The video last on screen stays up until the next frame is: a new
+            hour's video until it has a frame, an <img> until it has loaded.
+            Keyed by file in one list, so a video moving between the two
+            roles keeps its element and doesn't load again. */}
+        {[
+          heldVideo && (
+            <VideoFrame
+              key={heldVideo.span.file}
+              span={heldVideo.span}
+              index={heldVideo.shown}
+              visible
+              onShown={ignore}
+              onSize={ignore}
+              onError={ignore}
+            />
+          ),
+          span && (
+            <VideoFrame
+              key={span.file}
+              span={span}
+              index={currentIndex}
+              visible={videoOnScreen}
+              onShown={onVideoShown}
+              onSize={showFrameSize}
+              onError={() => {
+                console.error(`The video player could not play ${span.file}; showing decoded frames instead.`);
+                setFailedVideos((failed) => new Set(failed).add(span.file));
+              }}
+            />
+          ),
+        ]}
+        {showPreview && (
+          // Same box and fitting as the frame, which it covers until the
+          // frame catches up. Upscaled from 480 wide, so softer.
+          <img
+            src={previewSrc}
+            alt=""
+            data-testid="scrub-preview"
+            className="w-full h-full object-contain absolute inset-0 pointer-events-none"
           />
         )}
         {highlights.length > 0 && (
@@ -419,10 +548,10 @@ export function App({
             ))}
           </svg>
         )}
-        {(!src || frameFailed) && (
+        {(!src || frameFailed) && !videoOnScreen && !heldVideo && (
           <div className="flex items-center justify-center h-full text-muted-fg text-center">
             <p className="text-xl">
-              {frameFailed
+              {frameFailed && !span
                 ? "Could not load this frame"
                 : days.length === 0
                   ? "No screenshots yet"
@@ -476,6 +605,11 @@ export function App({
               max={Math.max(0, frameCount - 1)}
               value={currentIndex}
               onChange={(e) => goTo(parseInt(e.target.value, 10))}
+              onPointerDown={(): void => {
+                setPointerDown(true);
+                setScrubbing(true);
+                setRestingIndex(currentIndex);
+              }}
               disabled={frameCount === 0}
               className="relative block w-full h-2 rounded-full appearance-none cursor-pointer
                          disabled:opacity-50 disabled:cursor-not-allowed"
@@ -493,6 +627,9 @@ export function App({
   );
 }
 
+/** Callbacks of a held video, which reports nothing. */
+function ignore(): void {}
+
 /** "3 of 31" when on a match, otherwise how many there are. */
 function matchLabel(
   stops: Array<Stop>,
@@ -508,6 +645,11 @@ function matchLabel(
   return stops.length === 1 ? "1 match" : `${stops.length} matches`;
 }
 
+/** Where the slider puts its thumb's centre for frame `index`, as a percentage of its range. */
+function playheadPercent(index: number, frameCount: number): number {
+  return (Math.min(index, frameCount - 1) / Math.max(frameCount - 1, 1)) * 100;
+}
+
 /** Where the searched text was on screen, drawn just above the scrubber. */
 function MatchMarks({
   stops,
@@ -520,8 +662,7 @@ function MatchMarks({
 }): React.ReactNode {
   if (stops.length === 0 || frameCount === 0) return null;
   const current = rangeAt(stops, currentIndex);
-  // Where the slider puts its thumb's centre for frame `index`.
-  const at = (index: number): number => (Math.min(index, frameCount - 1) / Math.max(frameCount - 1, 1)) * 100;
+  const at = (index: number): number => playheadPercent(index, frameCount);
   return (
     <div
       data-testid="match-marks"
@@ -564,8 +705,7 @@ const AppMarks = React.memo(function AppMarks({
     [ranges, frameCount],
   );
   if (merged.length === 0 || frameCount === 0) return null;
-  // Same mapping as MatchMarks: where the playhead's centre sits for `index`.
-  const at = (index: number): number => (Math.min(index, frameCount - 1) / Math.max(frameCount - 1, 1)) * 100;
+  const at = (index: number): number => playheadPercent(index, frameCount);
   return (
     <div
       data-testid="app-marks"
@@ -628,11 +768,11 @@ function OtherDays({
               <path d="m2.5 4 2.5 2.5L7.5 4" />
             </svg>
           </PopoverButton>
-          {/* Styled like the day picker's list. The `!` beats the max-height
+          {/* Styled like the dropdowns' lists. The `!` beats the max-height
               Headless UI sets inline, which runs to the window's edge. */}
           <PopoverPanel
             anchor={{ to: "bottom start", gap: 4 }}
-            className="z-10 max-h-[min(24rem,var(--anchor-max-height,100vh))]! min-w-44 overflow-y-auto rounded-2xl border border-border bg-card p-1 text-sm text-fg tabular-nums shadow-md outline-none"
+            className={`${menuPanel} max-h-[min(24rem,var(--anchor-max-height,100vh))]! min-w-44`}
           >
             {({ close }): React.ReactElement => (
               <>
@@ -644,7 +784,7 @@ function OtherDays({
                       onPick(day);
                       close();
                     }}
-                    className="flex h-7 w-full cursor-default items-center justify-between gap-3 rounded-[11px] px-2.5 outline-none hover:bg-muted focus-visible:bg-muted"
+                    className={`${menuItem} w-full justify-between px-2.5 outline-none hover:bg-muted focus-visible:bg-muted`}
                   >
                     {label(day)}
                     <span className="text-muted-fg">{count}</span>
@@ -773,12 +913,14 @@ function usePlayback({
 }
 
 /**
- * Show `wanted` in an `<img>`, but never start loading a frame while another
+ * Show `wanted` in an `<img>` (`undefined` to keep what it shows), but never
+ * start loading a frame while another
  * is still loading. Dragging the scrubber across a video day would otherwise
  * queue a decode for every chunk it passes; this way each load that finishes
- * jumps straight to wherever the scrubber is now.
+ * jumps straight to wherever the scrubber is now. While `hold` is set, no new
+ * load starts at all (a preview is standing in).
  */
-function useGatedImage(wanted: string | null): {
+function useGatedImage(wanted: string | null | undefined, hold: boolean): {
   src: string | null;
   frameFailed: boolean;
   /** The last frame that finished loading successfully. */
@@ -798,8 +940,8 @@ function useGatedImage(wanted: string | null): {
   }>({ src: null, inFlight: false, frameFailed: false, loaded: null, settled: null });
 
   // Nothing loading: show the wanted frame. Otherwise the load that finishes
-  // brings this round again.
-  if (!state.inFlight && wanted !== state.src) {
+  // brings this round again. `undefined` keeps the frame shown.
+  if (wanted !== undefined && !state.inFlight && !hold && wanted !== state.src) {
     setState({ ...state, src: wanted, inFlight: wanted !== null });
   }
 

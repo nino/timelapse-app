@@ -7,22 +7,29 @@
 //! A day with neither falls back to the old script's whole-day videos
 //! (`YYYY-MM-DD--HH-MM-SS.mov|mp4`), played back to back. Video frames are
 //! decoded a chunk at a time into a size-capped LRU cache, so scrubbing
-//! through a long day only decodes the stretches actually looked at.
+//! through a long day only decodes the stretches actually looked at. A frame
+//! whose chunk isn't decoded yet is decoded on its own first, which is several
+//! times quicker, and read-ahead then decodes its chunk for the frames after it.
 //!
 //! Screenshots win when both exist because they are the originals, and the
 //! only source for the hour still being captured.
+//!
+//! With `with_previews`, videos also get small preview images (see
+//! `previews`) that the viewer shows while the scrubber is dragged, so it
+//! never waits on a decode until the drag stops.
 
 mod cache;
 mod gate;
 mod library;
+pub mod previews;
 mod read_ahead;
 mod video;
 
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration as StdDuration, SystemTime};
 
 use chrono::{DateTime, Duration, NaiveDate, NaiveDateTime};
 use serde::Serialize;
@@ -30,6 +37,7 @@ use serde::Serialize;
 use cache::ChunkCache;
 use gate::Gate;
 use library::{Shot, VideoFile, VideoKind};
+pub use previews::{PackKind, PreviewStore};
 pub use library::{filed_at, parse_screenshot_name, parse_video_name};
 use read_ahead::ReadAhead;
 pub use video::{RawFrame, Tools};
@@ -106,6 +114,64 @@ pub struct PendingFrames {
     pub ranges: Vec<FrameRange>,
 }
 
+/// A stretch of a day that one video holds, frame for frame, for a player
+/// that reads the video file itself (the viewer's beta video player): frame
+/// `start + n` of the day is frame `n` of `file`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VideoSpan {
+    pub start: usize,
+    /// Exclusive.
+    pub end: usize,
+    /// The video's file name in the library root.
+    pub file: String,
+    pub fps: f64,
+}
+
+/// What `FrameSource::day_videos` found, with the frame count it found it
+/// against, like `PendingFrames`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DayVideos {
+    pub frame_count: usize,
+    pub spans: Vec<VideoSpan>,
+}
+
+/// One video's preview pack, placed in its day. Mirrors `PreviewPack` in
+/// `src/previews.ts`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DayPreviewPack {
+    /// File name, served at `frames://localhost/previews/<name>`.
+    pub name: String,
+    /// Day-wide index of the video's first frame; the pack's frame indices
+    /// count from it.
+    pub first_index: usize,
+    pub frame_count: usize,
+    /// Only the video's keyframes, until its full pack is built.
+    pub coarse: bool,
+}
+
+/// The preview packs of a day's videos, with the frame count they were
+/// placed against. Videos without one yet are left out.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DayPreviews {
+    pub frame_count: usize,
+    pub packs: Vec<DayPreviewPack>,
+}
+
+/// A preview pack to build; see `FrameSource::next_preview_job`.
+#[derive(Debug, Clone)]
+pub struct PreviewJob {
+    /// The day the video belongs to, `YYYY-MM-DD`.
+    pub date: String,
+    pub video: PathBuf,
+    pub kind: PackKind,
+    key: String,
+    info: Option<VideoInfo>,
+}
+
 pub struct Frame {
     pub bytes: Vec<u8>,
     pub mime: &'static str,
@@ -172,6 +238,12 @@ pub struct FrameSource {
     read_ahead: Option<ReadAhead>,
     /// The last frame asked for, to tell which way the viewer is moving.
     last_frame: Mutex<Option<(String, usize)>>,
+    /// None unless `with_previews` switched them on.
+    previews: Option<Arc<PreviewStore>>,
+    /// Where the viewer is, for building previews around it first: the day
+    /// and frame last asked for, and a count of changes of day.
+    viewing: Mutex<Viewing>,
+    viewing_changed: Condvar,
     /// Per-video facts keyed by path, valid while size and mtime match.
     probes: Mutex<HashMap<PathBuf, Probe>>,
     /// Probes take turns through this. See `gate`.
@@ -212,6 +284,9 @@ impl FrameSource {
             cache: Arc::new(ChunkCache::open(cache_dir, cache_cap_bytes)?),
             read_ahead: None,
             last_frame: Mutex::new(None),
+            previews: None,
+            viewing: Mutex::new(Viewing::default()),
+            viewing_changed: Condvar::new(),
             probes: Mutex::new(HashMap::new()),
             probe_gate: Gate::new(PROBES_AT_ONCE),
             probing: Mutex::new(HashMap::new()),
@@ -235,6 +310,168 @@ impl FrameSource {
             Box::new(on_decoded),
         ));
         self
+    }
+
+    /// Keep preview packs of videos in `store` and serve them (`day_previews`,
+    /// `preview_pack`). Building them is up to the caller: the converter
+    /// writes them for new videos, and `next_preview_job` / `build_preview`
+    /// say what is missing and build it.
+    pub fn with_previews(mut self, store: Arc<PreviewStore>) -> Self {
+        self.previews = Some(store);
+        self
+    }
+
+    /// The preview packs of `date`'s videos. Empty without `with_previews`.
+    pub fn day_previews(&self, date: &str) -> Result<DayPreviews, Error> {
+        let segments = self.plan(parse_date(date)?)?;
+        let mut packs = Vec::new();
+        let mut offset = 0;
+        for segment in &segments {
+            if let (Segment::Video { file, info }, Some(store)) = (segment, &self.previews) {
+                if let Some((name, kind)) = store.best(&cache_key(file)?) {
+                    packs.push(DayPreviewPack {
+                        name,
+                        first_index: offset,
+                        frame_count: info.frame_count,
+                        coarse: kind == PackKind::Keyframes,
+                    });
+                }
+            }
+            offset += segment.len();
+        }
+        Ok(DayPreviews {
+            frame_count: offset,
+            packs,
+        })
+    }
+
+    /// The bytes of the preview pack called `name`, or `None` if there is
+    /// no such pack.
+    pub fn preview_pack(&self, name: &str) -> Result<Option<Vec<u8>>, Error> {
+        match &self.previews {
+            Some(store) => store.read(name),
+            None => Ok(None),
+        }
+    }
+
+    /// The most useful preview pack not built yet, other than those `skip`
+    /// rules out (say, ones that failed). For the day the viewer is on, the
+    /// keyframe packs of its videos come first, since they take a fraction
+    /// of a second each, then their full packs, both nearest the viewer
+    /// first. Then full packs for the rest of the library, newest first,
+    /// but only while the store has room: building past its cap would only
+    /// evict packs to make room for others.
+    pub fn next_preview_job(&self, skip: &dyn Fn(&PreviewJob) -> bool) -> Option<PreviewJob> {
+        let store = self.previews.as_ref()?;
+        let (viewing, finished) = {
+            let viewing = self.viewing.lock().unwrap();
+            (viewing.at.clone(), viewing.finished.clone())
+        };
+        if let Some((date, index)) = viewing {
+            // Planning today's day re-lists its folder, which changes every
+            // second, so a day with nothing left isn't planned again until
+            // the viewer moves to another one.
+            if finished.as_deref() != Some(date.as_str()) {
+                if let Some(job) = self.preview_job_near(store, &date, index, skip) {
+                    return Some(job);
+                }
+                self.viewing.lock().unwrap().finished = Some(date);
+            }
+        }
+        if store.nearly_full() {
+            return None;
+        }
+        let videos = library::list_root_videos(&self.root).ok()?;
+        videos.into_iter().find_map(|file| {
+            let key = cache_key(&file).ok()?;
+            let job = PreviewJob {
+                date: file.start.format("%Y-%m-%d").to_string(),
+                video: file.path,
+                kind: PackKind::Full,
+                key,
+                info: None,
+            };
+            (!store.has(&job.key, PackKind::Full) && !skip(&job)).then_some(job)
+        })
+    }
+
+    fn preview_job_near(
+        &self,
+        store: &PreviewStore,
+        date: &str,
+        index: usize,
+        skip: &dyn Fn(&PreviewJob) -> bool,
+    ) -> Option<PreviewJob> {
+        let segments = self.plan(parse_date(date).ok()?).ok()?;
+        let mut videos = Vec::new();
+        let mut offset = 0;
+        for segment in &segments {
+            if let Segment::Video { file, info } = segment {
+                let end = offset + info.frame_count;
+                let distance = if index < offset {
+                    offset - index
+                } else {
+                    index.saturating_sub(end.saturating_sub(1))
+                };
+                if let Ok(key) = cache_key(file) {
+                    videos.push((distance, file, *info, key));
+                }
+            }
+            offset += segment.len();
+        }
+        videos.sort_by_key(|(distance, ..)| *distance);
+        let job = |file: &VideoFile, info: VideoInfo, key: &str, kind| PreviewJob {
+            date: date.to_owned(),
+            video: file.path.clone(),
+            kind,
+            key: key.to_owned(),
+            info: Some(info),
+        };
+        let coarse = videos
+            .iter()
+            .filter(|(_, _, _, key)| store.best(key).is_none())
+            .map(|(_, file, info, key)| job(file, *info, key, PackKind::Keyframes));
+        let full = videos
+            .iter()
+            .filter(|(_, _, _, key)| !store.has(key, PackKind::Full))
+            .map(|(_, file, info, key)| job(file, *info, key, PackKind::Full));
+        coarse.chain(full).find(|job| !skip(job))
+    }
+
+    /// Build `job`'s pack, running ffmpeg at background priority. Returns
+    /// how many preview images it holds.
+    pub fn build_preview(&self, job: &PreviewJob) -> Result<usize, Error> {
+        let store = self
+            .previews
+            .as_ref()
+            .ok_or_else(|| Error::Tool("previews are off".into()))?;
+        // The converter may have written it since the job was picked.
+        if store.has(&job.key, PackKind::Full) {
+            return Ok(0);
+        }
+        store.build(&self.tools, &job.key, &job.video, job.kind, job.info)
+    }
+
+    /// Wait until the viewer moves to another day, or `timeout` passes.
+    /// `seen` is what the previous call returned (0 the first time); the
+    /// return value is the one to pass next time.
+    pub fn wait_for_viewer(&self, seen: u64, timeout: StdDuration) -> u64 {
+        let viewing = self.viewing.lock().unwrap();
+        let (viewing, _) = self
+            .viewing_changed
+            .wait_timeout_while(viewing, timeout, |v| v.day_changes == seen)
+            .unwrap();
+        viewing.day_changes
+    }
+
+    fn note_viewer(&self, date: &str, index: usize) {
+        let mut viewing = self.viewing.lock().unwrap();
+        let new_day = viewing.at.as_ref().map_or(true, |(day, _)| day != date);
+        viewing.at = Some((date.to_owned(), index));
+        if new_day {
+            viewing.day_changes += 1;
+            self.viewing_changed.notify_all();
+        }
     }
 
     /// Every day with screenshots or videos, oldest first, as `YYYY-MM-DD`.
@@ -273,6 +510,9 @@ impl FrameSource {
     pub fn frame(&self, date: &str, index: usize) -> Result<Frame, Error> {
         let day = parse_date(date)?;
         let segments = self.plan(day)?;
+        if self.previews.is_some() {
+            self.note_viewer(date, index);
+        }
         let frame = self.frame_in(day, date, &segments, index);
         // After this frame's own decode, so the two don't compete.
         if frame.is_ok() {
@@ -312,6 +552,25 @@ impl FrameSource {
                         .map(|_| ())
                     })
                 };
+                // Not decoded and nobody decoding it: decode just this frame,
+                // which comes back several times sooner than the whole chunk,
+                // and leave the chunk to read-ahead (`queue_read_ahead`).
+                if self.read_ahead.is_some()
+                    && !self.cache.contains(&key, chunk)
+                    && !self.cache.filling(&key, chunk)
+                {
+                    return match video::extract_frame(&self.tools, &file.path, *info, local)? {
+                        Some(bytes) => Ok(Frame {
+                            bytes,
+                            mime: "image/jpeg",
+                        }),
+                        None => Err(Error::OutOfRange {
+                            day: date.to_owned(),
+                            index,
+                            count: segments.iter().map(Segment::len).sum(),
+                        }),
+                    };
+                }
                 let dir = chunk_dir()?;
                 let bytes = match fs::read(dir.join(&name)) {
                     Ok(bytes) => bytes,
@@ -338,11 +597,28 @@ impl FrameSource {
     }
 
     /// Hand the read-ahead thread the undecoded chunks near `index`, in place
-    /// of whatever it still had queued.
+    /// of whatever it still had queued: first the chunk holding `index` if
+    /// `frame_in` served it as a single frame, then the ones nearby.
     fn queue_read_ahead(&self, date: &str, segments: &[Segment], index: usize) {
         let Some(read_ahead) = &self.read_ahead else {
             return;
         };
+        let job = |file: &VideoFile, info: &VideoInfo, chunk: usize| {
+            let key = cache_key(file).ok()?;
+            (!self.cache.contains(&key, chunk) && !self.cache.filling(&key, chunk)).then(|| {
+                read_ahead::Job {
+                    date: date.to_owned(),
+                    key,
+                    chunk,
+                    video: file.path.clone(),
+                    info: *info,
+                }
+            })
+        };
+        let mut jobs = Vec::new();
+        if let Ok((Segment::Video { file, info }, local)) = locate(segments, date, index) {
+            jobs.extend(job(file, info, local / CHUNK_FRAMES));
+        }
         let previous = self
             .last_frame
             .lock()
@@ -352,29 +628,18 @@ impl FrameSource {
         let (back, ahead) = match previous {
             Some(last) if index > last => (0, READ_AHEAD_FRAMES),
             Some(last) if index < last => (READ_AHEAD_FRAMES, 0),
-            Some(_) => return, // the same frame again
+            Some(_) if jobs.is_empty() => return, // the same frame again
+            Some(_) => (0, 0),
             None => (READ_AHEAD_FRAMES, READ_AHEAD_FRAMES),
         };
         let lens: Vec<_> = segments
             .iter()
             .map(|s| (s.len(), matches!(s, Segment::Video { .. })))
             .collect();
-        let mut jobs = Vec::new();
         for (segment, chunk) in chunks_near(&lens, index, back, ahead) {
-            let Segment::Video { file, info } = &segments[segment] else {
-                continue;
-            };
-            let Ok(key) = cache_key(file) else { continue };
-            if self.cache.contains(&key, chunk) {
-                continue;
+            if let Segment::Video { file, info } = &segments[segment] {
+                jobs.extend(job(file, info, chunk));
             }
-            jobs.push(read_ahead::Job {
-                date: date.to_owned(),
-                key,
-                chunk,
-                video: file.path.clone(),
-                info: *info,
-            });
         }
         read_ahead.replace(jobs);
     }
@@ -389,8 +654,14 @@ impl FrameSource {
         for segment in &segments {
             if let Segment::Video { file, info } = segment {
                 let key = cache_key(file)?;
+                // A full preview pack shows the stretch while dragging; only
+                // a keyframe one still leaves it pending.
+                let previewed = self
+                    .previews
+                    .as_ref()
+                    .is_some_and(|store| store.has(&key, PackKind::Full));
                 for chunk in 0..info.frame_count.div_ceil(CHUNK_FRAMES) {
-                    if self.cache.contains(&key, chunk) {
+                    if previewed || self.cache.contains(&key, chunk) {
                         continue;
                     }
                     let start = offset + chunk * CHUNK_FRAMES;
@@ -407,6 +678,42 @@ impl FrameSource {
             frame_count: offset,
             ranges: pending,
         })
+    }
+
+    /// The stretches of `date` served from video, in order, with the video
+    /// that holds each. Screenshot hours are left out.
+    pub fn day_videos(&self, date: &str) -> Result<DayVideos, Error> {
+        let segments = self.plan(parse_date(date)?)?;
+        let mut spans = Vec::new();
+        let mut offset = 0;
+        for segment in &segments {
+            if let Segment::Video { file, info } = segment {
+                if let Some(name) = file.path.file_name().and_then(|n| n.to_str()) {
+                    spans.push(VideoSpan {
+                        start: offset,
+                        end: offset + info.frame_count,
+                        file: name.to_owned(),
+                        fps: info.fps,
+                    });
+                }
+            }
+            offset += segment.len();
+        }
+        Ok(DayVideos {
+            frame_count: offset,
+            spans,
+        })
+    }
+
+    /// Where the library video named `name` is, if `name` is a bare file
+    /// name the frame source reads as a video and the file exists. Nothing
+    /// else in the library can be reached through it.
+    pub fn video_path(&self, name: &str) -> Option<PathBuf> {
+        if name.contains(['/', '\\']) || parse_video_name(name).is_none() {
+            return None;
+        }
+        let path = self.root.join(name);
+        path.is_file().then_some(path)
     }
 
     pub fn frame_time(&self, date: &str, index: usize) -> Result<Option<FrameTime>, Error> {
@@ -917,6 +1224,14 @@ impl FrameSource {
     }
 }
 
+#[derive(Default)]
+struct Viewing {
+    at: Option<(String, usize)>,
+    day_changes: u64,
+    /// A day whose videos all had their packs when last looked at.
+    finished: Option<String>,
+}
+
 /// Frame numbers of one day by capture hour; see `FrameSource::frame_hours`.
 #[derive(Default)]
 struct FrameHours {
@@ -1003,8 +1318,14 @@ fn locate<'a>(
 /// Cache folder name for a video: its stem plus its size, so a re-rendered
 /// video with the same name doesn't reuse stale frames.
 fn cache_key(video: &VideoFile) -> Result<String, Error> {
-    let stem = video.path.file_stem().unwrap_or_default().to_string_lossy();
-    Ok(format!("{stem}-{}", fs::metadata(&video.path)?.len()))
+    video_key(&video.path)
+}
+
+/// `cache_key` for the video at `path`, which is also the key its preview
+/// packs are stored under.
+pub fn video_key(path: &Path) -> Result<String, Error> {
+    let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+    Ok(format!("{stem}-{}", fs::metadata(path)?.len()))
 }
 
 #[cfg(test)]

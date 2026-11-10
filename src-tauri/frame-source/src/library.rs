@@ -191,6 +191,30 @@ pub fn list_videos(root: &Path, day: NaiveDate) -> std::io::Result<Vec<VideoFile
     Ok(videos)
 }
 
+/// Every video in the library root, of any day, newest start first. One
+/// directory listing, for work that walks the whole library.
+pub fn list_root_videos(root: &Path) -> std::io::Result<Vec<VideoFile>> {
+    let mut videos = Vec::new();
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        let Some((start, kind)) = parse_video_name(&name) else {
+            continue;
+        };
+        if entry.file_type()?.is_file() {
+            videos.push(VideoFile {
+                path: entry.path(),
+                start,
+                kind,
+            });
+        }
+    }
+    videos.sort_by(|a, b| b.start.cmp(&a.start).then_with(|| b.path.cmp(&a.path)));
+    Ok(videos)
+}
+
 /// Size plus a hash of the first MiB: enough to spot the byte-identical
 /// copies in the legacy library (the same render saved under two start
 /// times) without reading whole files.

@@ -26,8 +26,9 @@ there are no analytics.
   screenshot is never deleted before both its image (as video) and its text
   (as OCR) are kept.
 - **Battery-friendly background work.** OCR and video conversion run at
-  background priority and only on AC power; an encode in progress pauses when
-  you unplug. The Activity window (Window → Activity) shows what they are
+  background priority. Video conversion runs only on AC power, and an encode
+  in progress pauses when you unplug; on battery, OCR keeps reading new
+  screenshots every few minutes. The Activity window (Window → Activity) shows what they are
   doing and offers **Boost** (work at full speed for a while, optionally on
   battery) and **Low power** (pause both for a while, even on AC power).
 - **Automatic updates.** Release builds check GitHub for a newer release at
@@ -74,7 +75,7 @@ Everything is in `~/Timelapse`:
 | `YYYY-MM-DD--HH-MM-SS--hourly.mov` | One video per converted hour, named after its first frame |
 | `screenshots.db` | SQLite: capture times, front app and window, OCR text and its search index |
 | `diagnostics.db` | A log of state changes, errors and hourly summaries, kept for 30 days, for troubleshooting |
-| `.cache/` | Decoded video frames for the viewer; folders unused for 15 days are removed |
+| `.cache/` | Staging folders for the hour being converted; older versions kept decoded frames here, and folders unused for 15 days are removed |
 
 Older whole-day videos from the earlier `timelapse-to-video` scripts in the same
 folder are picked up too, and their text is read from the video.

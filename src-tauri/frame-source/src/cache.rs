@@ -132,6 +132,14 @@ impl ChunkCache {
         self.state.lock().unwrap().entries.contains_key(&chunk_dir) && chunk_dir.is_dir()
     }
 
+    /// Whether someone is decoding chunk `chunk` of the video `key` right
+    /// now, so that asking for it would wait for that decode to finish.
+    pub fn filling(&self, key: &str, chunk: usize) -> bool {
+        let chunk_dir = self.dir.join(key).join(format!("{chunk:06}"));
+        let lock = self.fill_locks.lock().unwrap().get(&chunk_dir).cloned();
+        lock.is_some_and(|lock| lock.try_lock().is_err())
+    }
+
     #[cfg(test)]
     pub fn total_bytes(&self) -> u64 {
         self.state.lock().unwrap().total_bytes
@@ -243,6 +251,33 @@ mod tests {
         let cache = ChunkCache::open(tmp.path().to_path_buf(), 5).unwrap();
         let dir = cache.get_or_fill("v", 0, fill_with(10)).unwrap();
         assert!(dir.join("0001.jpg").is_file());
+    }
+
+    #[test]
+    fn knows_when_a_chunk_is_being_filled() {
+        let tmp = TempDir::new().unwrap();
+        let cache = Arc::new(ChunkCache::open(tmp.path().to_path_buf(), 1_000).unwrap());
+        assert!(!cache.filling("v", 0));
+        let (started, wait_started) = std::sync::mpsc::channel();
+        let (release, wait_release) = std::sync::mpsc::channel::<()>();
+        let filler = {
+            let cache = Arc::clone(&cache);
+            std::thread::spawn(move || {
+                cache
+                    .get_or_fill("v", 0, |dir| {
+                        started.send(()).unwrap();
+                        wait_release.recv().unwrap();
+                        fill_with(10)(dir)
+                    })
+                    .unwrap();
+            })
+        };
+        wait_started.recv().unwrap();
+        assert!(cache.filling("v", 0));
+        assert!(!cache.filling("v", 1));
+        release.send(()).unwrap();
+        filler.join().unwrap();
+        assert!(!cache.filling("v", 0));
     }
 
     #[test]

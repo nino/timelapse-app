@@ -236,7 +236,8 @@ const plainButton = `rounded-xl border border-border bg-card px-3 py-1 font-medi
  * one card. Boost lets conversion and OCR run at full speed for a while, and
  * on battery too if asked; low-power mode keeps them off for a while, even on
  * AC power. Normally both run at background priority, a batch at most every
- * ten minutes, on AC power only.
+ * ten minutes, on AC power only, except that OCR keeps reading new screenshots
+ * on battery.
  */
 function Power({
   boost,
@@ -290,7 +291,7 @@ function Power({
   } else if (lowPower) {
     speed = `low power for another ${formatDuration((Date.parse(lowPowerUntil) - now) / 1000)}`;
   } else if (onBattery) {
-    speed = "waiting to be plugged in";
+    speed = "videos wait to be plugged in";
   } else {
     speed = "going easy on the CPU";
   }

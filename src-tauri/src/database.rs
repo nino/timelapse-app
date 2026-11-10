@@ -33,7 +33,6 @@
 //! the progress mark and committing each took.
 
 use rusqlite::{Connection, OptionalExtension, Result, Transaction, TransactionBehavior};
-use serde::Serialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -689,25 +688,6 @@ impl ScreenshotDatabase {
     }
 
 
-    /// Get screenshot metadata by frame number. Frame numbers restart in every
-    /// day folder, so pass `day` to get the right one; without it this returns
-    /// the most recent screenshot with that number.
-    pub fn get_screenshot_by_frame(
-        &self,
-        frame_number: u32,
-        day: Option<&str>,
-    ) -> Result<Option<(String, String)>> {
-        self.conn
-            .query_row(
-                "SELECT created_at, local_time FROM screenshots
-                 WHERE frame_number = ?1 AND (?2 IS NULL OR day = ?2)
-                 ORDER BY id DESC LIMIT 1",
-                rusqlite::params![frame_number, day],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()
-    }
-
     /// Record that OCR has handled frame `frame_number` of `day`. `result` is
     /// the recognized text, one line per box, and the boxes, or `None` when
     /// the frame was skipped because the screen had not changed. Either way
@@ -958,7 +938,9 @@ impl ScreenshotDatabase {
 
     /// Full-text search over OCR'd frames, newest first. Every word in `query`
     /// has to appear; the last one also matches as a prefix, so results show
-    /// up while a word is still being typed.
+    /// up while a word is still being typed. Only the tests search the whole
+    /// library; the app searches a day at a time (`search_ocr_in_day`).
+    #[cfg(test)]
     pub fn search_ocr(&self, query: &str, limit: u32) -> Result<Vec<OcrHit>> {
         let Some(fts_query) = fts_query(query) else {
             return Ok(Vec::new());
@@ -1197,7 +1179,8 @@ pub struct OcrDayMatch {
 
 /// One search result: the frame whose OCR text matched, and the matching
 /// passage with the hits wrapped in `[` `]`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OcrHit {
     pub day: String,
     /// The screenshot's `NNNNN`, or its 1-based position in the day's videos
@@ -1668,29 +1651,6 @@ mod tests {
         db.insert_screenshot("2024-03-04", 7, Utc::now(), Local::now()).unwrap();
 
         assert_eq!(day_of(&db, 7).as_deref(), Some("2024-03-04"));
-    }
-
-    #[test]
-    fn test_get_screenshot_by_frame_tells_days_apart() {
-        let temp_dir = TempDir::new().unwrap();
-        let db = ScreenshotDatabase::new(temp_dir.path().join("test.db")).unwrap();
-        let monday = "2024-01-01T09:00:00+00:00".parse::<DateTime<Utc>>().unwrap();
-        let tuesday = "2024-01-02T09:00:00+00:00".parse::<DateTime<Utc>>().unwrap();
-
-        db.insert_screenshot("2024-01-01", 1, monday, monday.with_timezone(&Local)).unwrap();
-        db.insert_screenshot("2024-01-02", 1, tuesday, tuesday.with_timezone(&Local)).unwrap();
-
-        let (created_at, _) = db.get_screenshot_by_frame(1, Some("2024-01-01")).unwrap().unwrap();
-        assert_eq!(created_at, monday.to_rfc3339());
-
-        let (created_at, _) = db.get_screenshot_by_frame(1, Some("2024-01-02")).unwrap().unwrap();
-        assert_eq!(created_at, tuesday.to_rfc3339());
-
-        // Without a day, the most recently inserted one wins.
-        let (created_at, _) = db.get_screenshot_by_frame(1, None).unwrap().unwrap();
-        assert_eq!(created_at, tuesday.to_rfc3339());
-
-        assert_eq!(db.get_screenshot_by_frame(1, Some("2024-01-03")).unwrap(), None);
     }
 
     #[test]

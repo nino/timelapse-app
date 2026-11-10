@@ -7,6 +7,7 @@ import {
   getSettings,
   setSendErrorReports,
   setUpdateAutomatically,
+  setVideoPlayerBeta,
   type Settings,
 } from "./settings";
 import { focusRing } from "./ui";
@@ -112,8 +113,29 @@ export function SettingsView(): React.ReactNode {
               <span>
                 <span className="font-medium">Send error reports</span>
                 <span className="mt-0.5 block text-muted-fg">
-                  Sends error messages and the app version to the developer, to help fix bugs. Never your
-                  screenshots, their text or window titles.
+                  Sends error messages, the app version and how far behind background work is to the
+                  developer, to help fix bugs. Never your screenshots, their text or window titles.
+                </span>
+              </span>
+            </label>
+          </section>
+          <section aria-label="Beta" className="rounded-xl border border-border bg-card px-4 py-3">
+            <label className="flex items-start gap-3">
+              <input
+                type="checkbox"
+                className={`mt-0.5 size-4 shrink-0 rounded accent-primary ${focusRing}`}
+                checked={settings.videoPlayerBeta}
+                onChange={(e) => {
+                  const enabled = e.currentTarget.checked;
+                  toggle({ videoPlayerBeta: enabled }, setVideoPlayerBeta, enabled);
+                }}
+              />
+              <span>
+                <span className="font-medium">Play videos in the viewer</span>
+                <span className="ml-1.5 rounded-full border border-border px-1.5 text-xs text-muted-fg">Beta</span>
+                <span className="mt-0.5 block text-muted-fg">
+                  Shows hours already turned into video with the system’s video player, instead of decoding
+                  their frames first. Scrubbing may be faster.
                 </span>
               </span>
             </label>

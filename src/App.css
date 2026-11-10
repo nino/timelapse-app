@@ -92,6 +92,16 @@ body {
   box-sizing: border-box;
 }
 
+/* The main window's layout fits the viewport exactly, but WebKit still lets
+   the page itself rubber-band under a trackpad scroll. Stop it scrolling or
+   overscrolling at all. The popup lists scroll in containers of their own,
+   which this leaves alone. */
+html[data-main-window],
+html[data-main-window] body {
+  overflow: hidden;
+  overscroll-behavior: none;
+}
+
 /* The macOS main window's native vibrancy (see main.tsx) shows wherever the
    page has no background of its own. */
 html[data-vibrancy],

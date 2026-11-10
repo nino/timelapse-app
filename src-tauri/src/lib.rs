@@ -1,14 +1,15 @@
 //! The Tauri app: commands, the `frames:` URI scheme, the menu, and `setup()`,
 //! which starts the photographer, OCR and the video converter.
 //!
-//! Each command that needs the photographer is a thin shim over a
-//! `*_impl(&PhotographerState, …)` function. `tauri::State` wraps a private
-//! reference with no public constructor, so that split is what lets the tests
-//! call the logic directly.
+//! Commands with logic worth testing are thin shims over `*_impl` functions
+//! that take plain arguments. `tauri::State` wraps a private reference with no
+//! public constructor, so that split is what lets the tests call the logic
+//! directly.
 
 mod activity;
 mod analytics;
 mod app_state;
+mod backlog;
 mod boost;
 mod converter;
 mod day_status;
@@ -17,15 +18,19 @@ mod database;
 mod day_apps;
 mod menu_app;
 mod diagnostics;
+mod media;
 mod ocr;
 mod ocr_helper;
 mod ocr_readahead;
 mod ocr_tiles;
 mod paths;
+mod previews;
 mod settings;
 mod updater;
 
-use frame_source::{DaySummary, FrameSource, FrameTime, PendingFrames, Tools};
+use frame_source::{
+    DayPreviews, DaySummary, DayVideos, FrameSource, FrameTime, PendingFrames, PreviewStore, Tools,
+};
 use tauri::http::{header, Response, StatusCode};
 
 use std::path::Path;
@@ -34,7 +39,7 @@ use tauri::menu::{Menu, MenuItem, MenuItemKind, PredefinedMenuItem, WINDOW_SUBME
 use tauri::{AppHandle, Emitter, Manager, Runtime, State, WebviewUrl, WebviewWindowBuilder};
 use activity::{Activity, Snapshot};
 use app_state::{AppStateStore, Rect, ViewerPosition};
-use database::{OcrHit, OcrProgress, ScreenshotDatabase};
+use database::{OcrProgress, ScreenshotDatabase};
 use serde::Serialize;
 use settings::{Settings, SettingsStore};
 use timelapse::Photographer;
@@ -68,14 +73,21 @@ const CHECK_FOR_UPDATES: &str = "check-for-updates";
 /// directory rather than in the (possibly synced) library.
 const FRAME_CACHE_CAP_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
+/// Preview packs are disposable too, and kept apart from the frame cache so
+/// that scrubbing through decoded frames never evicts them. The whole
+/// existing library comes to roughly 2.5 GB of them.
+const PREVIEW_CAP_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
 /// Event sent with a day's date when read-ahead has decoded a chunk of it.
 const FRAMES_DECODED: &str = "frames-decoded";
 
-// Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-#[tauri::command]
-fn greet(name: &str) -> String {
-    format!("Hello, {}! You've been greeted from Rust!", name)
-}
+/// Event sent with a day's date when the preview builder has built a pack
+/// for one of its videos.
+const PREVIEWS_BUILT: &str = "previews-built";
+
+/// Event sent with the new settings whenever one changes, so the main window
+/// picks up a change made in the Settings window.
+const SETTINGS_CHANGED: &str = "settings-changed";
 
 /// The directory under `$HOME` this build uses. Rust is the single source of
 /// truth for it: the frontend asks at startup rather than deriving its own
@@ -85,115 +97,10 @@ fn get_timelapse_root_name() -> String {
     paths::TIMELAPSE_DIR_NAME.to_string()
 }
 
-// The state-backed commands below are thin shims over these functions.
-// `tauri::State` is a newtype around a private reference with no public
-// constructor, so it cannot be built outside a running Tauri app — keeping the
-// logic in plain functions is what makes it reachable from unit tests.
-
-fn start_timelapse_impl(
-    state: &PhotographerState,
-    make_photographer: impl FnOnce() -> Result<Photographer, String>,
-) -> Result<String, String> {
-    let mut photographer_guard = state.lock().map_err(|e| e.to_string())?;
-
-    if photographer_guard.is_none() {
-        let photographer = make_photographer()?;
-        photographer.start();
-        *photographer_guard = Some(photographer);
-        Ok("Timelapse started successfully".to_string())
-    } else {
-        Err("Timelapse is already running".to_string())
-    }
-}
-
-fn stop_timelapse_impl(state: &PhotographerState) -> Result<String, String> {
-    let mut photographer_guard = state.lock().map_err(|e| e.to_string())?;
-
-    if let Some(photographer) = photographer_guard.take() {
-        photographer.stop();
-        Ok("Timelapse stopped successfully".to_string())
-    } else {
-        Err("Timelapse is not running".to_string())
-    }
-}
-
-fn is_timelapse_running_impl(state: &PhotographerState) -> Result<bool, String> {
+/// Whether the photographer has been started.
+fn is_capturing(state: &PhotographerState) -> Result<bool, String> {
     let photographer_guard = state.lock().map_err(|e| e.to_string())?;
     Ok(photographer_guard.is_some())
-}
-
-fn get_error_logs_impl(
-    state: &PhotographerState,
-) -> Result<Vec<timelapse::ErrorLogEntry>, String> {
-    let photographer_guard = state.lock().map_err(|e| e.to_string())?;
-
-    if let Some(photographer) = &*photographer_guard {
-        Ok(photographer.get_error_logs())
-    } else {
-        Ok(Vec::new())
-    }
-}
-
-fn clear_error_logs_impl(state: &PhotographerState) -> Result<String, String> {
-    let photographer_guard = state.lock().map_err(|e| e.to_string())?;
-
-    if let Some(photographer) = &*photographer_guard {
-        photographer.clear_error_logs();
-        Ok("Error logs cleared successfully".to_string())
-    } else {
-        Err("Timelapse is not running".to_string())
-    }
-}
-
-fn get_screenshot_metadata_impl(
-    state: &PhotographerState,
-    frame_number: u32,
-    day: Option<&str>,
-) -> Result<Option<(String, String)>, String> {
-    let photographer_guard = state.lock().map_err(|e| e.to_string())?;
-
-    if let Some(photographer) = &*photographer_guard {
-        photographer
-            .get_screenshot_metadata(frame_number, day)
-            .map_err(|e| e.to_string())
-    } else {
-        Err("Timelapse is not running".to_string())
-    }
-}
-
-#[tauri::command]
-async fn start_timelapse(
-    state: State<'_, PhotographerState>,
-    activity: State<'_, ActivityState>,
-) -> Result<String, String> {
-    let activity = Arc::clone(activity.inner());
-    start_timelapse_impl(state.inner(), || {
-        Photographer::new()
-            .map(|photographer| photographer.reporting_to(activity))
-            .map_err(|e| e.to_string())
-    })
-}
-
-#[tauri::command]
-async fn stop_timelapse(state: State<'_, PhotographerState>) -> Result<String, String> {
-    stop_timelapse_impl(state.inner())
-}
-
-#[tauri::command]
-async fn is_timelapse_running(state: State<'_, PhotographerState>) -> Result<bool, String> {
-    is_timelapse_running_impl(state.inner())
-}
-
-#[tauri::command]
-async fn get_error_logs(
-    state: State<'_, PhotographerState>,
-) -> Result<Vec<timelapse::ErrorLogEntry>, String> {
-    get_error_logs_impl(state.inner())
-}
-
-#[tauri::command]
-async fn clear_error_logs(state: State<'_, PhotographerState>) -> Result<String, String> {
-    clear_error_logs_impl(state.inner())
 }
 
 /// Run blocking work (ffmpeg, SQLite) off the async runtime's worker threads.
@@ -257,7 +164,25 @@ async fn get_pending_frames(
     with_frame_source(source.inner(), move |s| s.pending(&date)).await
 }
 
-/// The response for a `frames://localhost/<YYYY-MM-DD>/<index>` request.
+/// The stretches of `date` served from video and the video each comes from,
+/// for the beta video player, which plays them from `videos:` URLs.
+#[tauri::command]
+async fn get_day_videos(
+    source: State<'_, FrameSourceState>,
+    date: String,
+) -> Result<DayVideos, String> {
+    with_frame_source(source.inner(), move |s| s.day_videos(&date)).await
+}
+
+/// The preview packs of `date`'s videos, for showing while the scrubber is
+/// dragged. Each is served at `frames://localhost/previews/<name>`.
+#[tauri::command]
+async fn get_day_previews(source: State<'_, FrameSourceState>, date: String) -> Result<DayPreviews, String> {
+    with_frame_source(source.inner(), move |s| s.day_previews(&date)).await
+}
+
+/// The response for a `frames://localhost/<YYYY-MM-DD>/<index>` request, or
+/// for a preview pack at `frames://localhost/previews/<name>`.
 fn frame_response(source: Option<&FrameSource>, path: &str) -> Response<Vec<u8>> {
     let reply = |status: StatusCode, message: String| {
         Response::builder()
@@ -273,6 +198,25 @@ fn frame_response(source: Option<&FrameSource>, path: &str) -> Response<Vec<u8>>
     let (Some(date), Some(index), None) = (parts.next(), parts.next(), parts.next()) else {
         return reply(StatusCode::BAD_REQUEST, format!("expected /<day>/<index>, got {path}"));
     };
+    if date == "previews" {
+        let (status, content_type, body) = match source.preview_pack(index) {
+            Ok(Some(bytes)) => (StatusCode::OK, "application/octet-stream", bytes),
+            Ok(None) => (StatusCode::NOT_FOUND, "text/plain", format!("no preview pack {index}").into_bytes()),
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, "text/plain", e.to_string().into_bytes()),
+        };
+        return Response::builder()
+            .status(status)
+            .header(header::CONTENT_TYPE, content_type)
+            // The page keeps the packs it loaded itself.
+            .header(header::CACHE_CONTROL, "no-store")
+            // The page `fetch`es packs from its own origin (tauri://),
+            // which is another origin to this scheme; an `<img>` needs no
+            // permission, but a fetch does, failures included, or the page
+            // sees a network error instead of the status.
+            .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+            .body(body)
+            .unwrap();
+    }
     let Ok(index) = index.parse::<usize>() else {
         return reply(StatusCode::BAD_REQUEST, format!("not a frame index: {index}"));
     };
@@ -290,27 +234,6 @@ fn frame_response(source: Option<&FrameSource>, path: &str) -> Response<Vec<u8>>
         }
         Err(e) => reply(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
-}
-
-#[tauri::command]
-async fn get_screenshot_metadata(
-    state: State<'_, PhotographerState>,
-    frame_number: u32,
-    day: Option<String>,
-) -> Result<Option<(String, String)>, String> {
-    get_screenshot_metadata_impl(state.inner(), frame_number, day.as_deref())
-}
-
-/// Search the OCR text of every screenshot in `<root>`, newest first.
-fn search_ocr_impl(root: &Path, query: &str, limit: u32) -> Result<Vec<OcrHit>, String> {
-    let db = ScreenshotDatabase::new(root.join("screenshots.db")).map_err(|e| e.to_string())?;
-    db.search_ocr(query, limit).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-async fn search_ocr(query: String, limit: Option<u32>) -> Result<Vec<OcrHit>, String> {
-    let timelapse_root = paths::timelapse_root().ok_or("Unable to find home directory")?;
-    search_ocr_impl(&timelapse_root, &query, limit.unwrap_or(100))
 }
 
 /// Where one OCR match sits on a day's scrubber.
@@ -554,12 +477,6 @@ fn evict_old_cache_impl(root: &Path) -> Result<String, String> {
     Ok(format!("Removed {} old cache folders", removed_count))
 }
 
-#[tauri::command]
-async fn evict_old_cache() -> Result<String, String> {
-    let timelapse_root = paths::timelapse_root().ok_or("Unable to find home directory")?;
-    evict_old_cache_impl(&timelapse_root)
-}
-
 /// What capture, conversion and OCR are doing right now. It only reads
 /// memory (and, every few seconds, the power source), so the Activity window
 /// can poll it.
@@ -569,7 +486,7 @@ async fn get_activity(
     photographer: State<'_, PhotographerState>,
     boost: State<'_, BoostState>,
 ) -> Result<Snapshot, String> {
-    let capturing = is_timelapse_running_impl(photographer.inner())?;
+    let capturing = is_capturing(photographer.inner())?;
     let activity = Arc::clone(activity.inner());
     let low_power_until = boost.low_power_until();
     let boost = boost.status();
@@ -691,14 +608,26 @@ fn get_settings(settings: State<'_, SettingsStore>) -> Settings {
     settings.get()
 }
 
+/// Tells every window the settings have changed (`SETTINGS_CHANGED`), so the
+/// main window picks up a change made in the Settings window.
+fn settings_changed(app: &AppHandle, saved: Settings) {
+    if let Err(e) = app.emit(SETTINGS_CHANGED, saved) {
+        eprintln!("Could not report the settings change: {}", e);
+    }
+}
+
 #[tauri::command]
 fn set_update_automatically(
     enabled: bool,
+    app: AppHandle,
     settings: State<'_, SettingsStore>,
     updater: State<'_, UpdaterState>,
 ) -> Result<Settings, String> {
     let saved = settings.update(|s| s.update_automatically = enabled);
     updater.setting_changed();
+    if let Ok(saved) = saved {
+        settings_changed(&app, saved);
+    }
     saved
 }
 
@@ -716,16 +645,43 @@ fn relaunch_into_update(app: AppHandle) {
 }
 
 #[tauri::command]
-fn set_send_error_reports(enabled: bool, settings: State<'_, SettingsStore>) -> Result<Settings, String> {
+fn set_send_error_reports(
+    enabled: bool,
+    app: AppHandle,
+    settings: State<'_, SettingsStore>,
+) -> Result<Settings, String> {
     match settings.update(|s| s.send_error_reports = enabled) {
         Ok(saved) => {
             analytics::set_enabled(enabled);
+            settings_changed(&app, saved);
             Ok(saved)
         }
         Err(e) => {
             // The page puts the switch back when saving fails, so take the
             // change back here too rather than send with the switch shown off.
             let _ = settings.update(|s| s.send_error_reports = !enabled);
+            Err(e)
+        }
+    }
+}
+
+/// Turns the beta video player on or off, and tells the main window.
+#[tauri::command]
+fn set_video_player_beta(
+    enabled: bool,
+    app: AppHandle,
+    settings: State<'_, SettingsStore>,
+) -> Result<Settings, String> {
+    match settings.update(|s| s.video_player_beta = enabled) {
+        Ok(saved) => {
+            settings_changed(&app, saved);
+            Ok(saved)
+        }
+        Err(e) => {
+            // The page puts the switch back when saving fails, so take the
+            // change back here too, or the main window (never told) and the
+            // store would disagree with what the switch shows.
+            let _ = settings.update(|s| s.video_player_beta = !enabled);
             Err(e)
         }
     }
@@ -840,9 +796,11 @@ fn open_main_window<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
         .unwrap_or_default();
     let mut builder = WebviewWindowBuilder::from_config(app, &config)?;
     if let Some(place) = saved_place(app, MAIN_WINDOW) {
-        builder = builder
-            .position(place.x, place.y)
-            .inner_size(place.width, place.height);
+        // A size saved before the window had a minimum may be below it.
+        builder = builder.position(place.x, place.y).inner_size(
+            place.width.max(config.min_width.unwrap_or(0.0)),
+            place.height.max(config.min_height.unwrap_or(0.0)),
+        );
     }
     let window = builder.build()?;
     remember_place(&window.as_ref().window());
@@ -882,6 +840,7 @@ enum Opening {
 /// state is otherwise written a second after the last change.
 pub(crate) fn before_quit<R: Runtime>(app: &AppHandle<R>) {
     converter::kill_running_encode();
+    frame_source::previews::kill_running_build();
     if let Some(state) = app.try_state::<AppStateStore>() {
         state.save_now();
     }
@@ -1001,30 +960,10 @@ fn grow_settings_window(by: f64, window: tauri::WebviewWindow) -> Result<(), Str
     resize().map_err(|e| e.to_string())
 }
 
-/// ⌥⌘A from the main window's page. The key didn't reach the menu while one
-/// of the page's dropdowns had focus, so the page handles it itself and
-/// stops it there.
-#[tauri::command]
-fn toggle_activity(app: AppHandle) -> Result<(), String> {
-    toggle_activity_window(&app).map_err(|e| e.to_string())
-}
-
-/// When the Activity window was last toggled, so a ⌥⌘A that reaches both the
-/// menu and the page toggles it once rather than opening and closing it.
-static LAST_ACTIVITY_TOGGLE: Mutex<Option<std::time::Instant>> = Mutex::new(None);
-
 /// What the Activity menu item (⌥⌘A) does: closes the Activity window when
 /// it is the focused window, and otherwise brings it to the front, opening it
 /// if it isn't open.
 fn toggle_activity_window<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
-    {
-        let mut last = LAST_ACTIVITY_TOGGLE.lock().unwrap_or_else(|e| e.into_inner());
-        let now = std::time::Instant::now();
-        if last.is_some_and(|at| now.duration_since(at) < std::time::Duration::from_millis(300)) {
-            return Ok(());
-        }
-        *last = Some(now);
-    }
     if let Some(window) = app.get_webview_window(ACTIVITY_WINDOW) {
         if window.is_focused()? {
             return window.close();
@@ -1107,7 +1046,6 @@ pub fn run() {
 
     builder
         .plugin(tauri_plugin_fs::init())
-        .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_dialog::init())
         .manage(photographer_state)
@@ -1142,6 +1080,24 @@ pub fn run() {
                 responder.respond(frame_response(source.as_deref(), &path));
             });
         })
+        .register_asynchronous_uri_scheme_protocol("videos", |ctx, request, responder| {
+            let source = ctx
+                .app_handle()
+                .try_state::<FrameSourceState>()
+                .map(|state| Arc::clone(state.inner()));
+            let name = request.uri().path().trim_start_matches('/').to_owned();
+            let range = request
+                .headers()
+                .get(header::RANGE)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            // A range is a few megabytes read from disk; keep it off the
+            // webview's thread all the same.
+            tauri::async_runtime::spawn_blocking(move || {
+                let path = source.and_then(|source| source.video_path(&name));
+                responder.respond(media::video_response(path.as_deref(), range.as_deref()));
+            });
+        })
         .setup(|app| {
             app.manage(SettingsStore::load(app.path().app_config_dir().ok()));
             // Per profile, like the library: the viewer position names a day
@@ -1159,6 +1115,10 @@ pub fn run() {
             analytics::init(app.path().app_config_dir().ok().as_deref(), &version, reports);
             analytics::capture("app started", serde_json::json!({}));
             updater::spawn(app.handle().clone());
+
+            // Shared by the frame source, which serves them, the converter,
+            // which writes them for new videos, and the preview builder.
+            let mut preview_store: Option<Arc<PreviewStore>> = None;
 
             // Create the library up front. The frontend calls readDir on it
             // during its first render, which happens well before the delayed
@@ -1206,9 +1166,37 @@ pub fn run() {
                                 }
                             })
                         });
+                    // Per profile too. Without it, scrubbing works as before.
+                    preview_store = app
+                        .path()
+                        .app_cache_dir()
+                        .map_err(|e| e.to_string())
+                        .and_then(|dir| {
+                            let dir = dir.join(paths::TIMELAPSE_DIR_NAME).join("previews");
+                            PreviewStore::open(dir, PREVIEW_CAP_BYTES).map_err(|e| e.to_string())
+                        })
+                        .inspect_err(|e| {
+                            diagnostics::warn("previews", format!("Failed to open the preview store: {}", e)).record();
+                        })
+                        .ok()
+                        .map(Arc::new);
+                    let source = source.map(|source| match &preview_store {
+                        Some(store) => source.with_previews(Arc::clone(store)),
+                        None => source,
+                    });
                     match source {
                         Ok(source) => {
-                            app.manage::<FrameSourceState>(Arc::new(source));
+                            let source = Arc::new(source);
+                            app.manage::<FrameSourceState>(Arc::clone(&source));
+                            if preview_store.is_some() {
+                                let app = app.handle().clone();
+                                let boost = Arc::clone(app.state::<BoostState>().inner());
+                                previews::start(source, boost, move |date| {
+                                    if let Err(e) = app.emit(PREVIEWS_BUILT, date) {
+                                        eprintln!("Could not report built previews: {}", e);
+                                    }
+                                });
+                            }
                         }
                         Err(e) => {
                             diagnostics::error("app", format!("Failed to set up the frame source: {}", e)).record();
@@ -1231,14 +1219,17 @@ pub fn run() {
             let state_clone = Arc::clone(&photographer_state.inner());
             let activity = Arc::clone(app.state::<ActivityState>().inner());
             let boost = Arc::clone(app.state::<BoostState>().inner());
+            let converter_previews = preview_store.clone();
 
             tauri::async_runtime::spawn(async move {
                 tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
 
                 // Evict old cache entries on startup
-                match evict_old_cache().await {
-                    Ok(msg) => println!("Cache eviction: {}", msg),
-                    Err(e) => eprintln!("Failed to evict old cache: {}", e),
+                if let Some(root) = paths::timelapse_root() {
+                    match evict_old_cache_impl(&root) {
+                        Ok(msg) => println!("Cache eviction: {}", msg),
+                        Err(e) => eprintln!("Failed to evict old cache: {}", e),
+                    }
                 }
 
                 match Photographer::new() {
@@ -1267,8 +1258,10 @@ pub fn run() {
                         )
                         .reporting_to(Arc::clone(&activity))
                         .boosted_by(Arc::clone(&boost))
+                        .with_previews(converter_previews)
                         .start();
 
+                        backlog::start(root.clone(), Arc::clone(&activity), Arc::clone(&boost));
                         if ocr::start_background_ocr(root, ocr_dir, activity, boost) {
                             println!("OCR started");
                         } else {
@@ -1282,21 +1275,14 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            greet,
             get_timelapse_root_name,
-            start_timelapse,
-            stop_timelapse,
-            is_timelapse_running,
-            get_error_logs,
-            clear_error_logs,
-            evict_old_cache,
-            get_screenshot_metadata,
             list_days,
             get_day,
             get_day_statuses,
             get_frame_time,
             get_pending_frames,
-            search_ocr,
+            get_day_videos,
+            get_day_previews,
             search_ocr_day,
             get_day_apps,
             get_match_lines,
@@ -1317,10 +1303,10 @@ pub fn run() {
             get_installed_update,
             relaunch_into_update,
             set_send_error_reports,
+            set_video_player_beta,
             get_viewer_position,
             set_viewer_position,
-            grow_settings_window,
-            toggle_activity
+            grow_settings_window
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -1340,164 +1326,6 @@ mod tests {
     use tempfile::TempDir;
 
     const DAY: Duration = Duration::from_secs(24 * 60 * 60);
-
-    /// A photographer rooted in a temp dir, so nothing here reads or writes the
-    /// real `~/Timelapse`. The `TempDir` is returned so the caller keeps it
-    /// alive for the duration of the test.
-    fn temp_photographer() -> (TempDir, Photographer) {
-        let temp_dir = TempDir::new().unwrap();
-        let photographer = Photographer::new_in(temp_dir.path().to_path_buf()).unwrap();
-        (temp_dir, photographer)
-    }
-
-    /// State holding an already-registered (but never started) photographer.
-    fn running_state() -> (TempDir, PhotographerState) {
-        let (temp_dir, photographer) = temp_photographer();
-        (temp_dir, Arc::new(Mutex::new(Some(photographer))))
-    }
-
-    fn idle_state() -> PhotographerState {
-        Arc::new(Mutex::new(None))
-    }
-
-    #[test]
-    fn test_greet() {
-        let result = greet("Alice");
-        assert_eq!(result, "Hello, Alice! You've been greeted from Rust!");
-
-        let result = greet("Bob");
-        assert_eq!(result, "Hello, Bob! You've been greeted from Rust!");
-    }
-
-    // `start` calls `tokio::spawn`, which panics outside a runtime. What keeps
-    // the spawned capture loop from taking a screenshot is the
-    // `stop_timelapse_impl` below: it clears `running` before this test reaches
-    // any yield point, so the loop exits the first time it is polled. Do not
-    // add an `.await` between the start and the stop.
-    #[tokio::test]
-    async fn test_start_timelapse_success() {
-        let temp_dir = TempDir::new().unwrap();
-        let root = temp_dir.path().to_path_buf();
-        let state = idle_state();
-
-        let result = start_timelapse_impl(&state, || {
-            Photographer::new_in(root).map_err(|e| e.to_string())
-        });
-
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), "Timelapse started successfully");
-
-        // Verify photographer was created
-        assert!(state.lock().unwrap().is_some());
-
-        stop_timelapse_impl(&state).unwrap();
-    }
-
-    #[test]
-    fn test_start_timelapse_already_running() {
-        let (_temp_dir, state) = running_state();
-
-        // The factory must not run when one is already registered.
-        let result = start_timelapse_impl(&state, || {
-            panic!("should not build a second photographer");
-        });
-
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), "Timelapse is already running");
-    }
-
-    #[test]
-    fn test_stop_timelapse_success() {
-        let (_temp_dir, state) = running_state();
-
-        let result = stop_timelapse_impl(&state);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), "Timelapse stopped successfully");
-
-        // Verify photographer was removed
-        assert!(state.lock().unwrap().is_none());
-    }
-
-    #[test]
-    fn test_stop_timelapse_not_running() {
-        let state = idle_state();
-
-        let result = stop_timelapse_impl(&state);
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), "Timelapse is not running");
-    }
-
-    #[test]
-    fn test_is_timelapse_running() {
-        let state = idle_state();
-
-        // Initially not running
-        assert!(!is_timelapse_running_impl(&state).unwrap());
-
-        // Register a photographer
-        let (_temp_dir, photographer) = temp_photographer();
-        *state.lock().unwrap() = Some(photographer);
-        assert!(is_timelapse_running_impl(&state).unwrap());
-
-        // Stop it again
-        stop_timelapse_impl(&state).unwrap();
-        assert!(!is_timelapse_running_impl(&state).unwrap());
-    }
-
-    #[test]
-    fn test_get_error_logs_when_running() {
-        let (_temp_dir, state) = running_state();
-
-        let result = get_error_logs_impl(&state);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap().len(), 0);
-    }
-
-    #[test]
-    fn test_get_error_logs_when_not_running() {
-        let state = idle_state();
-
-        let result = get_error_logs_impl(&state);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap().len(), 0);
-    }
-
-    #[test]
-    fn test_clear_error_logs_success() {
-        let (_temp_dir, state) = running_state();
-
-        let result = clear_error_logs_impl(&state);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), "Error logs cleared successfully");
-    }
-
-    #[test]
-    fn test_clear_error_logs_not_running() {
-        let state = idle_state();
-
-        let result = clear_error_logs_impl(&state);
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), "Timelapse is not running");
-    }
-
-    #[test]
-    fn test_get_screenshot_metadata_not_running() {
-        let state = idle_state();
-
-        let result = get_screenshot_metadata_impl(&state, 1, None);
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), "Timelapse is not running");
-    }
-
-    #[test]
-    fn test_get_screenshot_metadata_unknown_frame() {
-        let (_temp_dir, state) = running_state();
-
-        // Nothing has been captured into this temp library yet.
-        let result = get_screenshot_metadata_impl(&state, 1, None);
-        assert!(result.is_ok());
-        assert!(result.unwrap().is_none());
-    }
 
     /// A temp library root with an empty `.cache` inside it. The `TempDir` is
     /// returned so the caller keeps it alive for the duration of the test.
@@ -1652,6 +1480,31 @@ mod tests {
     }
 
     #[test]
+    fn test_frame_response_serves_preview_packs() {
+        let library = TempDir::new().unwrap();
+        let (_cache, source) = frame_source_in(library.path());
+        let (_none, without) = frame_source_in(library.path());
+        let previews = TempDir::new().unwrap();
+        let store = PreviewStore::open(previews.path().to_path_buf(), u64::MAX).unwrap();
+        store.write("v-9", frame_source::PackKind::Full, &[(0, b"jpeg".to_vec())]).unwrap();
+        let source = source.with_previews(Arc::new(store));
+
+        let response = frame_response(Some(&source), "/previews/v-9.full.pack");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN], "*");
+        let pack = frame_source::previews::decode_pack(response.body()).unwrap();
+        assert_eq!(pack, vec![(0, b"jpeg".to_vec())]);
+
+        for path in ["/previews/v-8.full.pack", "/previews/..%2Fv-9.full.pack", "/previews/v-9.full"] {
+            assert_eq!(frame_response(Some(&source), path).status(), StatusCode::NOT_FOUND, "{path}");
+        }
+        assert_eq!(
+            frame_response(Some(&without), "/previews/v-9.full.pack").status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[test]
     fn test_frame_response_rejects_bad_requests() {
         let library = TempDir::new().unwrap();
         let (_cache, source) = frame_source_in(library.path());
@@ -1778,18 +1631,5 @@ mod tests {
             count_ocr_matches_impl(temp_dir.path(), "cargo").unwrap(),
             vec![DayCount { day: "2024-01-01".to_string(), count: 1 }]
         );
-    }
-
-    #[test]
-    fn test_search_ocr_reads_the_library_database() {
-        let temp_dir = TempDir::new().unwrap();
-        let db = ScreenshotDatabase::new(temp_dir.path().join("screenshots.db")).unwrap();
-        db.record_ocr_frame("2024-01-01", 4, Some(("cargo test", &[]))).unwrap();
-
-        let hits = search_ocr_impl(temp_dir.path(), "cargo", 10).unwrap();
-        assert_eq!(hits.len(), 1);
-        assert_eq!((hits[0].day.as_str(), hits[0].frame_number), ("2024-01-01", 4));
-
-        assert!(search_ocr_impl(temp_dir.path(), "nothing", 10).unwrap().is_empty());
     }
 }

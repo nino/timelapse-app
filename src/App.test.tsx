@@ -1,15 +1,16 @@
 import { afterAll, beforeEach, describe, expect, it, mock, spyOn } from 'bun:test';
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 
-import * as activity from './activity';
 import { App } from './App';
 import type { DayApps } from './apps';
 import * as frames from './frames';
-import { frameUrl, type Day, type DayStatus } from './frames';
+import { frameUrl, videoUrl, type Day, type DayStatus } from './frames';
 import * as dayAppsHook from './hooks/useDayApps';
+import * as dayPreviewsHook from './hooks/useDayPreviews';
 import * as library from './hooks/useLibrary';
 import * as ocrSearch from './hooks/useOcrSearch';
 import type { DayCount, DayMatch, LineBox } from './search';
+import * as settings from './settings';
 import * as updates from './updates';
 import * as viewerPosition from './viewerPosition';
 
@@ -27,10 +28,12 @@ const useOcrVersion = spyOn(ocrSearch, 'useOcrVersion');
 const getPendingFrames = spyOn(frames, 'getPendingFrames');
 const setViewerPosition = spyOn(viewerPosition, 'setViewerPosition');
 const useDayApps = spyOn(dayAppsHook, 'useDayApps');
-const toggleActivity = spyOn(activity, 'toggleActivity').mockResolvedValue(undefined);
+const useDayPreviews = spyOn(dayPreviewsHook, 'useDayPreviews');
 const getInstalledUpdate = spyOn(updates, 'getInstalledUpdate');
 const onUpdateReady = spyOn(updates, 'onUpdateReady');
 const relaunchIntoUpdate = spyOn(updates, 'relaunchIntoUpdate').mockResolvedValue(undefined);
+const getSettings = spyOn(settings, 'getSettings');
+const getDayVideos = spyOn(frames, 'getDayVideos');
 
 afterAll(() => {
   setViewerPosition.mockRestore();
@@ -44,10 +47,12 @@ afterAll(() => {
   useOcrVersion.mockRestore();
   getPendingFrames.mockRestore();
   useDayApps.mockRestore();
-  toggleActivity.mockRestore();
+  useDayPreviews.mockRestore();
   getInstalledUpdate.mockRestore();
   onUpdateReady.mockRestore();
   relaunchIntoUpdate.mockRestore();
+  getSettings.mockRestore();
+  getDayVideos.mockRestore();
 });
 
 /**
@@ -157,8 +162,11 @@ describe('App', () => {
     setViewerPosition.mockResolvedValue(undefined);
     useDayStatuses.mockReturnValue(new Map());
     useDayApps.mockReturnValue(null);
+    useDayPreviews.mockReturnValue(null);
     getInstalledUpdate.mockResolvedValue(null);
     onUpdateReady.mockResolvedValue((): void => {});
+    getSettings.mockResolvedValue({ updateAutomatically: true, sendErrorReports: false, videoPlayerBeta: false });
+    getDayVideos.mockResolvedValue({ frameCount: 0, spans: [] });
   });
 
   describe('Library states', () => {
@@ -207,6 +215,15 @@ describe('App', () => {
       await waitFor(() => expect(shownFrame()).toBe(frameUrl('2026-10-04', 2)));
       expect(dayPicker()).toHaveTextContent('2026-10-04');
       expect(position()).toBe('3 / 3');
+    });
+
+    it('keeps the mouse off the frame, so WebKit never runs Live Text on it', async () => {
+      // Live Text's overlay on a text-heavy frame froze window resizing.
+      mockLibrary({ '2026-10-04': 3 });
+      render(<App />);
+      await waitFor(() => expect(shownFrame()).toBe(frameUrl('2026-10-04', 2)));
+      expect(image()).toHaveClass('pointer-events-none');
+      await settleFrameTime();
     });
 
     it('lists days newest first and marks today', async () => {
@@ -682,13 +699,16 @@ describe('App', () => {
       await settleFrameTime();
     });
 
-    it('toggles the Activity window on Option+Cmd+A, also from a dropdown', async () => {
+    // WebKit sends a keypress for ⌘ shortcuts and keeps a cancelled one from
+    // the menu, so a dropdown that cancelled them blocked ⌘H, ⌥⌘A and co.
+    it('leaves Cmd shortcuts to the menu while a dropdown has focus', async () => {
       mockLibrary({ '2026-10-04': 100 });
       render(<App />);
-      toggleActivity.mockClear();
-      const event = fireEvent.keyDown(dayPicker(), { key: 'å', code: 'KeyA', metaKey: true, altKey: true });
-      expect(event).toBe(false);
-      expect(toggleActivity).toHaveBeenCalledTimes(1);
+      for (const name of ['Day', 'App', 'Playback speed']) {
+        const button = screen.getByRole('button', { name });
+        expect(fireEvent.keyPress(button, { key: 'h', charCode: 104, keyCode: 104, which: 104, metaKey: true })).toBe(true);
+        expect(fireEvent.keyPress(button, { key: 'a', charCode: 97, keyCode: 97, which: 97, ctrlKey: true })).toBe(true);
+      }
       await settleFrameTime();
     });
 
@@ -931,6 +951,179 @@ describe('App', () => {
       getPendingFrames.mockResolvedValue({ frameCount: 300, ranges: [] });
       finishLoading();
       await waitFor(() => expect(stretches()).toHaveLength(0));
+      await settleFrameTime();
+    });
+  });
+
+  describe('Beta video player', () => {
+    const hour = '2026-10-01--09-00-00--hourly.mov';
+
+    function mockVideoDay(videoPlayerBeta: boolean): void {
+      getSettings.mockResolvedValue({ updateAutomatically: true, sendErrorReports: false, videoPlayerBeta });
+      // Frames 0-199 are an hour of video, 200-299 still screenshots.
+      getDayVideos.mockResolvedValue({
+        frameCount: 300,
+        spans: [{ start: 0, end: 200, file: hour, fps: 15 }],
+      });
+      mockLibrary({ '2026-10-01': 300 }, 'mixed');
+    }
+
+    function video(): HTMLVideoElement | null {
+      return document.querySelector('video');
+    }
+
+    it('plays the hours kept as video in a video element when turned on', async () => {
+      mockVideoDay(true);
+      render(<App />);
+      await waitFor(() => expect(shownFrame()).toBe(frameUrl('2026-10-01', 299)));
+      expect(video()).toBeNull();
+      finishLoading();
+      await waitFor(() => expect(getDayVideos).toHaveBeenCalledWith('2026-10-01'));
+      await act(async () => {});
+
+      fireEvent.keyDown(window, { key: 'ArrowLeft', altKey: true });
+      await waitFor(() => expect(video()).not.toBeNull());
+      expect(video()?.getAttribute('src')).toBe(videoUrl(hour));
+      // The last frame stays up underneath until the video has one.
+      expect(shownFrame()).toBe(frameUrl('2026-10-01', 299));
+      expect(video()).toHaveClass('invisible');
+      // Nothing to decode, so nothing is drawn as pending.
+      expect(document.querySelectorAll('[data-pending-stretch]')).toHaveLength(0);
+      await settleFrameTime();
+    });
+
+    it('falls back to decoded frames when the video will not play', async () => {
+      mockVideoDay(true);
+      render(<App />);
+      await waitFor(() => expect(shownFrame()).toBe(frameUrl('2026-10-01', 299)));
+      finishLoading();
+      fireEvent.keyDown(window, { key: 'ArrowLeft', altKey: true });
+      await waitFor(() => expect(video()).not.toBeNull());
+
+      const consoleError = spyOn(console, 'error').mockImplementation(() => {});
+      fireEvent.error(video() as HTMLVideoElement);
+      consoleError.mockRestore();
+      await waitFor(() => expect(video()).toBeNull());
+      await waitFor(() => expect(shownFrame()).toBe(frameUrl('2026-10-01', 199)));
+      await settleFrameTime();
+    });
+
+    it('keeps the last video frame up until the frame after it has loaded', async () => {
+      mockVideoDay(true);
+      render(<App />);
+      await waitFor(() => expect(shownFrame()).toBe(frameUrl('2026-10-01', 299)));
+      finishLoading();
+      await waitFor(() => expect(getDayVideos).toHaveBeenCalledWith('2026-10-01'));
+      await act(async () => {});
+      fireEvent.keyDown(window, { key: 'ArrowLeft', altKey: true });
+      await waitFor(() => expect(video()).not.toBeNull());
+
+      // The video loads and lands on frame 199.
+      const element = video() as HTMLVideoElement;
+      Object.defineProperty(element, 'readyState', { value: 1 });
+      fireEvent(element, new Event('loadedmetadata'));
+      expect(element.currentTime).toBeCloseTo(199.5 / 15);
+      fireEvent(element, new Event('seeked'));
+      await waitFor(() => expect(element).not.toHaveClass('invisible'));
+
+      // Back into the screenshots: the video stays up until the image loads.
+      fireEvent.keyDown(window, { key: 'ArrowRight' });
+      await waitFor(() => expect(shownFrame()).toBe(frameUrl('2026-10-01', 200)));
+      expect(video()).toBe(element);
+      expect(element).not.toHaveClass('invisible');
+      finishLoading();
+      await waitFor(() => expect(video()).toBeNull());
+      await settleFrameTime();
+    });
+
+    it('stays off unless turned on', async () => {
+      mockVideoDay(false);
+      render(<App />);
+      await waitFor(() => expect(shownFrame()).toBe(frameUrl('2026-10-01', 299)));
+      finishLoading();
+      fireEvent.keyDown(window, { key: 'ArrowLeft', altKey: true });
+      await waitFor(() => expect(shownFrame()).toBe(frameUrl('2026-10-01', 199)));
+      expect(video()).toBeNull();
+      expect(getDayVideos).not.toHaveBeenCalled();
+      await settleFrameTime();
+    });
+  });
+
+  describe('Previews while dragging', () => {
+    /** A preview for every 15th frame, named after it. */
+    function mockPreviews(): void {
+      useDayPreviews.mockReturnValue({ at: (index) => `blob:preview-${Math.round(index / 15) * 15}` });
+    }
+
+    function preview(): HTMLImageElement | null {
+      return screen.queryByTestId('scrub-preview') as HTMLImageElement | null;
+    }
+
+    function slider(): HTMLInputElement {
+      return screen.getByRole('slider') as HTMLInputElement;
+    }
+
+    function drag(to: number): void {
+      fireEvent.change(slider(), { target: { value: String(to) } });
+    }
+
+    it('shows the nearest preview while dragging and holds the exact frame back', async () => {
+      mockPreviews();
+      mockLibrary({ '2026-10-01': 300 }, 'video');
+      render(<App />);
+      await settleFrameTime();
+      finishLoading();
+      expect(shownFrame()).toBe(frameUrl('2026-10-01', 299));
+      expect(preview()).toBeNull();
+
+      fireEvent.pointerDown(slider());
+      drag(100);
+      expect(preview()?.getAttribute('src')).toBe('blob:preview-105');
+      drag(40);
+      expect(preview()?.getAttribute('src')).toBe('blob:preview-45');
+      // Still moving: no exact frame asked for.
+      expect(shownFrame()).toBe(frameUrl('2026-10-01', 299));
+
+      // Paused on a frame: the exact frame loads and replaces the preview.
+      await waitFor(() => expect(shownFrame()).toBe(frameUrl('2026-10-01', 40)));
+      expect(preview()).not.toBeNull();
+      finishLoading();
+      expect(preview()).toBeNull();
+      await settleFrameTime();
+    });
+
+    it('keeps the preview after release until the exact frame is in, then lets go', async () => {
+      mockPreviews();
+      mockLibrary({ '2026-10-01': 300 }, 'video');
+      render(<App />);
+      await settleFrameTime();
+      finishLoading();
+
+      fireEvent.pointerDown(slider());
+      drag(200);
+      fireEvent.pointerUp(window);
+      expect(shownFrame()).toBe(frameUrl('2026-10-01', 200));
+      expect(preview()?.getAttribute('src')).toBe('blob:preview-195');
+      finishLoading();
+      expect(preview()).toBeNull();
+
+      // Arrow keys after the drag show exact frames only.
+      fireEvent.keyDown(window, { key: 'ArrowLeft' });
+      expect(preview()).toBeNull();
+      await settleFrameTime();
+    });
+
+    it('drags through exact frames where there are no previews', async () => {
+      mockLibrary({ '2026-10-01': 300 });
+      render(<App />);
+      await settleFrameTime();
+      finishLoading();
+
+      fireEvent.pointerDown(slider());
+      drag(100);
+      expect(preview()).toBeNull();
+      expect(shownFrame()).toBe(frameUrl('2026-10-01', 100));
+      fireEvent.pointerUp(window);
       await settleFrameTime();
     });
   });

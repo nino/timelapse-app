@@ -16,7 +16,9 @@
         "create": false,
         "title": "Timelapse App",
         "width": 800,
-        "height": 600
+        "height": 600,
+        "minWidth": 740,
+        "minHeight": 420
       }
     ],
     "security": {

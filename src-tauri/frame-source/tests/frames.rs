@@ -5,10 +5,13 @@
 use std::fs;
 use std::path::Path;
 use std::process::Command;
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
-use frame_source::{FrameRange, FrameSource, Source, Tools, CHUNK_FRAMES, READ_AHEAD_FRAMES};
+use frame_source::{
+    FrameRange, FrameSource, PackKind, PreviewJob, PreviewStore, Source, Tools, VideoSpan,
+    CHUNK_FRAMES, READ_AHEAD_FRAMES,
+};
 use tempfile::TempDir;
 
 const LEVEL_STEP: usize = 4;
@@ -21,9 +24,10 @@ fn make_video(path: &Path, frames: usize, level_offset: usize) {
         .args(["-v", "error", "-y", "-f", "lavfi", "-i", &filter])
         .args(["-frames:v", &frames.to_string()])
         // Keyframes every 2 s, like a real encode, so seeking has to decode
-        // forward from a keyframe to land on the right frame.
+        // forward from a keyframe to land on the right frame. No scene-cut
+        // keyframes, so the keyframes are known.
         .args([
-            "-c:v", "libx264", "-g", "30", "-pix_fmt", "yuv420p", "-qp", "0",
+            "-c:v", "libx264", "-g", "30", "-sc_threshold", "0", "-pix_fmt", "yuv420p", "-qp", "0",
         ])
         .arg(path)
         .status()
@@ -503,6 +507,61 @@ fn reports_video_frames_that_are_not_decoded_yet() {
     );
 }
 
+/// Wait for read-ahead's reports until `date`'s undecoded stretches are
+/// `expected`. Read-ahead may decode chunks in any order the viewer's
+/// requests leave it, so tests wait on the outcome, not on a count.
+fn wait_for_pending(
+    source: &FrameSource,
+    decoded: &mpsc::Receiver<String>,
+    date: &str,
+    expected: &[FrameRange],
+) {
+    while source.pending(date).unwrap().ranges != expected {
+        let day = decoded
+            .recv_timeout(Duration::from_secs(60))
+            .expect("read-ahead should decode a chunk");
+        assert_eq!(day, date);
+    }
+}
+
+#[test]
+fn lists_the_videos_a_day_is_played_from() {
+    let lib = Library::new();
+    let root = lib.root.path();
+    let day_dir = root.join("2026-10-04");
+    fs::create_dir(&day_dir).unwrap();
+    make_video(&root.join("2026-10-04--09-00-00--hourly.mov"), 4, 0);
+    write_shot(&day_dir, "03601.png", b"ten", "2026-10-04 10:00:00");
+    make_video(&root.join("2026-10-04--11-00-00--hourly.mov"), 3, 0);
+    let source = lib.source(u64::MAX);
+
+    let videos = source.day_videos("2026-10-04").unwrap();
+    assert_eq!(videos.frame_count, 8);
+    let span = |start, end, file: &str| VideoSpan {
+        start,
+        end,
+        file: file.to_owned(),
+        fps: 15.0,
+    };
+    assert_eq!(
+        videos.spans,
+        vec![
+            span(0, 4, "2026-10-04--09-00-00--hourly.mov"),
+            span(5, 8, "2026-10-04--11-00-00--hourly.mov"),
+        ]
+    );
+
+    // Only videos in the library root can be looked up, by bare name.
+    assert_eq!(
+        source.video_path("2026-10-04--09-00-00--hourly.mov"),
+        Some(root.join("2026-10-04--09-00-00--hourly.mov"))
+    );
+    assert_eq!(source.video_path("2026-10-04--12-00-00--hourly.mov"), None);
+    assert_eq!(source.video_path("2026-10-04/03601.png"), None);
+    assert_eq!(source.video_path("../2026-10-04--09-00-00--hourly.mov"), None);
+    assert_eq!(source.video_path("screenshots.db"), None);
+}
+
 #[test]
 fn reads_ahead_into_the_next_chunk_before_the_viewer_gets_there() {
     let lib = Library::new();
@@ -516,22 +575,26 @@ fn reads_ahead_into_the_next_chunk_before_the_viewer_gets_there() {
         decoded.send(date.to_owned()).unwrap();
     });
     let range = |start, end| FrameRange { start, end };
-    let wait = || {
-        read_ahead
-            .recv_timeout(Duration::from_secs(60))
-            .expect("read-ahead should decode a chunk")
-    };
 
-    // Mid-chunk, moving forward: nothing to read ahead yet.
+    // Mid-chunk, moving forward: only the chunk being viewed gets decoded.
     source.frame("2024-12-20", 0).unwrap();
     source.frame("2024-12-20", 10).unwrap();
+    wait_for_pending(
+        &source,
+        &read_ahead,
+        "2024-12-20",
+        &[range(CHUNK_FRAMES, 3 * CHUNK_FRAMES)],
+    );
     // Within READ_AHEAD_FRAMES of the next chunk: it gets decoded without
     // being asked for.
-    source.frame("2024-12-20", CHUNK_FRAMES - READ_AHEAD_FRAMES).unwrap();
-    assert_eq!(wait(), "2024-12-20");
-    assert_eq!(
-        source.pending("2024-12-20").unwrap().ranges,
-        vec![range(2 * CHUNK_FRAMES, 3 * CHUNK_FRAMES)]
+    source
+        .frame("2024-12-20", CHUNK_FRAMES - READ_AHEAD_FRAMES)
+        .unwrap();
+    wait_for_pending(
+        &source,
+        &read_ahead,
+        "2024-12-20",
+        &[range(2 * CHUNK_FRAMES, 3 * CHUNK_FRAMES)],
     );
     // And its frames are the right ones.
     assert_frame(
@@ -541,6 +604,47 @@ fn reads_ahead_into_the_next_chunk_before_the_viewer_gets_there() {
         (CHUNK_FRAMES + 7) * LEVEL_STEP % 256,
         lib.scratch.path(),
     );
+}
+
+#[test]
+fn serves_an_undecoded_frame_alone_then_decodes_its_chunk() {
+    let lib = Library::new();
+    make_video(
+        &lib.root.path().join("2024-12-20--09-00-00.mov"),
+        2 * CHUNK_FRAMES,
+        0,
+    );
+    let (decoded, read_ahead) = mpsc::channel();
+    let source = lib.source(u64::MAX).read_ahead(move |date| {
+        decoded.send(date.to_owned()).unwrap();
+    });
+    let range = |start, end| FrameRange { start, end };
+
+    // A frame in the middle of the second chunk, far from a keyframe.
+    let index = CHUNK_FRAMES + 47;
+    assert_frame(
+        &source,
+        "2024-12-20",
+        index,
+        index * LEVEL_STEP % 256,
+        lib.scratch.path(),
+    );
+    // Its chunk is decoded afterwards, so the next frames come from the cache.
+    wait_for_pending(
+        &source,
+        &read_ahead,
+        "2024-12-20",
+        &[range(0, CHUNK_FRAMES)],
+    );
+    assert_frame(
+        &source,
+        "2024-12-20",
+        index + 1,
+        (index + 1) * LEVEL_STEP % 256,
+        lib.scratch.path(),
+    );
+    // Past the end is still an error.
+    assert!(source.frame("2024-12-20", 2 * CHUNK_FRAMES).is_err());
 }
 
 #[test]
@@ -554,15 +658,10 @@ fn reads_back_from_the_end_of_a_day_it_opens_on() {
         decoded.send(date.to_owned()).unwrap();
     });
 
-    // The viewer opens a day on its last frame; the first video's two
-    // chunks are both within reach behind it.
+    // The viewer opens a day on its last frame; that frame's chunk and the
+    // first video's two chunks, both within reach behind it, all get decoded.
     source.frame("2024-12-20", 239).unwrap();
-    for _ in 0..2 {
-        read_ahead
-            .recv_timeout(Duration::from_secs(60))
-            .expect("read-ahead should decode a chunk");
-    }
-    assert_eq!(source.pending("2024-12-20").unwrap().ranges, vec![]);
+    wait_for_pending(&source, &read_ahead, "2024-12-20", &[]);
 }
 
 #[test]
@@ -778,4 +877,116 @@ fn finds_frames_in_recorded_videos_exactly() {
         source.indices_of_frames("2026-10-04", &[3, 11, 1, 10, 4]).unwrap(),
         vec![Some(2), Some(4), Some(0), Some(3), None]
     );
+}
+
+fn preview_source(lib: &Library, previews: &Path) -> FrameSource {
+    let store = PreviewStore::open(previews.to_path_buf(), u64::MAX).unwrap();
+    lib.source(u64::MAX).with_previews(Arc::new(store))
+}
+
+/// Mean luma of each image in a pack, in order, with its frame index.
+fn pack_lumas(bytes: &[u8], scratch: &Path) -> Vec<(usize, usize)> {
+    frame_source::previews::decode_pack(bytes)
+        .expect("a valid pack")
+        .into_iter()
+        .map(|(index, jpeg)| (index, luma(&jpeg, scratch)))
+        .collect()
+}
+
+/// Mean luma of a JPEG as stored. Unlike `gray_level`, the same for 4:2:0
+/// and 4:4:4 JPEGs (previews are 4:4:4), whose conversion to gray differs.
+fn luma(bytes: &[u8], dir: &Path) -> usize {
+    let file = dir.join("luma.jpg");
+    fs::write(&file, bytes).unwrap();
+    let output = Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(&file)
+        .args(["-vf", "scale=1:1", "-f", "rawvideo", "-pix_fmt", "yuvj444p", "-"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    usize::from(output.stdout[0])
+}
+
+/// Checks that each preview in `pack` looks like the exact frame it stands
+/// for, `first_index` being the video's first frame in `date`.
+fn assert_previews_match(
+    source: &FrameSource,
+    date: &str,
+    first_index: usize,
+    pack: &[u8],
+    scratch: &Path,
+) -> Vec<usize> {
+    let levels = pack_lumas(pack, scratch);
+    for &(index, level) in &levels {
+        let exact = luma(&source.frame(date, first_index + index).unwrap().bytes, scratch);
+        assert!(level.abs_diff(exact) <= 3, "preview of {index}: gray {level}, exact frame {exact}");
+    }
+    levels.into_iter().map(|(index, _)| index).collect()
+}
+
+#[test]
+fn builds_previews_around_the_viewer_coarse_first() {
+    let lib = Library::new();
+    let previews = TempDir::new().unwrap();
+    // Grays 32–228, inside video range (16–235): scaling clamps grays
+    // outside it, which real captures never have.
+    make_video(&lib.root.path().join("2024-12-20--09-00-00.mov"), 50, 32);
+    make_video(&lib.root.path().join("2024-12-20--17-05-22.mov"), 40, 40);
+    make_video(&lib.root.path().join("2024-12-19--09-00-00.mov"), 20, 0);
+    let source = preview_source(&lib, previews.path());
+    let scratch = lib.scratch.path();
+    let never = |_: &PreviewJob| false;
+
+    assert_eq!(source.day_previews("2024-12-20").unwrap().packs, vec![]);
+    // Nobody is looking yet: the library pass, newest video first.
+    let job = source.next_preview_job(&never).unwrap();
+    assert_eq!((job.date.as_str(), job.kind), ("2024-12-20", PackKind::Full));
+    assert!(job.video.ends_with("2024-12-20--17-05-22.mov"));
+
+    // Viewing the second video: keyframe packs first, nearest first.
+    source.frame("2024-12-20", 70).unwrap();
+    let mut built = Vec::new();
+    while let Some(job) = source.next_preview_job(&never) {
+        source.build_preview(&job).unwrap();
+        let name = job.video.file_name().unwrap().to_string_lossy().into_owned();
+        built.push((job.date, name, job.kind));
+        if built.len() == 2 {
+            // Coarse packs are served until the full ones exist.
+            let day = source.day_previews("2024-12-20").unwrap();
+            assert!(day.packs.iter().all(|pack| pack.coarse));
+            let pack = source.preview_pack(&day.packs[0].name).unwrap().unwrap();
+            // Only the keyframes, each placed at its own frame.
+            let indices = assert_previews_match(&source, "2024-12-20", 0, &pack, scratch);
+            assert_eq!(indices, vec![0, 30]);
+            // That asked for exact frames, which moved the viewer; put it back.
+            source.frame("2024-12-20", 70).unwrap();
+        }
+    }
+    let kinds: Vec<_> = built.iter().map(|(d, n, k)| (d.as_str(), &n[..19], *k)).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            ("2024-12-20", "2024-12-20--17-05-2", PackKind::Keyframes),
+            ("2024-12-20", "2024-12-20--09-00-0", PackKind::Keyframes),
+            ("2024-12-20", "2024-12-20--17-05-2", PackKind::Full),
+            ("2024-12-20", "2024-12-20--09-00-0", PackKind::Full),
+            ("2024-12-19", "2024-12-19--09-00-0", PackKind::Full),
+        ]
+    );
+
+    let day = source.day_previews("2024-12-20").unwrap();
+    assert_eq!(day.frame_count, 90);
+    assert_eq!(
+        day.packs
+            .iter()
+            .map(|p| (p.first_index, p.frame_count, p.coarse))
+            .collect::<Vec<_>>(),
+        vec![(0, 50, false), (50, 40, false)]
+    );
+    let pack = source.preview_pack(&day.packs[1].name).unwrap().unwrap();
+    let indices = assert_previews_match(&source, "2024-12-20", 50, &pack, scratch);
+    assert_eq!(indices, vec![0, 15, 30]);
+    // Fully previewed, so nothing is drawn as pending.
+    assert_eq!(source.pending("2024-12-20").unwrap().ranges, vec![]);
 }

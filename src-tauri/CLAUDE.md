@@ -4,17 +4,20 @@ Each module's `//!` doc comment says how it works; this file is the map and the 
 
 ## Modules
 
-- `lib.rs` — the Tauri commands, the `frames://localhost/<YYYY-MM-DD>/<index>` URI scheme (`http://frames.localhost/…` on Windows), the menu, and `setup()`, which creates the library directory, evicts cache folders over 15 days old, and starts the photographer (after a 1 s delay), OCR and the converter. State-backed commands are thin shims over `*_impl(&PhotographerState, …)` functions, which is what the tests call.
+- `lib.rs` — the Tauri commands, the `frames://localhost/<YYYY-MM-DD>/<index>` URI scheme (`http://frames.localhost/…` on Windows), the menu, and `setup()`, which creates the library directory, evicts cache folders over 15 days old, and starts the photographer (after a 1 s delay), OCR and the converter. Commands with logic worth testing are thin shims over `*_impl` functions that take plain arguments, which is what the tests call.
+- `media.rs` — the `videos://localhost/<file name>` URI scheme for the beta video player: library videos (`FrameSource::video_path`) served in byte ranges, which WebKit's media loader needs.
 - `timelapse.rs` — the `Photographer` capture loop.
 - `database.rs` — `ScreenshotDatabase` over `<library>/screenshots.db`, and its migrations.
 - `ocr.rs`, `ocr_helper.rs`, `ocr_tiles.rs`, `ocr_readahead.rs`, `menu_app.rs` — background OCR with Apple Vision (macOS only), run in a helper process because Vision can break for the rest of a process's life; during a boost, screenshots are read ahead by four helpers at once.
-- `converter.rs` — encodes each finished hour of PNGs into `<root>/YYYY-MM-DD--HH-MM-SS--hourly.mov` with ffmpeg, then deletes the PNGs.
-- `frame-source/` — **a separate crate** (no Tauri dependency) that answers "frame N of day D" whether the frame is a PNG, an hourly video or one of the old script's whole-day videos, with a chunked LRU cache of decoded video frames and read-ahead.
+- `converter.rs` — encodes each finished hour of PNGs into `<root>/YYYY-MM-DD--HH-MM-SS--hourly.mov` with ffmpeg, writing the hour's preview pack in the same run, then deletes the PNGs.
+- `frame-source/` — **a separate crate** (no Tauri dependency) that answers "frame N of day D" whether the frame is a PNG, an hourly video or one of the old script's whole-day videos, with a chunked LRU cache of decoded video frames and read-ahead. Its `previews` module keeps a preview pack per video (one 480-wide JPEG per 15 frames, or only the keyframes until that exists) in its own capped store, which the page loads once per day and shows while the scrubber is dragged; `frames://localhost/previews/<name>` serves them.
+- `previews.rs` — builds the packs old videos lack, one at a time at background priority and only while conversion may run: the open day first, outward from the viewer, then the rest of the library until the store is nearly full.
 - `day_status.rs` — how far OCR and video conversion have got with each day (not started, partly done, done), for the day picker, and how many days and frames each has left, for the Activity window; from directory listings, `ocr_progress` and OCR's own count of video-only days, never by probing a video.
 - `day_apps.rs` — which app was in front across a day (recorded window, else the OCR'd menu bar), as scrubber stretches for the app filter.
 - `activity.rs`, `boost.rs` — what the Activity window shows, and Boost / Low power mode, which change how hard conversion and OCR may work.
+- `backlog.rs` — logs once an hour how far behind OCR and video conversion are (frames left, age of the oldest screenshot each still has to do).
 - `diagnostics.rs` — `<library>/diagnostics.db`, a log for Nino to upload when something looks wrong.
-- `analytics.rs` — only when "Send error reports" is on in Settings (off by default; never nag anyone to turn it on), release builds made with `POSTHOG_KEY`/`POSTHOG_HOST` send an "app started" event and every error-level diagnostics event to PostHog, anonymously and rate-limited. The one exception is feedback from the Activity window (`send_feedback`), which the person sends on purpose, so it goes whatever the setting says. Never send library content (frames, OCR text, window titles) through it.
+- `analytics.rs` — only when "Send error reports" is on in Settings (off by default; never nag anyone to turn it on), release builds made with `POSTHOG_KEY`/`POSTHOG_HOST` send an "app started" event, every error-level diagnostics event and the hourly backlog (`backlog.rs`) to PostHog, anonymously and rate-limited. The one exception is feedback from the Activity window (`send_feedback`), which the person sends on purpose, so it goes whatever the setting says. Never send library content (frames, OCR text, window titles) through it.
 - `app_state.rs`, `settings.rs`, `updater.rs`, `paths.rs` — remembered window and viewer state, preferences, auto-update, library and ffmpeg paths.
 
 ## Data model
@@ -30,14 +33,14 @@ All in `screenshots.db`, keyed by `(day, frame_number)`:
 
 - **Filename format is load-bearing.** Screenshots are `NNNNN.png` (5-digit, zero-padded). `next_filename` returns the day folder's highest number plus one, and the frame source parses the same format (`parse_screenshot_name`). If you change one, change both. Numbering has gaps (old black frames, files removed by hand), so nothing may assume it is contiguous; the converter hard-links frames into a gapless sequence for ffmpeg.
 - **All-black frames are never written.** A black frame is dropped before it is saved, and its number is reused by the next capture.
-- **Write files atomically.** A frame is saved to `.NNNNN.png.tmp` and renamed into place; a video is renamed into the library root only once complete; a decoded chunk is staged in `.<chunk>.partial/`. Temp names are dotfiles with other extensions, so nothing that lists frames or videos picks them up.
+- **Write files atomically.** A frame is saved to `.NNNNN.png.tmp` and renamed into place; a video is renamed into the library root only once complete; a decoded chunk is staged in `.<chunk>.partial/`; a preview pack is written to `.<name>.<n>.tmp`. Temp names are dotfiles with other extensions, so nothing that lists frames or videos picks them up.
 - **Videos are a day source, not a separate list.** `library::parse_video_name` (frame-source) knows the two name formats, hourly (`YYYY-MM-DD--HH-MM-SS--hourly[-N].mov`, named after the first frame's time) and the old script's whole-day ones (named after the capture day and when the script ran, so not a start time). Anything new that writes videos must use one of them.
 - **Hours are bucketed the same way everywhere.** A screenshot's hour is the local hour of its mtime, clamped to its day folder's date; the converter and the frame source both call `frame_source::filed_at`.
 - **Never delete today's newest frame.** In today's folder the converter keeps the hour holding the highest-numbered frame, because deleting it would restart the day's numbering at `00001`.
 - **ffmpeg is a separate process.** A running encode is paused with `SIGSTOP` on battery and killed by `kill_running_encode` when the app quits or restarts (`RunEvent::Exit`, and before the updater's `app.restart()`, which skips `Exit`); otherwise it would outlive the app.
 - **Diagnostics are for changes and errors, never one row per frame.** Per-frame things go into a `Tally` written as one summary an hour.
 - **Settings and remembered state.** `settings.json` is shared by dev and release builds, and a new field needs a `#[serde(default)]` value. `state.json` is per profile, because the viewer position names a day in one library.
-- **The frontend's file access is scoped.** `capabilities/default.json`'s `fs:scope` permits both library trees two levels deep, and their `.cache/` three, because the scope is baked in at build time and can't branch on the profile. A new path the frontend needs must be added there, or it fails at runtime, not at build time.
+- **The frontend's file access is scoped.** `capabilities/default.json`'s `fs:scope` permits both library trees two levels deep (the root and the day folders, which the viewer watches), because the scope is baked in at build time and can't branch on the profile. A new path the frontend needs must be added there, or it fails at runtime, not at build time.
 
 ## Tests
 

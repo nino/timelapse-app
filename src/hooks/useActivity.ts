@@ -1,10 +1,10 @@
 import React from "react";
 
 import { getActivity, type Activity } from "../activity";
-import { useMountEffect } from "./useMountEffect";
+import { usePolling } from "./usePolling";
 
 /** How often the Activity window asks. The answer is read from memory in Rust. */
-export const ACTIVITY_POLL_MS = 1000;
+const ACTIVITY_POLL_MS = 1000;
 
 /**
  * The latest activity report and when it arrived, asked for every
@@ -23,53 +23,12 @@ export function useActivity(): {
     now: number;
     error: string | null;
   }>(() => ({ activity: null, now: Date.now(), error: null }));
-  const askNow = React.useRef<() => void>(() => {});
 
-  useMountEffect(() => {
-    let cancelled = false;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    let asking = false;
-
-    const ask = (): void => {
-      timer = undefined;
-      asking = true;
-      getActivity().then(
-        (activity) => {
-          if (!cancelled) setState({ activity, now: Date.now(), error: null });
-        },
-        (error: unknown) => {
-          if (!cancelled) setState((s) => ({ ...s, now: Date.now(), error: String(error) }));
-        },
-      ).finally(() => {
-        asking = false;
-        schedule();
-      });
-    };
-    // The next ask waits for this one, so slow answers never pile up.
-    const schedule = (): void => {
-      if (cancelled || asking || timer !== undefined || document.visibilityState !== "visible") return;
-      timer = setTimeout(ask, ACTIVITY_POLL_MS);
-    };
-    const onVisibilityChange = (): void => {
-      if (document.visibilityState === "visible" && !asking && timer === undefined) ask();
-    };
-    // An ask already under way may have started before the change; the next
-    // scheduled one picks it up a second later.
-    askNow.current = (): void => {
-      if (cancelled || asking) return;
-      if (timer !== undefined) clearTimeout(timer);
-      ask();
-    };
-
-    ask();
-    document.addEventListener("visibilitychange", onVisibilityChange);
-    return (): void => {
-      cancelled = true;
-      if (timer !== undefined) clearTimeout(timer);
-      document.removeEventListener("visibilitychange", onVisibilityChange);
-    };
-  });
-
-  const refresh = React.useCallback((): void => askNow.current(), []);
+  const refresh = usePolling(
+    getActivity,
+    ACTIVITY_POLL_MS,
+    (activity) => setState({ activity, now: Date.now(), error: null }),
+    (error) => setState((s) => ({ ...s, now: Date.now(), error: String(error) })),
+  );
   return { ...state, refresh };
 }

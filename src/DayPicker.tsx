@@ -1,9 +1,10 @@
-import { Listbox, ListboxButton, ListboxOption, ListboxOptions } from "@headlessui/react";
+import { Listbox, ListboxButton, ListboxOptions } from "@headlessui/react";
 import React from "react";
 
 import type { DayStatus, Stage } from "./frames";
 import { useDayStatuses } from "./hooks/useLibrary";
-import { focusRing } from "./ui";
+import { Chevron, DropdownOption, passShortcutsOn } from "./Dropdown";
+import { dropdownButton, menuPanel } from "./ui";
 
 /**
  * The day picker: the Ninoes Select (github.com/nino/ninoes,
@@ -30,7 +31,8 @@ export function DayPicker({
         <>
           <ListboxButton
             aria-label="Day"
-            className={`flex h-7.5 items-center gap-3 rounded-full border border-input bg-field pr-3.5 pl-4 text-sm font-medium tabular-nums ${focusRing}`}
+            onKeyPressCapture={passShortcutsOn}
+            className={`${dropdownButton} pl-3.5 font-medium tabular-nums`}
           >
             {value === null ? <span className="text-muted-fg">Select a day…</span> : label(value)}
             <Chevron />
@@ -56,10 +58,8 @@ function DayOptions({
   return (
     <ListboxOptions
       anchor={{ to: "bottom start", gap: 4 }}
-      className="z-10 max-h-96 min-w-(--button-width) overflow-y-auto rounded-2xl border border-border bg-card p-1 text-sm text-fg tabular-nums shadow-md outline-none"
+      className={`${menuPanel} min-w-(--button-width)`}
     >
-      {/* Options are concentric with the list: 16px minus the 1px border
-          and 4px padding. */}
       {monthsNewestFirst(days).map(({ month, dates }) => (
         <div key={month} role="group" aria-label={monthLabel(month)}>
           {/* Not an option, so Headless UI's arrow keys and typeahead skip it. */}
@@ -70,17 +70,10 @@ function DayOptions({
             {monthLabel(month)}
           </div>
           {dates.map((date) => (
-            <ListboxOption
-              key={date}
-              value={date}
-              className="flex h-7 cursor-default items-center justify-between gap-3 rounded-[11px] pr-2.5 pl-1.5 select-none data-focus:bg-muted data-selected:font-semibold"
-            >
-              <span className="flex items-center gap-1.5">
-                <Check />
-                {label(date)}
-              </span>
+            <DropdownOption key={date} value={date}>
+              <span className="flex-1">{label(date)}</span>
               <Status status={statuses.get(date)} />
-            </ListboxOption>
+            </DropdownOption>
           ))}
         </div>
       ))}
@@ -177,39 +170,6 @@ function Mark({ stage, children }: { stage: Stage; children: React.ReactNode }):
       <svg width="6" height="12" viewBox="0 0 6 12" className={DONE}>
         {children}
       </svg>
-    </svg>
-  );
-}
-
-export function Chevron(): React.ReactNode {
-  return (
-    <svg viewBox="0 0 16 16" aria-hidden="true" className="size-4 text-muted-fg">
-      <path
-        d="m4 6 4 4 4-4"
-        fill="none"
-        stroke="currentColor"
-        strokeWidth="1.5"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-      />
-    </svg>
-  );
-}
-
-// Only shown on the selected option (ListboxOption sets data-selected). It
-// leads the option, as in macOS menus, so anything on the right (the day
-// picker's status marks) can sit at the edge.
-export function Check(): React.ReactNode {
-  return (
-    <svg viewBox="0 0 16 16" aria-hidden="true" className="invisible size-3.5 shrink-0 in-data-selected:visible">
-      <path
-        d="m3.5 8.5 3 3 6-7"
-        fill="none"
-        stroke="currentColor"
-        strokeWidth="1.75"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-      />
     </svg>
   );
 }

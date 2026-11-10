@@ -119,7 +119,7 @@ pub fn extract_frames(
         .args(["-v", "error", "-nostdin", "-ss", &format!("{seek:.6}")])
         .arg("-i")
         .arg(video)
-        .args(["-frames:v", &count.to_string(), "-q:v", "3"])
+        .args(["-frames:v", &count.to_string(), "-q:v", JPEG_QUALITY])
         .arg(out_dir.join("%04d.jpg"))
         .output()
         .map_err(|e| Error::Tool(format!("could not run ffmpeg: {e}")))?;
@@ -136,6 +136,55 @@ pub fn extract_frames(
         .count();
     Ok(written)
 }
+
+/// Decode frame `index` alone as a JPEG, without writing anything to disk.
+/// `Ok(None)` if the video has no such frame. Costs the decode from the
+/// keyframe before it, but not the decode and JPEG encode of a whole chunk,
+/// so a viewer waiting on one frame gets it sooner than from
+/// `extract_frames`.
+pub fn extract_frame(
+    tools: &Tools,
+    video: &Path,
+    info: VideoInfo,
+    index: usize,
+) -> Result<Option<Vec<u8>>, Error> {
+    let output = Command::new(&tools.ffmpeg)
+        .args([
+            "-v",
+            "error",
+            "-nostdin",
+            "-ss",
+            &format!("{:.6}", seek_to(index, info)),
+        ])
+        .arg("-i")
+        .arg(video)
+        .args([
+            "-frames:v",
+            "1",
+            "-q:v",
+            JPEG_QUALITY,
+            "-f",
+            "image2pipe",
+            "-c:v",
+            "mjpeg",
+            "-",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| Error::Tool(format!("could not run ffmpeg: {e}")))?;
+    if !output.status.success() {
+        return Err(Error::Tool(format!(
+            "ffmpeg failed on {}: {}",
+            video.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok((!output.stdout.is_empty()).then_some(output.stdout))
+}
+
+/// ffmpeg's `-q:v` for decoded frames, the same for a chunk and a single
+/// frame so the two look alike.
+const JPEG_QUALITY: &str = "3";
 
 /// One decoded frame: `width` × `height` pixels of 8-bit RGB, row by row.
 pub struct RawFrame<'a> {
@@ -286,6 +335,28 @@ fn lower_priority(command: &mut Command) {
 
 #[cfg(not(unix))]
 fn lower_priority(_command: &mut Command) {}
+
+/// For work nobody is waiting on, such as building previews of old videos:
+/// nice 10, and on macOS also the background policy `taskpolicy -b` applies
+/// (throttled, and kept on the efficiency cores on Apple Silicon), as the
+/// converter's encodes run.
+pub fn idle_priority(command: &mut Command) {
+    lower_priority(command);
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: setpriority is a single system call, safe between fork and
+        // exec; it only changes the process about to exec ffmpeg.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpriority(libc::PRIO_DARWIN_PROCESS, 0, libc::PRIO_DARWIN_BG) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
