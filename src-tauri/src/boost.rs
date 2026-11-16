@@ -3,6 +3,9 @@
 //! Normally both run at background priority (ffmpeg under `taskpolicy -b`,
 //! the OCR thread at the background QoS class), batches start at most every
 //! ten minutes, and on battery only OCR of new screenshots runs (`ocr.rs`).
+//! ffmpeg also leaves background priority by itself when the oldest hour
+//! waiting for a video is more than a day and a half old
+//! (`converter::CATCH_UP_AFTER`).
 //! While a boost is on, ffmpeg and OCR run at normal priority, batches
 //! follow each other straight away, and, if the boost allows it, they also
 //! run at full speed on battery.

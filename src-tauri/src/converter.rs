@@ -7,7 +7,10 @@
 //! minutes, so a backlog (say, after a stretch on battery) is worked off
 //! quickly once OCR has caught up. Nothing is encoded unless the machine is on
 //! AC power, and an encode in progress is paused while the power is unplugged.
-//! A boost (see `boost.rs`) lifts these limits for a while.
+//! A boost (see `boost.rs`) lifts these limits for a while. ffmpeg runs at
+//! background priority, except during a boost or while the oldest waiting
+//! hour is more than `CATCH_UP_AFTER` old: then it encodes at normal
+//! priority, still on AC only, until the backlog is younger again.
 //!
 //! An hour whose video exists counts as converted. Its PNGs are then deleted,
 //! as the scripts did, once `OcrCheck` still agrees that OCR has read them.
@@ -60,6 +63,15 @@ const LATE_WRITE_GRACE_SECS: i64 = 60;
 /// starts this long after the previous one started; an encode that takes
 /// longer than this is followed by the next one straight away.
 const BATCH_INTERVAL: Duration = Duration::from_secs(10 * 60);
+
+/// How old the oldest hour waiting to be converted must be before encodes
+/// run at normal priority instead of in the background. A Mac left on AC
+/// overnight clears its videos while nobody uses it, so its oldest waiting
+/// hour stays under a day (at most 23 h in the hourly backlog log, November
+/// 2026); one that is mostly asleep or on battery outside working hours fell
+/// days behind, because a background encode barely outpaced capture. Past
+/// this age it encodes as during a boost, on AC only.
+const CATCH_UP_AFTER: chrono::Duration = chrono::Duration::hours(36);
 
 /// How long to wait before looking again when there is nothing to convert.
 const IDLE_POLL: Duration = Duration::from_secs(5 * 60);
@@ -753,7 +765,7 @@ fn progress_frame(line: &str) -> Option<usize> {
 
 /// Encode with ffmpeg, pausing while the power is unplugged (unless `boost`
 /// allows battery) and giving up if `running` clears. ffmpeg runs at
-/// background priority except during a boost. `on_progress` is called with
+/// background priority except during a boost or while `catching_up`. `on_progress` is called with
 /// the number of frames encoded so far, and `on_pause` with `true` when the
 /// encode pauses and `false` when it carries on.
 fn encode_with_ffmpeg(
@@ -761,11 +773,12 @@ fn encode_with_ffmpeg(
     output: &Path,
     running: &AtomicBool,
     boost: &Boost,
+    catching_up: bool,
     on_progress: impl Fn(usize) + Send + 'static,
     on_pause: impl FnMut(bool),
 ) -> Result<(), ConvertError> {
     let mut boosted = boost.is_on();
-    let mut child = ffmpeg_command(frames_dir, output, !boosted)
+    let mut child = ffmpeg_command(frames_dir, output, !(boosted || catching_up))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         // `-loglevel error` keeps stderr short enough that it cannot fill the
@@ -807,7 +820,9 @@ fn encode_with_ffmpeg(
             let boosted_now = boost.is_on();
             if boosted_now != boosted {
                 boosted = boosted_now;
-                set_background(pid, !boosted);
+                if !catching_up {
+                    set_background(pid, !boosted);
+                }
                 // Look at the power again: the boost may allow battery, or
                 // its end may forbid it.
                 power = None;
@@ -956,6 +971,12 @@ impl Converter {
             batch.day,
             batch.hour
         );
+        let catching_up = is_far_behind(&batch, now);
+        if catching_up {
+            crate::diagnostics::info("converter", "Catching up at normal priority")
+                .data(serde_json::json!({ "day": batch.day, "hour": batch.hour }))
+                .record();
+        }
         let started = Instant::now();
         let video_name = batch.video_name();
         activity.encoding_started(Encoding {
@@ -981,6 +1002,7 @@ impl Converter {
                     output,
                     &running_owned,
                     &boost_owned,
+                    catching_up,
                     move |frames| progress.encoding_progress(frames),
                     |paused| {
                         if paused {
@@ -1056,6 +1078,12 @@ fn delete_converted(root: &Path, ocr_done: &OcrCheck, activity: &Activity) {
     if let Err(e) = remove_empty_day_folders(root, now) {
         crate::diagnostics::warn("converter", format!("Failed to remove empty day folders: {}", e)).record();
     }
+}
+
+/// Whether `batch`, the oldest hour waiting, started more than
+/// `CATCH_UP_AFTER` before `now`, so it is encoded at normal priority.
+fn is_far_behind(batch: &HourBatch, now: DateTime<Local>) -> bool {
+    now.naive_local() - batch.start > CATCH_UP_AFTER
 }
 
 /// How long to wait after a batch that took `took`, so that the next one
@@ -1569,6 +1597,24 @@ mod tests {
     }
 
     #[test]
+    fn encodes_at_normal_priority_once_the_oldest_hour_is_a_day_and_a_half_old() {
+        let batch = |start: DateTime<Local>| HourBatch {
+            day: start.format("%Y-%m-%d").to_string(),
+            hour: 9,
+            start: start.naive_local(),
+            part: 0,
+            frames: Vec::new(),
+        };
+        let now = at("2026-11-16", 12, 0);
+        // A night's backlog on a Mac left on AC: background priority.
+        assert!(!is_far_behind(&batch(at("2026-11-15", 13, 0)), now));
+        assert!(!is_far_behind(&batch(at("2026-11-15", 0, 0)), now));
+        // Days behind, as on a laptop that sleeps outside working hours.
+        assert!(is_far_behind(&batch(at("2026-11-14", 23, 0)), now));
+        assert!(is_far_behind(&batch(at("2026-11-10", 9, 0)), now));
+    }
+
+    #[test]
     fn batches_follow_each_other_during_a_boost() {
         assert_eq!(rest_after(Duration::from_secs(60), true), Duration::ZERO);
     }
@@ -1767,7 +1813,7 @@ mod tests {
         let previews = TempDir::new().unwrap();
         let store = PreviewStore::open(previews.path().to_path_buf(), u64::MAX).unwrap();
         let name = convert_batch(root, &batch, Some(&store), |dir, out| {
-            encode_with_ffmpeg(dir, out, &running, &Boost::default(), move |frames| reported.lock().unwrap().push(frames), |_| {})
+            encode_with_ffmpeg(dir, out, &running, &Boost::default(), false, move |frames| reported.lock().unwrap().push(frames), |_| {})
         })
         .unwrap();
         // The reader thread may still be draining the pipe for a moment.
