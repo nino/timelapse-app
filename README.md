@@ -27,7 +27,9 @@ there are no analytics.
   (as OCR) are kept.
 - **Battery-friendly background work.** OCR and video conversion run at
   background priority. Video conversion runs only on AC power, and an encode
-  in progress pauses when you unplug; on battery, OCR keeps reading new
+  in progress pauses when you unplug; when the oldest unconverted hour is more
+  than a day and a half old, encoding speeds up to normal priority until it
+  catches up; on battery, OCR keeps reading new
   screenshots every few minutes. The Activity window (Window → Activity) shows what they are
   doing and offers **Boost** (work at full speed for a while, optionally on
   battery) and **Low power** (pause both for a while, even on AC power).

@@ -237,7 +237,8 @@ const plainButton = `rounded-xl border border-border bg-card px-3 py-1 font-medi
  * on battery too if asked; low-power mode keeps them off for a while, even on
  * AC power. Normally both run at background priority, a batch at most every
  * ten minutes, on AC power only, except that OCR keeps reading new screenshots
- * on battery.
+ * on battery, and encoding speeds up by itself once the video backlog is over
+ * a day and a half old.
  */
 function Power({
   boost,
