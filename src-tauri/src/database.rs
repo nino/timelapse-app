@@ -35,6 +35,7 @@
 use rusqlite::{Connection, OptionalExtension, Result, Transaction, TransactionBehavior};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use chrono::{DateTime, Utc, Local};
 use crate::menu_app::menu_bar_app;
@@ -187,6 +188,72 @@ pub struct ScreenshotDatabase {
     conn: Connection,
 }
 
+/// How many read-only connections the viewer's commands (searches, OCR
+/// lines, day statuses) have open at most; more callers at once wait for one.
+const READERS: usize = 4;
+
+/// The read-only connections to one database file, kept open between
+/// commands and never more than `READERS` of them.
+///
+/// Opening a connection per command ran the app out of file descriptors.
+/// While any other connection in the process has the file open (the capture
+/// loop's and OCR's always do), SQLite can't close a connection's file
+/// without dropping that connection's locks, so it keeps the descriptor for
+/// reuse instead, and the process ends up holding as many as were ever open
+/// at once.
+struct ReaderPool {
+    path: PathBuf,
+    state: Mutex<PoolState>,
+    freed: Condvar,
+}
+
+struct PoolState {
+    idle: Vec<ScreenshotDatabase>,
+    /// Idle and in use.
+    open: usize,
+}
+
+/// A read-only connection from `ScreenshotDatabase::reader`, handed back
+/// for the next caller when dropped.
+pub struct Reader {
+    db: Option<ScreenshotDatabase>,
+    pool: &'static ReaderPool,
+}
+
+impl std::ops::Deref for Reader {
+    type Target = ScreenshotDatabase;
+
+    fn deref(&self) -> &ScreenshotDatabase {
+        self.db.as_ref().expect("held until dropped")
+    }
+}
+
+impl Drop for Reader {
+    fn drop(&mut self) {
+        if let Some(db) = self.db.take() {
+            self.pool.state.lock().unwrap().idle.push(db);
+            self.pool.freed.notify_one();
+        }
+    }
+}
+
+/// The pool for `path`, made on first use. One per library, so a leaked
+/// handful at most.
+fn reader_pool(path: PathBuf) -> &'static ReaderPool {
+    static POOLS: OnceLock<Mutex<HashMap<PathBuf, &'static ReaderPool>>> = OnceLock::new();
+    let mut pools = POOLS.get_or_init(Default::default).lock().unwrap();
+    pools.entry(path.clone()).or_insert_with(|| {
+        Box::leak(Box::new(ReaderPool {
+            path,
+            state: Mutex::new(PoolState {
+                idle: Vec::new(),
+                open: 0,
+            }),
+            freed: Condvar::new(),
+        }))
+    })
+}
+
 /// The app and window that were in front when a screenshot was taken.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FrontWindow {
@@ -218,6 +285,36 @@ impl ScreenshotDatabase {
         // a checkpoint resets it, both quick.
         conn.busy_timeout(Duration::from_secs(5))?;
         Ok(Some(Self { conn }))
+    }
+
+    /// A read-only connection to the database at `db_path`, from a pool
+    /// shared by every caller (see `ReaderPool`): use this, not
+    /// `open_read_only`, for anything the viewer asks for. Waits while
+    /// `READERS` are in use. `None` if the database does not exist yet.
+    pub fn reader(db_path: PathBuf) -> Result<Option<Reader>> {
+        if !db_path.is_file() {
+            return Ok(None);
+        }
+        let pool = reader_pool(db_path);
+        let mut state = pool.state.lock().unwrap();
+        loop {
+            if let Some(db) = state.idle.pop() {
+                return Ok(Some(Reader { db: Some(db), pool }));
+            }
+            if state.open < READERS {
+                state.open += 1;
+                drop(state);
+                return match Self::open_read_only(pool.path.clone()) {
+                    Ok(Some(db)) => Ok(Some(Reader { db: Some(db), pool })),
+                    failed => {
+                        pool.state.lock().unwrap().open -= 1;
+                        pool.freed.notify_one();
+                        failed.map(|_| None)
+                    }
+                };
+            }
+            state = pool.freed.wait(state).unwrap();
+        }
     }
 
     /// Create a new database connection and initialize the schema
@@ -1928,6 +2025,37 @@ mod tests {
         assert_eq!(lines_matching(&lines, "test lai").unwrap(), vec![1, 3]);
         assert_eq!(lines_matching(&lines, "\"cargo $").unwrap(), vec![0, 3]);
         assert!(lines_matching(&lines, " ").unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_readers_are_shared_and_capped() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("test.db");
+        assert!(ScreenshotDatabase::reader(path.clone()).unwrap().is_none());
+        let _writer = ScreenshotDatabase::new(path.clone()).unwrap();
+
+        // All of them in use: the next caller waits for one to come back.
+        let held: Vec<Reader> = (0..READERS)
+            .map(|_| ScreenshotDatabase::reader(path.clone()).unwrap().unwrap())
+            .collect();
+        let (got, wait_got) = std::sync::mpsc::channel();
+        let waiter = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                let reader = ScreenshotDatabase::reader(path).unwrap().unwrap();
+                got.send(()).unwrap();
+                reader.ocr_version().unwrap();
+            })
+        };
+        assert!(wait_got.recv_timeout(Duration::from_millis(200)).is_err());
+        drop(held);
+        wait_got.recv_timeout(Duration::from_secs(5)).unwrap();
+        waiter.join().unwrap();
+
+        // Handed back, not closed: no more were opened.
+        let pool = reader_pool(path);
+        let state = pool.state.lock().unwrap();
+        assert_eq!((state.open, state.idle.len()), (READERS, READERS));
     }
 
     #[test]

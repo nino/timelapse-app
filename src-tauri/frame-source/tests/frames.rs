@@ -147,12 +147,12 @@ fn serves_exact_frames_across_chunks_and_videos() {
 fn write_db(root: &Path, times: &[&str]) {
     let conn = rusqlite::Connection::open(root.join("screenshots.db")).unwrap();
     conn.execute_batch(
-        "CREATE TABLE screenshots (id INTEGER PRIMARY KEY, frame_number INTEGER, local_time TEXT)",
+        "CREATE TABLE screenshots (id INTEGER PRIMARY KEY, day TEXT, frame_number INTEGER, local_time TEXT)",
     )
     .unwrap();
     for (n, time) in times.iter().enumerate() {
         conn.execute(
-            "INSERT INTO screenshots (frame_number, local_time) VALUES (?1, ?2)",
+            "INSERT INTO screenshots (day, frame_number, local_time) VALUES (substr(?2, 1, 10), ?1, ?2)",
             rusqlite::params![n as i64 + 1, time],
         )
         .unwrap();
