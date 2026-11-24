@@ -12,6 +12,13 @@ export function ensureError(val: unknown): Error {
   return new Error(String(val));
 }
 
+/**
+ * How often a failed load is tried again. Library changes reload too, but
+ * a failure such as running out of file descriptors can outlast them, and
+ * the window shows nothing but the error until a load succeeds.
+ */
+export const LOAD_RETRY_MS = 3000;
+
 /** Every day with frames, oldest first, kept current. */
 export function useDays(): {
   days: Array<string>;
@@ -37,6 +44,7 @@ export function useDays(): {
   const reload = useLatestLoad(load);
   // New day folders and new videos both land in the root.
   useDirectoryChanges(timelapseRoot(), reload);
+  useInterval(reload, daysError ? LOAD_RETRY_MS : null);
 
   return { days, daysError };
 }
@@ -130,6 +138,7 @@ export function useDay(date: string | null): {
   useDirectoryChanges(date ? timelapseRoot() : null, reload);
 
   const current = state.date === date && date !== null;
+  useInterval(reload, current && state.error ? LOAD_RETRY_MS : null);
   return {
     day: current ? state.day : null,
     dayError: current ? state.error : null,

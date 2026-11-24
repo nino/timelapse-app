@@ -6,7 +6,7 @@ import { act, renderHook, waitFor } from '@testing-library/react';
 import type { Day } from '../frames';
 import { mocked } from '../test/mocked';
 import { TEST_ROOT } from '../test/setup';
-import { useDay, useDayStatuses, useDays } from './useLibrary';
+import { LOAD_RETRY_MS, useDay, useDayStatuses, useDays } from './useLibrary';
 
 // invoke and watch are replaced with mocks in src/test/setup.ts.
 
@@ -76,9 +76,33 @@ describe('useDays', () => {
     fireChange(TEST_ROOT);
     await waitFor(() => expect(result.current.daysError).toBeNull());
   });
+
+  it('tries a failed load again by itself', async () => {
+    mocked(invoke).mockRejectedValueOnce('Too many open files (os error 24)');
+    const { result } = renderHook(() => useDays());
+    await waitFor(() => expect(result.current.daysError).not.toBeNull());
+
+    mocked(invoke).mockResolvedValueOnce(['2024-12-20']);
+    await waitFor(() => expect(result.current.days).toEqual(['2024-12-20']), {
+      timeout: LOAD_RETRY_MS + 2000,
+    });
+    expect(result.current.daysError).toBeNull();
+  });
 });
 
 describe('useDay', () => {
+  it('tries a failed load again by itself', async () => {
+    mocked(invoke).mockRejectedValueOnce('Too many open files (os error 24)');
+    const { result } = renderHook(() => useDay('2026-10-04'));
+    await waitFor(() => expect(result.current.dayError).not.toBeNull());
+
+    mocked(invoke).mockResolvedValueOnce(day('2026-10-04', 10));
+    await waitFor(() => expect(result.current.day?.frameCount).toBe(10), {
+      timeout: LOAD_RETRY_MS + 2000,
+    });
+    expect(result.current.dayError).toBeNull();
+  });
+
   it('loads the day and follows new captures in its folder', async () => {
     mocked(invoke).mockResolvedValueOnce(day('2026-10-04', 10));
     const { result } = renderHook(() => useDay('2026-10-04'));

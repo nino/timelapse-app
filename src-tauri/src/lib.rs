@@ -136,7 +136,7 @@ async fn get_day_statuses() -> Result<Vec<day_status::DayStatus>, String> {
     run_blocking(move || {
         // A database that can't be opened reads as one OCR hasn't touched.
         let db = library_db(&timelapse_root).unwrap_or(None);
-        day_status::day_statuses(&timelapse_root, db.as_ref()).map_err(|e| e.to_string())
+        day_status::day_statuses(&timelapse_root, db.as_deref()).map_err(|e| e.to_string())
     })
     .await
 }
@@ -249,9 +249,10 @@ struct DayMatch {
     frame: u32,
 }
 
-/// The read-only library database in `root`, or `None` before it exists.
-fn library_db(root: &Path) -> Result<Option<ScreenshotDatabase>, String> {
-    ScreenshotDatabase::open_read_only(root.join("screenshots.db")).map_err(|e| e.to_string())
+/// A read-only connection to the library database in `root`, or `None`
+/// before it exists.
+fn library_db(root: &Path) -> Result<Option<database::Reader>, String> {
+    ScreenshotDatabase::reader(root.join("screenshots.db")).map_err(|e| e.to_string())
 }
 
 /// Every place on `date`'s scrubber where OCR read text matching `query`, in
@@ -342,7 +343,7 @@ async fn get_day_apps(
     let source = Arc::clone(source.inner());
     run_blocking(move || {
         let db = library_db(&timelapse_root)?;
-        day_apps::day_apps(db.as_ref(), &source, &date)
+        day_apps::day_apps(db.as_deref(), &source, &date)
     })
     .await
 }
@@ -508,7 +509,7 @@ async fn get_remaining_work(activity: State<'_, ActivityState>) -> Result<day_st
     let video_frames_left = activity.ocr_video_frames_left();
     run_blocking(move || {
         let db = library_db(&timelapse_root).unwrap_or(None);
-        day_status::remaining_work(&timelapse_root, db.as_ref(), video_frames_left.as_ref()).map_err(|e| e.to_string())
+        day_status::remaining_work(&timelapse_root, db.as_deref(), video_frames_left.as_ref()).map_err(|e| e.to_string())
     })
     .await
 }
@@ -1035,7 +1036,32 @@ pub fn run_ocr_helper_if_asked() -> bool {
     true
 }
 
+/// Raise this process's limit on open files from macOS's default of 256 for
+/// apps started from Finder, which the app's own files, ffmpeg's pipes and
+/// WebKit's share, to what the system allows. Scrubbing once ran past 256;
+/// this is headroom, not the fix for that.
+#[cfg(unix)]
+fn raise_open_file_limit() {
+    // OPEN_MAX: macOS refuses a soft limit above it even when the hard
+    // limit is unlimited.
+    const MOST: libc::rlim_t = 10_240;
+    // SAFETY: getrlimit and setrlimit only read and write the struct.
+    unsafe {
+        let mut limit: libc::rlimit = std::mem::zeroed();
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
+            return;
+        }
+        let wanted = limit.rlim_max.min(MOST);
+        if limit.rlim_cur < wanted {
+            limit.rlim_cur = wanted;
+            libc::setrlimit(libc::RLIMIT_NOFILE, &limit);
+        }
+    }
+}
+
 pub fn run() {
+    #[cfg(unix)]
+    raise_open_file_limit();
     let photographer_state: PhotographerState = Arc::new(Mutex::new(None));
     let activity: ActivityState = Arc::default();
 

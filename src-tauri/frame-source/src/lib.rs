@@ -266,6 +266,15 @@ pub struct FrameSource {
     /// time order. Only asked for videos the converter recorded no
     /// frames for; the hour has ended, so its rows no longer change.
     hour_times: Mutex<HashMap<PathBuf, Arc<Vec<String>>>>,
+    /// One read-only connection to the library database, opened on first
+    /// use and shared by every caller, one at a time. Opening one per call
+    /// runs the app out of file descriptors: while any other connection in
+    /// the process has the database open (the capture loop's always does),
+    /// SQLite can't close a connection's file without dropping that one's
+    /// locks, so it keeps the descriptor for reuse instead. The process
+    /// then holds as many as were ever open at once, and fast scrubbing,
+    /// which asks for a frame time at every step, had hundreds open at once.
+    db: Mutex<Option<rusqlite::Connection>>,
 }
 
 impl FrameSource {
@@ -294,6 +303,7 @@ impl FrameSource {
             day_times: Mutex::new(HashMap::new()),
             recorded_frames: Mutex::new(HashMap::new()),
             hour_times: Mutex::new(HashMap::new()),
+            db: Mutex::new(None),
         })
     }
 
@@ -944,22 +954,21 @@ impl FrameSource {
     fn frame_hours(&self, date: &str) -> Result<FrameHours, Error> {
         let mut hours = FrameHours::default();
         let day = parse_date(date)?;
-        let Some(conn) = self.open_db()? else {
-            return Ok(hours);
-        };
         // Keyed on the day folder the frame was written to, like the OCR rows
         // being looked up: a capture just before midnight can be stamped
         // with the next day's time.
-        let mut statement = conn.prepare(
-            "SELECT frame_number, local_time FROM screenshots
-             WHERE day = ?1
-             ORDER BY frame_number",
-        )?;
-        let rows = statement.query_map([date], |row| {
-            Ok((row.get::<_, u32>(0)?, row.get::<_, String>(1)?))
+        let rows = self.with_db(|conn| {
+            let mut statement = conn.prepare(
+                "SELECT frame_number, local_time FROM screenshots
+                 WHERE day = ?1
+                 ORDER BY frame_number",
+            )?;
+            let rows = statement
+                .query_map([date], |row| Ok((row.get::<_, u32>(0)?, row.get::<_, String>(1)?)))?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
         })?;
-        for row in rows {
-            let (number, time) = row?;
+        for (number, time) in rows.unwrap_or_default() {
             let Some(hour) = local_hour(&time, day) else {
                 continue;
             };
@@ -1096,19 +1105,22 @@ impl FrameSource {
         if let Some(times) = self.day_times.lock().unwrap().get(&day) {
             return Ok(times.clone());
         }
-        let Some(conn) = self.open_db()? else {
+        let times = self.with_db(|conn| {
+            let mut statement = conn.prepare(
+                "SELECT frame_number, local_time FROM screenshots
+                 WHERE substr(local_time, 1, 10) = ?1
+                 ORDER BY frame_number, id",
+            )?;
+            let times = statement
+                .query_map([day.format("%Y-%m-%d").to_string()], |row| {
+                    Ok((row.get::<_, u32>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(times)
+        })?;
+        let Some(times) = times else {
             return Ok(Arc::default());
         };
-        let mut statement = conn.prepare(
-            "SELECT frame_number, local_time FROM screenshots
-             WHERE substr(local_time, 1, 10) = ?1
-             ORDER BY frame_number, id",
-        )?;
-        let times = statement
-            .query_map([day.format("%Y-%m-%d").to_string()], |row| {
-                Ok((row.get::<_, u32>(0)?, row.get::<_, String>(1)?))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
         let times = Arc::new(times);
         self.day_times.lock().unwrap().insert(day, times.clone());
         Ok(times)
@@ -1128,19 +1140,28 @@ impl FrameSource {
         let hour = video.hour();
         let query = |conn: &rusqlite::Connection| -> rusqlite::Result<Vec<String>> {
             // `local_time` is ISO 8601, so comparing it as text against the
-            // hour's bounds compares times.
+            // hour's bounds compares times. The day folders around the hour
+            // (a capture just before midnight can be stamped with the next
+            // day's time) let `screenshots_day_frame` narrow the rows first,
+            // instead of every row in the library being read.
+            let day = |time: chrono::NaiveDateTime| time.format("%Y-%m-%d").to_string();
             conn.prepare(
                 "SELECT local_time FROM screenshots
-                 WHERE local_time >= ?1 AND local_time < ?2
+                 WHERE day >= ?3 AND day <= ?4 AND local_time >= ?1 AND local_time < ?2
                  ORDER BY local_time, id",
             )?
             .query_map(
-                rusqlite::params![format(hour), format(hour + Duration::minutes(61))],
+                rusqlite::params![
+                    format(hour),
+                    format(hour + Duration::minutes(61)),
+                    day(hour - Duration::days(1)),
+                    day(hour + Duration::minutes(61)),
+                ],
                 |row| row.get::<_, String>(0),
             )?
             .collect()
         };
-        let Ok(Some(Ok(times))) = self.open_db().map(|conn| conn.map(|conn| query(&conn))) else {
+        let Ok(Some(times)) = self.with_db(|conn| Ok(query(conn)?)) else {
             return Arc::default();
         };
         let times = Arc::new(times);
@@ -1177,7 +1198,7 @@ impl FrameSource {
             .query_map([name], |row| Ok((row.get::<_, u32>(0)?, row.get::<_, String>(1)?)))?
             .collect()
         };
-        let Ok(Some(Ok(frames))) = self.open_db().map(|conn| conn.map(|conn| query(&conn))) else {
+        let Ok(Some(frames)) = self.with_db(|conn| Ok(query(conn)?)) else {
             return Arc::default();
         };
         // The record is written before the video is published, or, for an
@@ -1191,36 +1212,55 @@ impl FrameSource {
         frames
     }
 
-    fn open_db(&self) -> Result<Option<rusqlite::Connection>, Error> {
-        let db = self.root.join("screenshots.db");
-        if !db.is_file() {
+    /// Run `query` on the shared read-only connection (see `db`), opening it
+    /// first if need be. `Ok(None)` while the library has no database.
+    fn with_db<T>(
+        &self,
+        query: impl FnOnce(&rusqlite::Connection) -> Result<T, Error>,
+    ) -> Result<Option<T>, Error> {
+        let path = self.root.join("screenshots.db");
+        let mut db = self.db.lock().unwrap();
+        if !path.is_file() {
+            *db = None;
             return Ok(None);
         }
-        Ok(Some(rusqlite::Connection::open_with_flags(
-            &db,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?))
+        let conn = match db.take() {
+            Some(conn) => conn,
+            None => {
+                let conn = rusqlite::Connection::open_with_flags(
+                    &path,
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+                )?;
+                // In WAL mode a reader only waits while a writer sets the log
+                // up or a checkpoint resets it, both quick.
+                conn.busy_timeout(StdDuration::from_secs(2))?;
+                conn
+            }
+        };
+        let result = query(&conn);
+        *db = Some(conn);
+        result.map(Some)
     }
 
     fn db_time(&self, date: &str, frame_number: u32) -> Result<Option<String>, Error> {
-        let Some(conn) = self.open_db()? else {
-            return Ok(None);
-        };
-        // Frame numbers restart every day, so the date has to be part of the
-        // key. `local_time` is ISO 8601 in local time, so its first ten
-        // characters are the day folder's name.
-        let result = conn.query_row(
-            "SELECT local_time FROM screenshots
-             WHERE frame_number = ?1 AND substr(local_time, 1, 10) = ?2
-             ORDER BY id DESC LIMIT 1",
-            rusqlite::params![frame_number, date],
-            |row| row.get::<_, String>(0),
-        );
-        match result {
-            Ok(time) => Ok(Some(time)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
+        // Frame numbers restart every day, so the day folder has to be part
+        // of the key; `screenshots_day_frame` indexes the two together, so
+        // this is a lookup rather than a scan of every row.
+        let time = self.with_db(|conn| {
+            let result = conn.query_row(
+                "SELECT local_time FROM screenshots
+                 WHERE day = ?2 AND frame_number = ?1
+                 ORDER BY id DESC LIMIT 1",
+                rusqlite::params![frame_number, date],
+                |row| row.get::<_, String>(0),
+            );
+            match result {
+                Ok(time) => Ok(Some(time)),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                Err(e) => Err(e.into()),
+            }
+        })?;
+        Ok(time.flatten())
     }
 }
 
