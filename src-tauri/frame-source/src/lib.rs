@@ -254,6 +254,8 @@ pub struct FrameSource {
     probing: Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>,
     /// Screenshot listings keyed by day, valid while the folder's mtime
     /// matches. Today's folder changes every second; older ones never do.
+    /// A changed folder is listed again, reusing what the old listing knew
+    /// (see `library::list_screenshots`).
     screenshots: Mutex<HashMap<NaiveDate, (SystemTime, Arc<Vec<Shot>>)>>,
     /// Every frame number and capture time the database has for a day, in
     /// frame-number order. Only asked for days served from legacy videos,
@@ -1049,21 +1051,22 @@ impl FrameSource {
 
     fn list_screenshots(&self, day: NaiveDate) -> Result<Arc<Vec<Shot>>, Error> {
         let dir = self.day_dir(day);
+        // Held while listing, so that callers asking at once (every scrub
+        // step asks for a frame and for its time) share one listing instead
+        // of each making their own.
+        let mut listings = self.screenshots.lock().unwrap();
         let modified = match fs::metadata(&dir) {
             Ok(meta) => meta.modified()?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Arc::default()),
             Err(e) => return Err(e.into()),
         };
-        if let Some((stamp, shots)) = self.screenshots.lock().unwrap().get(&day) {
-            if *stamp == modified {
-                return Ok(shots.clone());
-            }
-        }
-        let shots = Arc::new(library::list_screenshots(&dir)?);
-        self.screenshots
-            .lock()
-            .unwrap()
-            .insert(day, (modified, shots.clone()));
+        let known = match listings.get(&day) {
+            Some((stamp, shots)) if *stamp == modified => return Ok(shots.clone()),
+            Some((_, shots)) => shots.clone(),
+            None => Arc::default(),
+        };
+        let shots = Arc::new(library::list_screenshots(&dir, &known)?);
+        listings.insert(day, (modified, shots.clone()));
         Ok(shots)
     }
 

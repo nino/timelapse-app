@@ -41,6 +41,10 @@ pub struct Shot {
     pub number: u32,
     /// Local modification time, which is when it was captured.
     pub modified: NaiveDateTime,
+    /// The file's inode, where the platform gives it without a stat, so a
+    /// relisting can tell a file it already knows from a new one that took
+    /// the same name.
+    pub inode: Option<u64>,
 }
 
 impl Shot {
@@ -129,11 +133,29 @@ pub fn list_days(root: &Path) -> std::io::Result<Vec<NaiveDate>> {
 
 /// Screenshots in a day folder, in frame-number order. A missing folder is an
 /// empty day, not an error.
-pub fn list_screenshots(day_dir: &Path) -> std::io::Result<Vec<Shot>> {
+///
+/// Each file's capture time comes from `known` (an earlier listing of the
+/// same folder, or empty) when it lists the same file, instead of from a
+/// stat. Today's folder gains a frame every second and holds tens
+/// of thousands of them until they are converted, and it is listed again at
+/// every scrub step; reading the folder is cheap, a stat per file is not.
+pub fn list_screenshots(day_dir: &Path, known: &[Shot]) -> std::io::Result<Vec<Shot>> {
     let entries = match fs::read_dir(day_dir) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(e),
+    };
+    // A screenshot keeps its mtime once it is renamed into place, so a file
+    // seen before (same name, same inode) still has the time it had then.
+    // `known` is in frame-number order, so it is searched by number.
+    let seen_before = |name: &str, number: u32, inode: Option<u64>| -> Option<NaiveDateTime> {
+        let inode = inode?;
+        let at = known.partition_point(|shot| shot.number < number);
+        known[at..]
+            .iter()
+            .take_while(|shot| shot.number == number)
+            .find(|shot| shot.name == name && shot.inode == Some(inode))
+            .map(|shot| shot.modified)
     };
     let mut shots = Vec::new();
     for entry in entries {
@@ -144,19 +166,38 @@ pub fn list_screenshots(day_dir: &Path) -> std::io::Result<Vec<Shot>> {
         let Some(number) = parse_screenshot_name(&name) else {
             continue;
         };
-        // The converter may delete it between the listing and the stat.
-        let Ok(modified) = entry.metadata().and_then(|m| m.modified()) else {
-            continue;
+        let inode = inode(&entry);
+        let modified = match seen_before(&name, number, inode) {
+            Some(modified) => modified,
+            None => {
+                // The converter may delete it between the listing and the stat.
+                let Ok(modified) = entry.metadata().and_then(|m| m.modified()) else {
+                    continue;
+                };
+                DateTime::<Local>::from(modified).naive_local()
+            }
         };
-        let modified = DateTime::<Local>::from(modified).naive_local();
         shots.push(Shot {
             name,
             number,
             modified,
+            inode,
         });
     }
     shots.sort_by_key(|shot| shot.number);
     Ok(shots)
+}
+
+#[cfg(unix)]
+fn inode(entry: &fs::DirEntry) -> Option<u64> {
+    use std::os::unix::fs::DirEntryExt;
+    Some(entry.ino())
+}
+
+/// Not without a stat here, so every listing stats every file.
+#[cfg(not(unix))]
+fn inode(_entry: &fs::DirEntry) -> Option<u64> {
+    None
 }
 
 /// Videos for `day`, from the library root and from the day folder, in start
@@ -243,6 +284,7 @@ mod tests {
             name: "00001.png".into(),
             number: 1,
             modified,
+            inode: None,
         };
         let at = |d: u32, h: u32, m: u32| {
             NaiveDate::from_ymd_opt(2026, 10, d).unwrap().and_hms_opt(h, m, 0).unwrap()
@@ -326,15 +368,52 @@ mod tests {
         ] {
             fs::write(dir.path().join(name), b"").unwrap();
         }
-        let names: Vec<_> = list_screenshots(dir.path())
+        let names: Vec<_> = list_screenshots(dir.path(), &[])
             .unwrap()
             .into_iter()
             .map(|s| s.name)
             .collect();
         assert_eq!(names, vec!["00002.png", "00010.png", "100000.png"]);
-        assert!(list_screenshots(&dir.path().join("missing"))
+        assert!(list_screenshots(&dir.path().join("missing"), &[])
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn relisting_reuses_known_times_and_stats_new_or_replaced_files() {
+        let dir = TempDir::new().unwrap();
+        for name in ["00001.png", "00002.png"] {
+            fs::write(dir.path().join(name), b"").unwrap();
+        }
+        let first = list_screenshots(dir.path(), &[]).unwrap();
+        // Pretend the first listing saw other times, to tell a reused time
+        // from a fresh stat.
+        let long_ago = NaiveDate::from_ymd_opt(2000, 1, 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap();
+        let known: Vec<Shot> = first
+            .iter()
+            .map(|shot| Shot {
+                modified: long_ago,
+                ..shot.clone()
+            })
+            .collect();
+        // 00002 is replaced by a new file with the same name; 00003 is new.
+        fs::remove_file(dir.path().join("00002.png")).unwrap();
+        fs::write(dir.path().join("00003.png"), b"").unwrap();
+        fs::write(dir.path().join("00002.png"), b"").unwrap();
+
+        let shots = list_screenshots(dir.path(), &known).unwrap();
+        let times: Vec<_> = shots
+            .iter()
+            .map(|s| (s.number, s.modified == long_ago))
+            .collect();
+        let replaced = shots[1].inode != first[1].inode;
+        assert_eq!(times[0], (1, true));
+        assert_eq!(times[1], (2, !replaced));
+        assert_eq!(times[2], (3, false));
     }
 
     #[test]
