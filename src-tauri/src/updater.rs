@@ -20,11 +20,19 @@
 //! - "Check for Updates…" in the app menu, whatever the setting: it says what
 //!   it found in a dialog and relaunches straight away if asked to. Here the
 //!   admin password dialog is expected, since someone asked for the update.
+//!
+//! Every dialog here is a sheet on one of the app's windows (`dialog`). With
+//! no window to attach to, the dialog plugin shows a `CFUserNotification`
+//! alert instead, which a separate system process draws: on some Macs macOS
+//! doesn't make that alert active, so neither it nor any of the app's windows
+//! has focus until someone clicks.
 
 use std::sync::Arc;
 use std::time::Duration;
-use tauri::{AppHandle, Emitter, Manager};
-use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+use tauri::{AppHandle, Emitter, Manager, WebviewWindow};
+use tauri_plugin_dialog::{
+    DialogExt, MessageDialogBuilder, MessageDialogButtons, MessageDialogKind,
+};
 use tauri_plugin_updater::{Update, UpdaterExt};
 use tokio::sync::{Mutex, Notify};
 
@@ -255,13 +263,11 @@ pub fn check_from_menu(app: AppHandle) {
             }
         };
         let version = update.version.clone();
-        let install_it = app
-            .dialog()
-            .message(format!(
-                "Timelapse App {} is available. You have {}.",
-                version, current
-            ))
-            .title("A new version is available")
+        let install_it = dialog(
+            &app,
+            "A new version is available",
+            format!("Timelapse App {} is available. You have {}.", version, current),
+        )
             .buttons(MessageDialogButtons::OkCancelCustom(
                 "Install and Relaunch".into(),
                 "Later".into(),
@@ -294,13 +300,14 @@ pub fn relaunch_into_update(app: &AppHandle) {
 }
 
 fn offer_relaunch(app: &AppHandle, version: &str) {
-    let relaunch = app
-        .dialog()
-        .message(format!(
+    let relaunch = dialog(
+        app,
+        "An update is ready",
+        format!(
             "Timelapse App {} is installed and starts the next time the app opens.",
             version
-        ))
-        .title("An update is ready")
+        ),
+    )
         .buttons(MessageDialogButtons::OkCancelCustom(
             "Relaunch Now".into(),
             "Later".into(),
@@ -366,15 +373,42 @@ fn after_exit(pid: u32, program: &str, args: &[&std::ffi::OsStr]) -> std::proces
 }
 
 fn tell(app: &AppHandle, title: &str, message: &str) {
-    app.dialog().message(message).title(title).blocking_show();
+    dialog(app, title, message).blocking_show();
 }
 
 fn warn(app: &AppHandle, title: &str, message: &str) {
-    app.dialog()
-        .message(message)
-        .title(title)
+    dialog(app, title, message)
         .kind(MessageDialogKind::Warning)
         .blocking_show();
+}
+
+/// A dialog shown as a sheet on the window the person is in, so it takes
+/// focus within the app (see the module comment).
+fn dialog(
+    app: &AppHandle,
+    title: &str,
+    message: impl Into<String>,
+) -> MessageDialogBuilder<tauri::Wry> {
+    let builder = app.dialog().message(message).title(title);
+    match dialog_window(app) {
+        Some(window) => builder.parent(&window),
+        None => builder,
+    }
+}
+
+/// The focused window, else the main window if it is on screen, else any
+/// window on screen. A sheet on a hidden or minimised window can't be seen.
+fn dialog_window(app: &AppHandle) -> Option<WebviewWindow> {
+    let windows = app.webview_windows();
+    let on_screen = |window: &&WebviewWindow| {
+        window.is_visible().unwrap_or(false) && !window.is_minimized().unwrap_or(true)
+    };
+    windows
+        .values()
+        .find(|window| window.is_focused().unwrap_or(false))
+        .or_else(|| windows.get(crate::MAIN_WINDOW).filter(on_screen))
+        .or_else(|| windows.values().find(on_screen))
+        .cloned()
 }
 
 /// Whether this account can replace the running app bundle by itself. The
