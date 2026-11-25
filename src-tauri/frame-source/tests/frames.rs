@@ -990,3 +990,27 @@ fn builds_previews_around_the_viewer_coarse_first() {
     // Fully previewed, so nothing is drawn as pending.
     assert_eq!(source.pending("2024-12-20").unwrap().ranges, vec![]);
 }
+
+#[test]
+fn a_kept_plan_follows_conversion_of_an_hour() {
+    let lib = Library::new();
+    let root = lib.root.path();
+    let day_dir = root.join("2026-10-04");
+    fs::create_dir(&day_dir).unwrap();
+    write_shot(&day_dir, "00001.png", b"nine", "2026-10-04 09:00:00");
+    write_shot(&day_dir, "00002.png", b"ten", "2026-10-04 10:00:00");
+    let source = lib.source(u64::MAX);
+    let day = source.day("2026-10-04").unwrap();
+    assert_eq!((day.frame_count, day.source), (2, Source::Screenshots));
+    // Asked again with nothing changed: the same answer, from the kept plan.
+    assert_eq!(source.frame("2026-10-04", 1).unwrap().bytes, b"ten");
+
+    // The converter publishes 09:00 as video, then deletes its screenshot.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    make_video(&root.join("2026-10-04--09-00-00--hourly.mov"), 3, 0);
+    fs::remove_file(day_dir.join("00001.png")).unwrap();
+
+    let day = source.day("2026-10-04").unwrap();
+    assert_eq!((day.frame_count, day.source), (4, Source::Mixed));
+    assert_eq!(source.frame("2026-10-04", 3).unwrap().bytes, b"ten");
+}
