@@ -718,6 +718,72 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
+    /// Where a capture's time goes, stage by stage, on the real screen.
+    /// Run by hand on a Mac: `cargo test --release capture_stage_timings --
+    /// --ignored --nocapture`. Writes nothing to the library.
+    #[tokio::test]
+    #[ignore]
+    async fn capture_stage_timings() {
+        use std::time::Instant;
+        let ms = |t: Instant| t.elapsed().as_secs_f64() * 1000.0;
+        let mut rows: Vec<[f64; 7]> = Vec::new();
+        for _ in 0..20 {
+            let started = Instant::now();
+            let (screen, _) = get_focused_screen().await.unwrap();
+            let lookup = ms(started);
+            let row = tokio::task::spawn_blocking(move || {
+                let started = Instant::now();
+                with_capture(&screen, |capture| {
+                    let grab = ms(started);
+                    let t = Instant::now();
+                    let frame = fit_to_frame(capture, "bench").unwrap();
+                    let resize = ms(t);
+                    // The same resize from an ordinary heap copy, to tell slow
+                    // pixels (an uncached surface) from a slow resize.
+                    let t = Instant::now();
+                    let copy = capture.pixels.to_vec();
+                    let copy_ms = ms(t);
+                    let copied = Capture { pixels: Cow::Owned(copy), ..*capture };
+                    let t = Instant::now();
+                    fit_to_frame(&copied, "bench").unwrap();
+                    let resize_copy = ms(t);
+                    let t = Instant::now();
+                    let mut png = Vec::new();
+                    frame
+                        .write_to(&mut std::io::Cursor::new(&mut png), ImageFormat::Png)
+                        .unwrap();
+                    let encode = ms(t);
+                    println!(
+                        "{}x{} {} B/row -> {}x{}, png {} KB",
+                        capture.width,
+                        capture.height,
+                        capture.bytes_per_row,
+                        frame.width(),
+                        frame.height(),
+                        png.len() / 1024
+                    );
+                    Ok([grab, resize, copy_ms, resize_copy, encode, 0.0, 0.0])
+                })
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            let t = Instant::now();
+            next_filename(&std::env::temp_dir()).unwrap();
+            let mut row = row;
+            row[5] = lookup;
+            row[6] = ms(t);
+            rows.push(row);
+            sleep(Duration::from_millis(500)).await;
+        }
+        let names = ["grab", "resize", "copy pixels", "resize the copy", "png encode", "screen lookup", "next_filename(tmp)"];
+        for (i, name) in names.iter().enumerate() {
+            let mut column: Vec<f64> = rows.iter().map(|r| r[i]).collect();
+            column.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            println!("{:>20}: median {:6.1} ms, max {:6.1} ms", name, column[column.len() / 2], column[column.len() - 1]);
+        }
+    }
+
     #[test]
     fn test_photographer_new() {
         let temp_dir = TempDir::new().unwrap();
