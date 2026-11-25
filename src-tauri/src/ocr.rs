@@ -1404,7 +1404,10 @@ mod vision {
                     .map(|tile| {
                         let request = VNRecognizeTextRequest::new();
                         request.setRecognitionLevel(VNRequestTextRecognitionLevel::Accurate);
-                        request.setUsesLanguageCorrection(true);
+                        // No language correction: on 40 of Nino's frames it
+                        // found no word the uncorrected text missed, and
+                        // reading took 102 ms a frame instead of 124.
+                        request.setUsesLanguageCorrection(false);
                         let region = tile.region();
                         let region = CGRect::new(
                             CGPoint::new(region.x, region.y),
