@@ -735,11 +735,12 @@ mod tests {
                 let started = Instant::now();
                 with_capture(&screen, |capture| {
                     let grab = ms(started);
-                    let t = Instant::now();
-                    let frame = fit_to_frame(capture, "bench").unwrap();
-                    let resize = ms(t);
-                    // The same resize from an ordinary heap copy, to tell slow
-                    // pixels (an uncached surface) from a slow resize.
+                    // Copy first, while the pixels are cold, then resize the
+                    // copy; then resize Core Graphics' own pixels, as the loop
+                    // does. On Nino's M4 Max (November 2026) the copy took
+                    // 1 ms and the first resize 9 ms, the second 4 ms: the
+                    // first resize pays for cold scratch buffers, so copying
+                    // the pixels out first would not make capture faster.
                     let t = Instant::now();
                     let copy = capture.pixels.to_vec();
                     let copy_ms = ms(t);
@@ -747,6 +748,9 @@ mod tests {
                     let t = Instant::now();
                     fit_to_frame(&copied, "bench").unwrap();
                     let resize_copy = ms(t);
+                    let t = Instant::now();
+                    let frame = fit_to_frame(capture, "bench").unwrap();
+                    let resize = ms(t);
                     let t = Instant::now();
                     let mut png = Vec::new();
                     frame
@@ -776,7 +780,7 @@ mod tests {
             rows.push(row);
             sleep(Duration::from_millis(500)).await;
         }
-        let names = ["grab", "resize", "copy pixels", "resize the copy", "png encode", "screen lookup", "next_filename(tmp)"];
+        let names = ["grab", "resize CG pixels (after copy)", "copy CG pixels (cold)", "resize the copy", "png encode", "screen lookup", "next_filename(tmp)"];
         for (i, name) in names.iter().enumerate() {
             let mut column: Vec<f64> = rows.iter().map(|r| r[i]).collect();
             column.sort_by(|a, b| a.partial_cmp(b).unwrap());
