@@ -246,12 +246,12 @@ impl Thumbnail {
 
     /// Box-filter the RGB pixels down to the thumbnail size first, then take
     /// each small pixel's luma, with `into_luma8`'s weights so video frames
-    /// and screenshots are judged alike. Luma is (up to rounding) linear, so
-    /// this matches greying the whole frame and then shrinking it, as this
-    /// used to, but costs about a tenth as much: the SIMD resize reads each
-    /// source pixel once, and only 126,000 pixels are greyed instead of two
-    /// million (0.8 ms rather than 9 ms a frame, measured on 1800×1124
-    /// screenshots).
+    /// and screenshots are judged alike. Luma is linear, so on an ordinary
+    /// 1800×1124 frame this is within rounding of greying the whole frame
+    /// and then shrinking it, as this used to, for about a tenth of the
+    /// time: the SIMD resize reads each source pixel once, and 126,000
+    /// pixels are greyed instead of two million (0.8 ms rather than 9 ms a
+    /// frame on five of Nino's screenshots, on a cloud test machine).
     fn of_pixels(width: u32, height: u32, rgb: &[u8]) -> Result<Thumbnail, String> {
         let source = ImageRef::new(width, height, rgb, PixelType::U8x3)
             .map_err(|_| "frame is smaller than its size says")?;
