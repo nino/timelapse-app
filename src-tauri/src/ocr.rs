@@ -34,7 +34,8 @@ use crate::converter::{is_day_folder_name, on_ac_power, OcrCheck, HourBatch};
 use crate::database::{DayOcrProgress, LineBox, OcrProgress, ScreenshotDatabase};
 use crate::ocr_readahead::ReadAhead;
 use frame_source::{DayVideo, FrameSource, RawFrame};
-use image::{imageops, GrayImage};
+use fast_image_resize::images::{Image, ImageRef};
+use fast_image_resize::{FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -232,30 +233,40 @@ pub struct Thumbnail(Vec<u8>);
 
 impl Thumbnail {
     pub fn of(image: &Path) -> Result<Thumbnail, String> {
-        let grey = image::open(image)
+        let rgb = image::open(image)
             .map_err(|e| format!("Failed to read {}: {}", image.display(), e))?
-            .into_luma8();
-        Ok(Thumbnail::of_grey(&grey))
+            .into_rgb8();
+        Thumbnail::of_pixels(rgb.width(), rgb.height(), rgb.as_raw())
     }
 
     /// The thumbnail of a decoded video frame.
     pub fn of_rgb(frame: &RawFrame) -> Result<Thumbnail, String> {
-        // The same luma weights as `into_luma8`, so video frames and
-        // screenshots are judged alike.
-        let luma = frame
-            .rgb
-            .chunks_exact(3)
-            .map(|p| ((2126 * p[0] as u32 + 7152 * p[1] as u32 + 722 * p[2] as u32) / 10000) as u8)
-            .collect();
-        let grey = GrayImage::from_raw(frame.width, frame.height, luma)
-            .ok_or("frame is smaller than its size says")?;
-        Ok(Thumbnail::of_grey(&grey))
+        Thumbnail::of_pixels(frame.width, frame.height, frame.rgb)
     }
 
-    fn of_grey(grey: &GrayImage) -> Thumbnail {
-        // `thumbnail` averages each block of source pixels, like a box filter.
-        let small = imageops::thumbnail(grey, THUMB_WIDTH as u32, THUMB_HEIGHT as u32);
-        Thumbnail(small.into_raw())
+    /// Box-filter the RGB pixels down to the thumbnail size first, then take
+    /// each small pixel's luma, with `into_luma8`'s weights so video frames
+    /// and screenshots are judged alike. Luma is linear, so on an ordinary
+    /// 1800×1124 frame this is within rounding of greying the whole frame
+    /// and then shrinking it, as this used to, for about a tenth of the
+    /// time: the SIMD resize reads each source pixel once, and 126,000
+    /// pixels are greyed instead of two million (0.8 ms rather than 9 ms a
+    /// frame on five of Nino's screenshots, on a cloud test machine).
+    fn of_pixels(width: u32, height: u32, rgb: &[u8]) -> Result<Thumbnail, String> {
+        let source = ImageRef::new(width, height, rgb, PixelType::U8x3)
+            .map_err(|_| "frame is smaller than its size says")?;
+        let mut small = Image::new(THUMB_WIDTH as u32, THUMB_HEIGHT as u32, PixelType::U8x3);
+        let options = ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FilterType::Box));
+        Resizer::new()
+            .resize(&source, &mut small, &options)
+            .map_err(|e| format!("Failed to shrink frame: {}", e))?;
+        Ok(Thumbnail(
+            small
+                .buffer()
+                .chunks_exact(3)
+                .map(|p| ((2126 * p[0] as u32 + 7152 * p[1] as u32 + 722 * p[2] as u32) / 10000) as u8)
+                .collect(),
+        ))
     }
 
     pub fn differs_from(&self, other: &Thumbnail) -> bool {
@@ -1393,7 +1404,10 @@ mod vision {
                     .map(|tile| {
                         let request = VNRecognizeTextRequest::new();
                         request.setRecognitionLevel(VNRequestTextRecognitionLevel::Accurate);
-                        request.setUsesLanguageCorrection(true);
+                        // No language correction: on 40 of Nino's frames it
+                        // found no word the uncorrected text missed, and
+                        // reading took 102 ms a frame instead of 124.
+                        request.setUsesLanguageCorrection(false);
                         let region = tile.region();
                         let region = CGRect::new(
                             CGPoint::new(region.x, region.y),
@@ -1618,6 +1632,56 @@ mod tests {
         assert!(!Thumbnail::of(&path("blank_again.png")).unwrap().differs_from(&blank));
         assert!(!Thumbnail::of(&path("cursor.png")).unwrap().differs_from(&blank));
         assert!(Thumbnail::of(&path("word.png")).unwrap().differs_from(&blank));
+    }
+
+    /// Shrinking first and greying after gives the thumbnail that greying
+    /// the whole frame and shrinking it gave, which the change thresholds
+    /// were tuned on: on a noisy 1800×1124 frame, which shrinks by exactly
+    /// 4, no pixel is more than 2 grey levels out.
+    #[test]
+    fn thumbnails_match_greying_the_whole_frame_first() {
+        let (width, height) = (1800, 1124);
+        let mut seed = 1u32;
+        let rgb: Vec<u8> = (0..width * height * 3)
+            .map(|_| {
+                seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                (seed >> 16) as u8
+            })
+            .collect();
+        let image = image::RgbImage::from_raw(width, height, rgb.clone()).unwrap();
+        let expected = image::imageops::thumbnail(
+            &image::DynamicImage::ImageRgb8(image).into_luma8(),
+            THUMB_WIDTH as u32,
+            THUMB_HEIGHT as u32,
+        )
+        .into_raw();
+        let Thumbnail(got) = Thumbnail::of_rgb(&RawFrame { width, height, rgb: &rgb }).unwrap();
+        assert_eq!(got.len(), expected.len());
+        let worst = got.iter().zip(&expected).map(|(a, b)| a.abs_diff(*b)).max().unwrap();
+        assert!(worst <= 2, "a pixel is {} grey levels out", worst);
+    }
+
+    /// A big screen's frame shrinks by a fraction, where the filter weighs
+    /// pixels on a block's edge differently from the old one, so check what
+    /// matters there: a cursor still isn't a change and a word still is.
+    #[test]
+    fn big_screen_frames_tell_a_cursor_from_a_word() {
+        let (width, height) = (2700u32, 1520u32);
+        let frame = |rects: &[(u32, u32, u32, u32)]| {
+            let mut rgb = vec![255u8; (width * height * 3) as usize];
+            for &(x, y, w, h) in rects {
+                for py in y..y + h {
+                    for px in x..x + w {
+                        let at = ((py * width + px) * 3) as usize;
+                        rgb[at..at + 3].fill(0);
+                    }
+                }
+            }
+            Thumbnail::of_rgb(&RawFrame { width, height, rgb: &rgb }).unwrap()
+        };
+        let blank = frame(&[]);
+        assert!(!frame(&[(700, 700, 3, 27)]).differs_from(&blank));
+        assert!(frame(&[(400, 400, 60, 60)]).differs_from(&blank));
     }
 
     #[test]
