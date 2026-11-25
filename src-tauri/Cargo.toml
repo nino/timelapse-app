@@ -32,7 +32,7 @@ dirs = "7.0"
 tokio = { version = "1", features = ["full"] }
 fast_image_resize = { version = "6", features = ["image"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
-screenshots = "0.5"
+screenshots = "0.8"
 active-win-pos-rs = "0.11"
 rusqlite = { version = "0.41", features = ["bundled"] }
 frame_source = { path = "frame-source" }
@@ -63,10 +63,10 @@ tempfile = "3.17"
 members = ["frame-source"]
 
 # The capture loop resizes a screen-sized capture and encodes a PNG every
-# second (and off macOS decodes a screen-sized PNG first). Unoptimized, that
-# alone overruns the interval under `tauri dev`, so the image crates are
-# optimized even in debug builds. The channel swap in `fit_to_frame` is the
-# one per-pixel loop left in the app crate, on the small frame.
+# second. Unoptimized, that alone overruns the interval under `tauri dev`, so
+# the image crates are optimized even in debug builds. The channel swap in
+# `fit_to_frame` is the one per-pixel loop left in the app crate, on the small
+# frame.
 [profile.dev.package.image]
 opt-level = 3
 [profile.dev.package.png]

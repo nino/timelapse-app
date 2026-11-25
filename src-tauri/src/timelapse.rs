@@ -2,8 +2,8 @@
 //! focused window.
 //!
 //! Each tick captures that screen (on macOS straight from Core Graphics as raw
-//! BGRA pixels, skipping the `screenshots` crate's PNG encode that would only
-//! be decoded again), box-filters it into a frame (`frame_size`: a
+//! BGRA pixels, skipping the `screenshots` crate's copy that swaps every pixel
+//! to RGBA), box-filters it into a frame (`frame_size`: a
 //! letterboxed 1800×1124 frame, or a big screen's own shape at a density OCR
 //! can still read), drops it if it is all black, and otherwise writes it as
 //! the day folder's next `NNNNN.png` and records a row in `screenshots.db`.
@@ -280,20 +280,26 @@ struct Capture<'a> {
 }
 
 impl Capture<'_> {
-    /// Decode a PNG, as the `screenshots` crate returns captures off macOS.
+    /// Wrap the red, green, blue, alpha pixels the `screenshots` crate
+    /// returns off macOS. They come as a plain buffer because that crate is on
+    /// an older `image` than the app.
     #[cfg(any(not(target_os = "macos"), test))]
-    fn from_png(data: &[u8], pixels_per_point: f64) -> Result<Capture<'static>, Error> {
-        let image = image::load_from_memory_with_format(data, ImageFormat::Png)
-            .map_err(|e| Error::UnableToCreateScreenshot {
-                reason: format!("Failed to read image: {}", e),
-            })?
-            .into_rgba8();
-        let (width, height) = image.dimensions();
+    fn from_rgba(
+        width: u32,
+        height: u32,
+        pixels: Vec<u8>,
+        pixels_per_point: f64,
+    ) -> Result<Capture<'static>, Error> {
+        if pixels.len() != width as usize * height as usize * 4 {
+            return Err(Error::UnableToCreateScreenshot {
+                reason: format!("{} bytes is not a {}×{} capture", pixels.len(), width, height),
+            });
+        }
         Ok(Capture {
             width,
             height,
             bytes_per_row: width as usize * 4,
-            pixels: Cow::Owned(image.into_raw()),
+            pixels: Cow::Owned(pixels),
             bgra: false,
             pixels_per_point,
         })
@@ -303,8 +309,8 @@ impl Capture<'_> {
 /// Capture `screen` and hand the capture to `use_capture`.
 ///
 /// On macOS this asks Core Graphics directly and lends out its pixels as they
-/// are. The `screenshots` crate's own `capture()` swaps every pixel to RGBA and
-/// encodes a full-resolution PNG, which `fit_to_frame` would only decode again.
+/// are. The `screenshots` crate's own `capture()` copies the screen and swaps
+/// every pixel to RGBA, which `fit_to_frame` doesn't need.
 /// The capture can't outlive the Core Graphics image, which isn't `Send`,
 /// hence the callback rather than a return value.
 #[cfg(target_os = "macos")]
@@ -407,7 +413,13 @@ fn with_capture<R>(
     let image = screen.capture().map_err(|err| Error::UnableToCreateScreenshot {
         reason: err.to_string(),
     })?;
-    use_capture(&Capture::from_png(image.buffer(), screen.display_info.scale_factor as f64)?)
+    let (width, height) = image.dimensions();
+    use_capture(&Capture::from_rgba(
+        width,
+        height,
+        image.into_raw(),
+        screen.display_info.scale_factor as f64,
+    )?)
 }
 
 /// The display the last capture used, so a capture that can't find the active
@@ -1157,17 +1169,15 @@ mod tests {
     }
 
     #[test]
-    fn test_capture_from_png() {
-        let image = RgbImage::from_pixel(3, 2, image::Rgb([1, 2, 3]));
-        let mut png = std::io::Cursor::new(Vec::new());
-        image.write_to(&mut png, ImageFormat::Png).unwrap();
+    fn test_capture_from_rgba() {
+        let pixels = [1, 2, 3, 255].repeat(6);
 
-        let capture = Capture::from_png(png.get_ref(), 2.0).unwrap();
+        let capture = Capture::from_rgba(3, 2, pixels, 2.0).unwrap();
 
         assert_eq!((capture.width, capture.height, capture.bytes_per_row), (3, 2, 12));
         assert_eq!(&capture.pixels[..4], &[1, 2, 3, 255]);
         assert!(!capture.bgra);
-        assert!(Capture::from_png(b"not a png", 2.0).is_err());
+        assert!(Capture::from_rgba(3, 2, vec![0; 23], 2.0).is_err());
     }
 
     #[test]
