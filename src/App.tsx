@@ -330,7 +330,9 @@ export function App({
     },
     [selectedDay, currentIndex, frameCount],
   );
-  useLatestLoad(loadFrameTime);
+  // One lookup at a time: scrubbing asks at every step, faster than a slow
+  // Mac answers, and unanswered lookups queue up in Rust ahead of the frame.
+  useLatestLoad(loadFrameTime, { oneAtATime: true });
   const shownFrameTime = selectedDay && frameCount > 0 ? frameTime : null;
 
   const error = daysError ?? dayError;

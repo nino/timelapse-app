@@ -230,6 +230,8 @@ impl Segment {
     }
 }
 
+type PlanStamps = ((Option<SystemTime>, Option<SystemTime>), Arc<Vec<Segment>>);
+
 type StepTimer = Box<dyn Fn(&'static str, StdDuration) + Send + Sync>;
 
 pub struct FrameSource {
@@ -256,6 +258,9 @@ pub struct FrameSource {
     /// about the same video at once wait for one probe and don't each run
     /// their own.
     probing: Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>,
+    /// Each day's plan and the (day folder, root) mtimes it was made at.
+    /// See `plan`.
+    plans: Mutex<HashMap<NaiveDate, Arc<Mutex<Option<PlanStamps>>>>>,
     /// Screenshot listings keyed by day, valid while the folder's mtime
     /// matches. Today's folder changes every second; older ones never do.
     /// A changed folder is listed again, reusing what the old listing knew
@@ -306,6 +311,7 @@ impl FrameSource {
             probes: Mutex::new(HashMap::new()),
             probe_gate: Gate::new(PROBES_AT_ONCE),
             probing: Mutex::new(HashMap::new()),
+            plans: Mutex::new(HashMap::new()),
             screenshots: Mutex::new(HashMap::new()),
             day_times: Mutex::new(HashMap::new()),
             recorded_frames: Mutex::new(HashMap::new()),
@@ -362,7 +368,7 @@ impl FrameSource {
         let segments = self.plan(parse_date(date)?)?;
         let mut packs = Vec::new();
         let mut offset = 0;
-        for segment in &segments {
+        for segment in segments.iter() {
             if let (Segment::Video { file, info }, Some(store)) = (segment, &self.previews) {
                 if let Some((name, kind)) = store.best(&cache_key(file)?) {
                     packs.push(DayPreviewPack {
@@ -441,7 +447,7 @@ impl FrameSource {
         let segments = self.plan(parse_date(date).ok()?).ok()?;
         let mut videos = Vec::new();
         let mut offset = 0;
-        for segment in &segments {
+        for segment in segments.iter() {
             if let Segment::Video { file, info } = segment {
                 let end = offset + info.frame_count;
                 let distance = if index < offset {
@@ -689,7 +695,7 @@ impl FrameSource {
         let segments = self.plan(parse_date(date)?)?;
         let mut pending: Vec<FrameRange> = Vec::new();
         let mut offset = 0;
-        for segment in &segments {
+        for segment in segments.iter() {
             if let Segment::Video { file, info } = segment {
                 let key = cache_key(file)?;
                 // A full preview pack shows the stretch while dragging; only
@@ -724,7 +730,7 @@ impl FrameSource {
         let segments = self.plan(parse_date(date)?)?;
         let mut spans = Vec::new();
         let mut offset = 0;
-        for segment in &segments {
+        for segment in segments.iter() {
             if let Segment::Video { file, info } = segment {
                 if let Some(name) = file.path.file_name().and_then(|n| n.to_str()) {
                     spans.push(VideoSpan {
@@ -838,12 +844,13 @@ impl FrameSource {
     pub fn video_only_day(&self, date: &str) -> Result<Option<Vec<DayVideo>>, Error> {
         let mut videos = Vec::new();
         let mut first_index = 0;
-        for segment in self.plan(parse_date(date)?)? {
+        for segment in self.plan(parse_date(date)?)?.iter() {
             let Segment::Video { file, info } = segment else {
                 return Ok(None);
             };
+            let info = *info;
             videos.push(DayVideo {
-                path: file.path,
+                path: file.path.clone(),
                 first_index,
                 frame_count: info.frame_count,
                 info,
@@ -920,7 +927,7 @@ impl FrameSource {
         // Clock hour -> (first index, length) of each part of its video.
         let mut video_hours: HashMap<NaiveDateTime, Vec<(usize, usize)>> = HashMap::new();
         let mut start = 0;
-        for segment in &segments {
+        for segment in segments.iter() {
             match segment {
                 Segment::Screenshots { shots, range } => {
                     for (i, shot) in shots[range.clone()].iter().enumerate() {
@@ -1016,7 +1023,39 @@ impl FrameSource {
 
     /// The day's frames as an ordered list of segments. See the module docs
     /// for which source wins.
-    fn plan(&self, day: NaiveDate) -> Result<Vec<Segment>, Error> {
+    ///
+    /// Kept per day while the day folder's and the library root's mtimes are
+    /// unchanged: every file that goes into a plan (a screenshot, a video in
+    /// the day folder or the root) is added, renamed into place or removed
+    /// in one of those two folders. Scrubbing asks for a plan twice a step
+    /// (the frame and its time), and on a slow Mac listing a day folder of
+    /// tens of thousands of screenshots for each made the asks pile up for
+    /// seconds. The lock is held while a plan is made, so callers asking at
+    /// once wait for one plan instead of each making their own. Each day has
+    /// its own lock, so a day whose videos are being probed for the first
+    /// time (the preview builder walks the library) holds up no other day.
+    fn plan(&self, day: NaiveDate) -> Result<Arc<Vec<Segment>>, Error> {
+        let mtime = |path: &Path| -> Result<Option<SystemTime>, Error> {
+            match fs::metadata(path) {
+                Ok(meta) => Ok(Some(meta.modified()?)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(e.into()),
+            }
+        };
+        let slot = self.plans.lock().unwrap().entry(day).or_default().clone();
+        let mut slot = slot.lock().unwrap();
+        let stamps = (mtime(&self.day_dir(day))?, mtime(&self.root)?);
+        if let Some((known, segments)) = &*slot {
+            if *known == stamps {
+                return Ok(segments.clone());
+            }
+        }
+        let segments = Arc::new(self.make_plan(day)?);
+        *slot = Some((stamps, segments.clone()));
+        Ok(segments)
+    }
+
+    fn make_plan(&self, day: NaiveDate) -> Result<Vec<Segment>, Error> {
         let shots = self.list_screenshots(day)?;
 
         let mut videos = Vec::new();
