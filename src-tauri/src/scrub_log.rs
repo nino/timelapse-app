@@ -7,9 +7,11 @@
 //! `videoFrame`, `dbTime`, see `FrameSource::time_steps`), the `frames:`
 //! handler and `get_frame_time` their whole requests (`frameRequest`,
 //! `frameTime`), and the page how long each frame took from asking for it to
-//! having it on screen (`shown`), which includes the webview decoding it. A
-//! stretch ends once nothing has been asked for in `IDLE`; stretches with
-//! fewer than `MIN_FRAMES` frames are not logged.
+//! having it on screen (`shown`), which includes the webview decoding it. The
+//! beta video player, which asks the frame source for nothing, reports how
+//! long each seek took to show its frame (`videoSeek`). A stretch ends once
+//! nothing has been asked for in `IDLE`; stretches with fewer than
+//! `MIN_FRAMES` frames are not logged.
 
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
@@ -96,7 +98,12 @@ fn watch() {
 /// longest time in milliseconds, plus the counters. `None` for a stretch too
 /// short to log.
 fn summary(stretch: &Stretch) -> Option<Value> {
-    let frames = stretch.steps.get("frameRequest").map_or(0, Vec::len);
+    // Frames served by the frame source, or shown by the beta video player
+    // seeking (which asks the frame source for nothing).
+    let frames: usize = ["frameRequest", "videoSeek"]
+        .iter()
+        .map(|step| stretch.steps.get(step).map_or(0, Vec::len))
+        .sum();
     if frames < MIN_FRAMES {
         return None;
     }
@@ -143,5 +150,14 @@ mod tests {
         );
         assert_eq!(data["steps"]["plan"]["p90Ms"], json!(3.0));
         assert_eq!(data["counts"]["pngFrames"], json!(10));
+    }
+
+    #[test]
+    fn counts_video_player_seeks_as_frames() {
+        let mut stretch = Stretch::default();
+        stretch.steps.insert("videoSeek", vec![ms(30); 4]);
+        assert!(summary(&stretch).is_none());
+        stretch.steps.insert("videoSeek", vec![ms(30); 5]);
+        assert_eq!(summary(&stretch).unwrap()["steps"]["videoSeek"]["p50Ms"], json!(30.0));
     }
 }

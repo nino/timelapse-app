@@ -3,7 +3,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen, type EventCallback } from '@tauri-apps/api/event';
 import { act, renderHook, waitFor } from '@testing-library/react';
 
-import { frameUrl, type Day, type PendingFrames } from '../frames';
+import { type Day, type PendingFrames } from '../frames';
 import { mocked } from '../test/mocked';
 import { usePendingFrames } from './usePendingFrames';
 
@@ -14,7 +14,8 @@ function day(date: string, source: Day['source'], frameCount = 300): Day {
 }
 
 function pending(...ranges: Array<[number, number]>): PendingFrames {
-  return { frameCount: 300, ranges: ranges.map(([start, end]) => ({ start, end })) };
+  const list = ranges.map(([start, end]) => ({ start, end }));
+  return { frameCount: 300, ranges: list, undecoded: list };
 }
 
 beforeEach(() => {
@@ -23,26 +24,6 @@ beforeEach(() => {
 });
 
 describe('usePendingFrames', () => {
-  it('asks again after a pending frame loads, and only then', async () => {
-    mocked(invoke).mockResolvedValueOnce(pending([0, 150]));
-    const video = day('2026-10-01', 'video');
-    const { result, rerender } = renderHook(
-      ({ loaded }: { loaded: string | null }) => usePendingFrames(video, loaded),
-      { initialProps: { loaded: null } as { loaded: string | null } },
-    );
-    await waitFor(() => expect(result.current).toEqual(pending([0, 150])));
-    expect(invoke).toHaveBeenCalledWith('get_pending_frames', { date: '2026-10-01' });
-
-    // Frame 200 was already decoded: nothing to re-check.
-    rerender({ loaded: frameUrl('2026-10-01', 200) });
-    expect(invoke).toHaveBeenCalledTimes(1);
-
-    mocked(invoke).mockResolvedValueOnce(pending());
-    rerender({ loaded: frameUrl('2026-10-01', 20) });
-    await waitFor(() => expect(result.current).toEqual(pending()));
-    expect(invoke).toHaveBeenCalledTimes(2);
-  });
-
   it('asks again when read-ahead decodes part of the day', async () => {
     let decoded: EventCallback<string> = () => {};
     const unlisten = mock((): void => {});
@@ -51,7 +32,7 @@ describe('usePendingFrames', () => {
       return Promise.resolve(unlisten);
     });
     mocked(invoke).mockResolvedValueOnce(pending([0, 300]));
-    const { result, unmount } = renderHook(() => usePendingFrames(day('2026-10-01', 'video'), null));
+    const { result, unmount } = renderHook(() => usePendingFrames(day('2026-10-01', 'video')));
     await waitFor(() => expect(result.current).toEqual(pending([0, 300])));
     expect(listen).toHaveBeenCalledWith('frames-decoded', expect.any(Function));
 
@@ -69,7 +50,7 @@ describe('usePendingFrames', () => {
 
   it('asks again when the day grows', async () => {
     mocked(invoke).mockResolvedValue(pending([0, 150]));
-    const { rerender } = renderHook(({ d }: { d: Day }) => usePendingFrames(d, null), {
+    const { rerender } = renderHook(({ d }: { d: Day }) => usePendingFrames(d), {
       initialProps: { d: day('2026-10-04', 'mixed', 300) },
     });
     await waitFor(() => expect(invoke).toHaveBeenCalledTimes(1));
@@ -85,7 +66,7 @@ describe('usePendingFrames', () => {
       }),
     );
     mocked(invoke).mockReturnValueOnce(new Promise(() => {}));
-    const { result, rerender } = renderHook(({ d }: { d: Day }) => usePendingFrames(d, null), {
+    const { result, rerender } = renderHook(({ d }: { d: Day }) => usePendingFrames(d), {
       initialProps: { d: day('2026-10-04', 'mixed', 300) },
     });
     rerender({ d: day('2026-10-04', 'mixed', 301) });
@@ -94,14 +75,14 @@ describe('usePendingFrames', () => {
   });
 
   it('never asks about screenshot days', () => {
-    const { result } = renderHook(() => usePendingFrames(day('2026-10-04', 'screenshots'), null));
+    const { result } = renderHook(() => usePendingFrames(day('2026-10-04', 'screenshots')));
     expect(result.current).toBeNull();
     expect(invoke).not.toHaveBeenCalled();
   });
 
   it("does not show the previous day's answer for a new day", async () => {
     mocked(invoke).mockResolvedValueOnce(pending([0, 300]));
-    const { result, rerender } = renderHook(({ d }: { d: Day }) => usePendingFrames(d, null), {
+    const { result, rerender } = renderHook(({ d }: { d: Day }) => usePendingFrames(d), {
       initialProps: { d: day('2026-10-01', 'video') },
     });
     await waitFor(() => expect(result.current).not.toBeNull());

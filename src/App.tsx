@@ -20,7 +20,7 @@ import {
   useMatchLines,
   useOcrVersion,
 } from "./hooks/useOcrSearch";
-import { usePendingFrames } from "./hooks/usePendingFrames";
+import { inRanges, usePendingFrames } from "./hooks/usePendingFrames";
 import { useSettings } from "./hooks/useSettings";
 import { useTimeout } from "./hooks/useTimeout";
 import { PendingStretches } from "./PendingStretches";
@@ -199,12 +199,17 @@ export function App({
     goTo(Math.min(frameCount - 1, Math.max(0, currentIndex + direction * step)));
   });
 
-  // While the scrubber is dragged over video, a small preview of the nearest
-  // second is shown at once, and the exact frame is only asked for once the
-  // drag pauses on a frame for DRAG_PAUSE_MS. So dragging never waits on a
-  // decode, and doesn't queue one per stretch it passes. The preview stays
-  // up after the drag ends until the exact frame has loaded.
+  // While the scrubber is dragged over video that isn't decoded yet, a small
+  // preview of the nearest second is shown at once, and the exact frame is
+  // only asked for once the drag pauses on a frame for DRAG_PAUSE_MS. So
+  // dragging never waits on a decode, and doesn't queue one per stretch it
+  // passes. The preview stays up after the drag ends until the exact frame
+  // has loaded. Where the video is decoded already (read-ahead decodes
+  // around wherever the viewer has asked for a frame), exact frames cost
+  // no more than screenshots, so the drag shows them as it does screenshots.
   const previews = useDayPreviews(day);
+  const settings = useSettings();
+  const videoPlayer = settings?.videoPlayerBeta === true;
   const [pointerDown, setPointerDown] = React.useState(false);
   const [scrubbing, setScrubbing] = React.useState(false);
   const [restingIndex, setRestingIndex] = React.useState<number | null>(null);
@@ -220,6 +225,12 @@ export function App({
   useEventListener("blur", () => setPointerDown(false));
   const previewSrc = scrubbing ? (previews?.at(currentIndex) ?? null) : null;
   const moving = pointerDown && restingIndex !== currentIndex;
+  // Stretches still to be decoded from video are drawn paler on the scrubber.
+  // The video player needs nothing decoded, and screenshots never do.
+  const pendingFrames = usePendingFrames(videoPlayer ? null : day);
+  // Not known yet counts as not decoded.
+  const decoded = pendingFrames !== null && !inRanges(pendingFrames.undecoded, currentIndex);
+  const previewStandsIn = previewSrc !== null && !decoded;
 
   const wantedSrc =
     selectedDay && frameCount > 0 ? frameUrl(selectedDay, currentIndex) : null;
@@ -227,8 +238,6 @@ export function App({
   // Beta: hours kept as video are shown by seeking a <video> of the hour
   // (`VideoFrame`) instead of asking the frame source to decode them. A video
   // the page can't play falls back to decoded frames.
-  const settings = useSettings();
-  const videoPlayer = settings?.videoPlayerBeta === true;
   const dayVideos = useDayVideos(videoPlayer ? day : null);
   const [failedVideos, setFailedVideos] = React.useState<ReadonlySet<string>>(() => new Set());
   const videoSpan =
@@ -262,7 +271,7 @@ export function App({
   // showed, underneath, until the player has a frame up.
   const { src, frameFailed, loaded, settled, onLoad, onError } = useGatedImage(
     span ? undefined : wantedSrc,
-    moving && previewSrc !== null,
+    moving && previewStandsIn,
   );
   // Once the <img> has settled on the wanted frame, the video's last frame
   // no longer stands in for it. Checked here rather than in `onLoad`: a
@@ -277,7 +286,7 @@ export function App({
   if (scrubbing && !pointerDown && (span !== null || settled === wantedSrc)) {
     setScrubbing(false);
   }
-  const showPreview = span === null && previewSrc !== null && loaded !== wantedSrc;
+  const showPreview = span === null && previewStandsIn && loaded !== wantedSrc;
   const [speed, setSpeed] = React.useState<PlaybackSpeed>(savedPlaybackSpeed);
   const { playing, togglePlaying } = usePlayback({
     frameMs: 1000 / speed,
@@ -293,9 +302,6 @@ export function App({
       : wantedSrc !== null && settled === wantedSrc,
     goTo,
   });
-  // Stretches still to be decoded from video are drawn paler on the scrubber.
-  // The video player needs nothing decoded, and screenshots never do.
-  const pendingFrames = usePendingFrames(videoPlayer ? null : day, loaded);
   const [frameSize, setFrameSize] = React.useState(DEFAULT_FRAME_SIZE);
   // Kept as is when unchanged, so the outlines don't re-render.
   const showFrameSize = (size: { width: number; height: number }): void =>

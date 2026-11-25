@@ -62,7 +62,13 @@ export function getFrameTime(
 export type PendingFrames = {
   /** The day's frame count when the ranges were found. */
   frameCount: number;
+  /** Stretches with neither decoded frames nor full previews. */
   ranges: Array<FrameRange>;
+  /**
+   * Stretches with no decoded frames, previews or not. Frames outside them
+   * come back without a decode, so they can be asked for mid-drag.
+   */
+  undecoded: Array<FrameRange>;
 };
 
 /** The stretches of `date` that still have to be decoded from video. */

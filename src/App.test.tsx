@@ -26,6 +26,7 @@ const useMatchCounts = spyOn(ocrSearch, 'useMatchCounts');
 const useMatchLines = spyOn(ocrSearch, 'useMatchLines');
 const useOcrVersion = spyOn(ocrSearch, 'useOcrVersion');
 const getPendingFrames = spyOn(frames, 'getPendingFrames');
+const onFramesDecoded = spyOn(frames, 'onFramesDecoded');
 const setViewerPosition = spyOn(viewerPosition, 'setViewerPosition');
 const useDayApps = spyOn(dayAppsHook, 'useDayApps');
 const useDayPreviews = spyOn(dayPreviewsHook, 'useDayPreviews');
@@ -41,6 +42,7 @@ afterAll(() => {
   useDay.mockRestore();
   useDayStatuses.mockRestore();
   getFrameTime.mockRestore();
+  onFramesDecoded.mockRestore();
   useDayMatches.mockRestore();
   useMatchCounts.mockRestore();
   useMatchLines.mockRestore();
@@ -158,7 +160,8 @@ describe('App', () => {
     mock.clearAllMocks();
     getFrameTime.mockResolvedValue(null);
     mockSearch('', {});
-    getPendingFrames.mockResolvedValue({ frameCount: 0, ranges: [] });
+    getPendingFrames.mockResolvedValue({ frameCount: 0, ranges: [], undecoded: [] });
+    onFramesDecoded.mockResolvedValue((): void => {});
     setViewerPosition.mockResolvedValue(undefined);
     useDayStatuses.mockReturnValue(new Map());
     useDayApps.mockReturnValue(null);
@@ -937,7 +940,13 @@ describe('App', () => {
 
   describe('Decoding progress', () => {
     it('pales the stretches of the scrubber that are not decoded yet', async () => {
-      getPendingFrames.mockResolvedValue({ frameCount: 300, ranges: [{ start: 150, end: 300 }] });
+      let decoded: (date: string) => void = () => {};
+      onFramesDecoded.mockImplementation((handler) => {
+        decoded = handler;
+        return Promise.resolve((): void => {});
+      });
+      const rest = [{ start: 150, end: 300 }];
+      getPendingFrames.mockResolvedValue({ frameCount: 300, ranges: rest, undecoded: rest });
       mockLibrary({ '2026-10-01': 300 }, 'video');
       render(<App />);
       const stretches = (): NodeListOf<HTMLElement> =>
@@ -947,9 +956,9 @@ describe('App', () => {
       expect(stretches()[0].style.width).toBe('50%');
       expect(getPendingFrames).toHaveBeenCalledWith('2026-10-01');
 
-      // Showing a frame decodes its chunk, so the scrubber asks again.
-      getPendingFrames.mockResolvedValue({ frameCount: 300, ranges: [] });
-      finishLoading();
+      // Read-ahead reports decoding the rest, so the scrubber asks again.
+      getPendingFrames.mockResolvedValue({ frameCount: 300, ranges: [], undecoded: [] });
+      act(() => decoded('2026-10-01'));
       await waitFor(() => expect(stretches()).toHaveLength(0));
       await settleFrameTime();
     });
@@ -1067,11 +1076,18 @@ describe('App', () => {
       fireEvent.change(slider(), { target: { value: String(to) } });
     }
 
+    /** Frames `start..end` of the 300 are not decoded yet; everything is previewed. */
+    function mockUndecoded(start: number, end: number): void {
+      getPendingFrames.mockResolvedValue({ frameCount: 300, ranges: [], undecoded: [{ start, end }] });
+    }
+
     it('shows the nearest preview while dragging and holds the exact frame back', async () => {
       mockPreviews();
+      mockUndecoded(0, 300);
       mockLibrary({ '2026-10-01': 300 }, 'video');
       render(<App />);
       await settleFrameTime();
+      await waitFor(() => expect(getPendingFrames).toHaveBeenCalled());
       finishLoading();
       expect(shownFrame()).toBe(frameUrl('2026-10-01', 299));
       expect(preview()).toBeNull();
@@ -1094,9 +1110,11 @@ describe('App', () => {
 
     it('keeps the preview after release until the exact frame is in, then lets go', async () => {
       mockPreviews();
+      mockUndecoded(0, 300);
       mockLibrary({ '2026-10-01': 300 }, 'video');
       render(<App />);
       await settleFrameTime();
+      await waitFor(() => expect(getPendingFrames).toHaveBeenCalled());
       finishLoading();
 
       fireEvent.pointerDown(slider());
@@ -1110,6 +1128,50 @@ describe('App', () => {
       // Arrow keys after the drag show exact frames only.
       fireEvent.keyDown(window, { key: 'ArrowLeft' });
       expect(preview()).toBeNull();
+      await settleFrameTime();
+    });
+
+    it('drags through exact frames where the video is decoded, previews where not', async () => {
+      mockPreviews();
+      mockUndecoded(150, 300);
+      mockLibrary({ '2026-10-01': 300 }, 'video');
+      render(<App />);
+      await settleFrameTime();
+      await waitFor(() => expect(getPendingFrames).toHaveBeenCalled());
+      finishLoading();
+
+      fireEvent.pointerDown(slider());
+      // Decoded: the exact frame at once, with no preview over it.
+      drag(100);
+      expect(shownFrame()).toBe(frameUrl('2026-10-01', 100));
+      expect(preview()).toBeNull();
+      finishLoading();
+      drag(101);
+      expect(shownFrame()).toBe(frameUrl('2026-10-01', 101));
+      expect(preview()).toBeNull();
+      finishLoading();
+
+      // Not decoded: the preview, and the exact frame held back.
+      drag(200);
+      expect(preview()?.getAttribute('src')).toBe('blob:preview-195');
+      expect(shownFrame()).toBe(frameUrl('2026-10-01', 101));
+      fireEvent.pointerUp(window);
+      await settleFrameTime();
+    });
+
+    it('holds exact frames back until it knows what is decoded', async () => {
+      mockPreviews();
+      getPendingFrames.mockReturnValue(new Promise(() => {}));
+      mockLibrary({ '2026-10-01': 300 }, 'video');
+      render(<App />);
+      await settleFrameTime();
+      finishLoading();
+
+      fireEvent.pointerDown(slider());
+      drag(100);
+      expect(preview()?.getAttribute('src')).toBe('blob:preview-105');
+      expect(shownFrame()).toBe(frameUrl('2026-10-01', 299));
+      fireEvent.pointerUp(window);
       await settleFrameTime();
     });
 

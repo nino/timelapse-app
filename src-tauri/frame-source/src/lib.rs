@@ -112,6 +112,10 @@ pub struct FrameRange {
 pub struct PendingFrames {
     pub frame_count: usize,
     pub ranges: Vec<FrameRange>,
+    /// The stretches with no decoded frames, previews or not: a frame
+    /// outside them comes back without running ffmpeg, so the viewer can
+    /// ask for exact frames there even while the scrubber is dragged.
+    pub undecoded: Vec<FrameRange>,
 }
 
 /// A stretch of a day that one video holds, frame for frame, for a player
@@ -694,6 +698,7 @@ impl FrameSource {
     pub fn pending(&self, date: &str) -> Result<PendingFrames, Error> {
         let segments = self.plan(parse_date(date)?)?;
         let mut pending: Vec<FrameRange> = Vec::new();
+        let mut undecoded: Vec<FrameRange> = Vec::new();
         let mut offset = 0;
         for segment in segments.iter() {
             if let Segment::Video { file, info } = segment {
@@ -705,14 +710,14 @@ impl FrameSource {
                     .as_ref()
                     .is_some_and(|store| store.has(&key, PackKind::Full));
                 for chunk in 0..info.frame_count.div_ceil(CHUNK_FRAMES) {
-                    if previewed || self.cache.contains(&key, chunk) {
+                    if self.cache.contains(&key, chunk) {
                         continue;
                     }
                     let start = offset + chunk * CHUNK_FRAMES;
                     let end = offset + ((chunk + 1) * CHUNK_FRAMES).min(info.frame_count);
-                    match pending.last_mut() {
-                        Some(last) if last.end == start => last.end = end,
-                        _ => pending.push(FrameRange { start, end }),
+                    push_range(&mut undecoded, start, end);
+                    if !previewed {
+                        push_range(&mut pending, start, end);
                     }
                 }
             }
@@ -721,6 +726,7 @@ impl FrameSource {
         Ok(PendingFrames {
             frame_count: offset,
             ranges: pending,
+            undecoded,
         })
     }
 
@@ -1357,6 +1363,14 @@ fn local_hour(time: &str, day: NaiveDate) -> Option<NaiveDateTime> {
         .or_else(|_| NaiveDateTime::parse_from_str(time, "%Y-%m-%dT%H:%M:%S%.f"))
         .ok()?;
     Some(library::truncate_to_hour(filed_at(local, day)))
+}
+
+/// Append `start..end` to `ranges`, merged into the last range if they touch.
+fn push_range(ranges: &mut Vec<FrameRange>, start: usize, end: usize) {
+    match ranges.last_mut() {
+        Some(last) if last.end == start => last.end = end,
+        _ => ranges.push(FrameRange { start, end }),
+    }
 }
 
 fn parse_date(date: &str) -> Result<NaiveDate, Error> {
