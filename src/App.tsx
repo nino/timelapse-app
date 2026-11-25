@@ -5,6 +5,7 @@ import "./App.css";
 import { AppPicker } from "./AppPicker";
 import { mergeCloseRanges, nextInRanges } from "./apps";
 import { DayPicker } from "./DayPicker";
+import { noteFrameShown, timestamp } from "./diagnostics";
 import { frameUrl, getFrameTime, type FrameRange, type FrameTime, type VideoSpan } from "./frames";
 import { useDayApps } from "./hooks/useDayApps";
 import { useDayVideos } from "./hooks/useDayVideos";
@@ -937,12 +938,14 @@ function useGatedImage(wanted: string | null | undefined, hold: boolean): {
     frameFailed: boolean;
     loaded: string | null;
     settled: string | null;
-  }>({ src: null, inFlight: false, frameFailed: false, loaded: null, settled: null });
+    /** When `src` was asked for (`performance.now()`), for the scrub log. */
+    requestedAt: number;
+  }>({ src: null, inFlight: false, frameFailed: false, loaded: null, settled: null, requestedAt: 0 });
 
   // Nothing loading: show the wanted frame. Otherwise the load that finishes
   // brings this round again. `undefined` keeps the frame shown.
   if (wanted !== undefined && !state.inFlight && !hold && wanted !== state.src) {
-    setState({ ...state, src: wanted, inFlight: wanted !== null });
+    setState({ ...state, src: wanted, inFlight: wanted !== null, requestedAt: timestamp() });
   }
 
   const settle = React.useCallback((failed: boolean): void => {
@@ -960,7 +963,10 @@ function useGatedImage(wanted: string | null | undefined, hold: boolean): {
     frameFailed: state.frameFailed,
     loaded: state.loaded,
     settled: state.settled,
-    onLoad: React.useCallback((): void => settle(false), [settle]),
+    onLoad: React.useCallback((): void => {
+      noteFrameShown(performance.now() - state.requestedAt);
+      settle(false);
+    }, [settle, state.requestedAt]),
     onError: React.useCallback((): void => settle(true), [settle]),
   };
 }

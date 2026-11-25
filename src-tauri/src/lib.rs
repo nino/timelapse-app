@@ -25,6 +25,7 @@ mod ocr_readahead;
 mod ocr_tiles;
 mod paths;
 mod previews;
+mod scrub_log;
 mod settings;
 mod updater;
 
@@ -35,6 +36,7 @@ use tauri::http::{header, Response, StatusCode};
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tauri::menu::{Menu, MenuItem, MenuItemKind, PredefinedMenuItem, WINDOW_SUBMENU_ID};
 use tauri::{AppHandle, Emitter, Manager, Runtime, State, WebviewUrl, WebviewWindowBuilder};
 use activity::{Activity, Snapshot};
@@ -152,7 +154,24 @@ async fn get_frame_time(
     date: String,
     index: usize,
 ) -> Result<Option<FrameTime>, String> {
-    with_frame_source(source.inner(), move |s| s.frame_time(&date, index)).await
+    with_frame_source(source.inner(), move |s| {
+        let started = Instant::now();
+        let time = s.frame_time(&date, index);
+        scrub_log::step("frameTime", started.elapsed());
+        time
+    })
+    .await
+}
+
+/// How long frames took from the page asking for them to having them on
+/// screen, in milliseconds, for the scrub log (`scrub_log`).
+#[tauri::command]
+fn report_frames_shown(milliseconds: Vec<f64>) {
+    for ms in milliseconds {
+        if ms.is_finite() && ms >= 0.0 {
+            scrub_log::step("shown", Duration::from_secs_f64(ms / 1000.0));
+        }
+    }
 }
 
 /// Frame ranges of `date` that still have to be decoded from video.
@@ -220,7 +239,17 @@ fn frame_response(source: Option<&FrameSource>, path: &str) -> Response<Vec<u8>>
     let Ok(index) = index.parse::<usize>() else {
         return reply(StatusCode::BAD_REQUEST, format!("not a frame index: {index}"));
     };
-    match source.frame(date, index) {
+    let started = Instant::now();
+    let frame = source.frame(date, index);
+    scrub_log::step("frameRequest", started.elapsed());
+    if let Ok(frame) = &frame {
+        scrub_log::count(if frame.mime == "image/png" { "pngFrames" } else { "videoFrames" }, 1);
+        scrub_log::count("bytes", frame.bytes.len() as u64);
+    }
+    if chrono::Local::now().format("%Y-%m-%d").to_string() == date {
+        scrub_log::count("todayFrames", 1);
+    }
+    match frame {
         Ok(frame) => Response::builder()
             .header(header::CONTENT_TYPE, frame.mime)
             // The same URL can name a different file if a black frame is
@@ -1186,11 +1215,13 @@ pub fn run() {
                             // Tell the viewer, so the scrubber stops drawing
                             // the read-ahead stretch as not decoded yet.
                             let app = app.handle().clone();
-                            source.read_ahead(move |date| {
-                                if let Err(e) = app.emit(FRAMES_DECODED, date) {
-                                    eprintln!("Could not report decoded frames: {}", e);
-                                }
-                            })
+                            source
+                                .read_ahead(move |date| {
+                                    if let Err(e) = app.emit(FRAMES_DECODED, date) {
+                                        eprintln!("Could not report decoded frames: {}", e);
+                                    }
+                                })
+                                .time_steps(scrub_log::step)
                         });
                     // Per profile too. Without it, scrubbing works as before.
                     preview_store = app
@@ -1306,6 +1337,7 @@ pub fn run() {
             get_day,
             get_day_statuses,
             get_frame_time,
+            report_frames_shown,
             get_pending_frames,
             get_day_videos,
             get_day_previews,

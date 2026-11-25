@@ -230,12 +230,16 @@ impl Segment {
     }
 }
 
+type StepTimer = Box<dyn Fn(&'static str, StdDuration) + Send + Sync>;
+
 pub struct FrameSource {
     root: PathBuf,
     tools: Tools,
     cache: Arc<ChunkCache>,
     /// None unless `read_ahead` switched it on.
     read_ahead: Option<ReadAhead>,
+    /// Told how long each step of serving a frame took. See `time_steps`.
+    step_timer: Option<StepTimer>,
     /// The last frame asked for, to tell which way the viewer is moving.
     last_frame: Mutex<Option<(String, usize)>>,
     /// None unless `with_previews` switched them on.
@@ -294,6 +298,7 @@ impl FrameSource {
             tools,
             cache: Arc::new(ChunkCache::open(cache_dir, cache_cap_bytes)?),
             read_ahead: None,
+            step_timer: None,
             last_frame: Mutex::new(None),
             previews: None,
             viewing: Mutex::new(Viewing::default()),
@@ -322,6 +327,25 @@ impl FrameSource {
             Box::new(on_decoded),
         ));
         self
+    }
+
+    /// Call `timer` with how long each step of `frame` and `frame_time` took:
+    /// `plan` (listing the day), `readPng`, `videoFrame` and `dbTime`, so the
+    /// app can tell where a slow scrub spends its time.
+    pub fn time_steps(mut self, timer: impl Fn(&'static str, StdDuration) + Send + Sync + 'static) -> Self {
+        self.step_timer = Some(Box::new(timer));
+        self
+    }
+
+    /// Run `step`, telling the step timer (if any) how long it took.
+    fn timed<T>(&self, name: &'static str, step: impl FnOnce() -> T) -> T {
+        let Some(timer) = &self.step_timer else {
+            return step();
+        };
+        let started = std::time::Instant::now();
+        let result = step();
+        timer(name, started.elapsed());
+        result
     }
 
     /// Keep preview packs of videos in `store` and serve them (`day_previews`,
@@ -521,7 +545,7 @@ impl FrameSource {
 
     pub fn frame(&self, date: &str, index: usize) -> Result<Frame, Error> {
         let day = parse_date(date)?;
-        let segments = self.plan(day)?;
+        let segments = self.timed("plan", || self.plan(day))?;
         if self.previews.is_some() {
             self.note_viewer(date, index);
         }
@@ -543,10 +567,12 @@ impl FrameSource {
         let (segment, local) = locate(segments, date, index)?;
         match segment {
             Segment::Screenshots { shots, range } => Ok(Frame {
-                bytes: fs::read(self.day_dir(day).join(&shots[range.start + local].name))?,
+                bytes: self.timed("readPng", || {
+                    fs::read(self.day_dir(day).join(&shots[range.start + local].name))
+                })?,
                 mime: "image/png",
             }),
-            Segment::Video { file, info } => {
+            Segment::Video { file, info } => self.timed("videoFrame", || {
                 let chunk = local / CHUNK_FRAMES;
                 let name = format!("{:04}.jpg", local % CHUNK_FRAMES + 1);
                 let key = cache_key(file)?;
@@ -604,7 +630,7 @@ impl FrameSource {
                     bytes,
                     mime: "image/jpeg",
                 })
-            }
+            }),
         }
     }
 
@@ -730,14 +756,14 @@ impl FrameSource {
 
     pub fn frame_time(&self, date: &str, index: usize) -> Result<Option<FrameTime>, Error> {
         let day = parse_date(date)?;
-        let segments = self.plan(day)?;
+        let segments = self.timed("plan", || self.plan(day))?;
         let Ok((segment, local)) = locate(&segments, date, index) else {
             return Ok(None);
         };
         match segment {
             Segment::Screenshots { shots, range } => {
                 let shot = &shots[range.start + local];
-                if let Some(local_time) = self.db_time(date, shot.number)? {
+                if let Some(local_time) = self.timed("dbTime", || self.db_time(date, shot.number))? {
                     return Ok(Some(FrameTime {
                         local_time,
                         exact: true,

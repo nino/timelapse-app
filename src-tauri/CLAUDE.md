@@ -16,8 +16,9 @@ Each module's `//!` doc comment says how it works; this file is the map and the 
 - `day_apps.rs` — which app was in front across a day (recorded window, else the OCR'd menu bar), as scrubber stretches for the app filter.
 - `activity.rs`, `boost.rs` — what the Activity window shows, and Boost / Low power mode, which change how hard conversion and OCR may work.
 - `backlog.rs` — logs once an hour how far behind OCR and video conversion are (frames left, age of the oldest screenshot each still has to do).
+- `scrub_log.rs` — one "Scrub" row per stretch of scrubbing or playback: per step of serving a frame (listing the day, reading the PNG, decoding video, the time lookup) and until the page has it on screen, the 50th/90th percentile and longest time.
 - `diagnostics.rs` — `<library>/diagnostics.db`, a log for Nino to upload when something looks wrong.
-- `analytics.rs` — only when "Send error reports" is on in Settings (off by default; never nag anyone to turn it on), release builds made with `POSTHOG_KEY`/`POSTHOG_HOST` send an "app started" event, every error-level diagnostics event and the hourly backlog (`backlog.rs`) to PostHog, anonymously and rate-limited. The one exception is feedback from the Activity window (`send_feedback`), which the person sends on purpose, so it goes whatever the setting says. Never send library content (frames, OCR text, window titles) through it.
+- `analytics.rs` — only when "Send error reports" is on in Settings (off by default; never nag anyone to turn it on), release builds made with `POSTHOG_KEY`/`POSTHOG_HOST` send an "app started" event, every error-level diagnostics event, the hourly backlog (`backlog.rs`) and scrub timings (`scrub_log.rs`) to PostHog, anonymously and rate-limited. The one exception is feedback from the Activity window (`send_feedback`), which the person sends on purpose, so it goes whatever the setting says. Never send library content (frames, OCR text, window titles) through it.
 - `app_state.rs`, `settings.rs`, `updater.rs`, `paths.rs` — remembered window and viewer state, preferences, auto-update, library and ffmpeg paths.
 
 ## Data model
