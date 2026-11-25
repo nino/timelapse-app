@@ -102,6 +102,7 @@ export function App({
   // "(Today)" label moves over at midnight instead of sticking to launch day.
   // Local date, to match `create_day_dir_if_needed` in Rust.
   const today = React.useMemo(
+    // oxlint-disable-next-line react/purity -- reading the clock is the point (see above)
     () => localDateFolder(new Date()),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [days],
