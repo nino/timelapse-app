@@ -28,6 +28,11 @@ export type SeekableVideo = {
 export type SeekerCallbacks = {
   /** The seek asked for frame `wanted` has finished, showing frame `shown`. */
   onShown: (wanted: number, shown: number) => void;
+  /**
+   * A seek has finished, `milliseconds` after its frame was asked for
+   * (including any wait for the seek before it), for the scrub log.
+   */
+  onSeekTimed?: (milliseconds: number) => void;
 };
 
 /**
@@ -40,9 +45,11 @@ const HAVE_METADATA = 1;
 
 export class VideoSeeker {
   private wanted: number | null = null;
+  /** When `wanted` was asked for (`performance.now()`). */
+  private wantedAt = 0;
   private shown: number | null = null;
-  /** The frame the running seek is for, and its number. */
-  private running: { frame: number; id: number } | null = null;
+  /** The frame the running seek is for, its number, and when it was asked for. */
+  private running: { frame: number; id: number; askedAt: number } | null = null;
   private seeks = 0;
   private timer: ReturnType<typeof setTimeout> | null = null;
 
@@ -61,6 +68,7 @@ export class VideoSeeker {
   /** Show frame `frame` of the video (0-based). */
   want(frame: number): void {
     if (frame === this.wanted && (this.running !== null || frame === this.shown)) return;
+    if (frame !== this.wanted) this.wantedAt = performance.now();
     this.wanted = frame;
     this.start();
   }
@@ -76,7 +84,7 @@ export class VideoSeeker {
       return;
     }
     const id = ++this.seeks;
-    this.running = { frame, id };
+    this.running = { frame, id, askedAt: this.wantedAt };
     this.video.requestVideoFrameCallback?.((_, metadata) => this.onFrame(id, metadata.mediaTime));
     // The middle of the frame, so rounding can't land on its neighbour.
     this.video.currentTime = (frame + 0.5) / this.fps;
@@ -112,6 +120,7 @@ export class VideoSeeker {
     this.shown = shown;
     this.clearTimer();
     if (!this.video.isConnected) return;
+    this.callbacks.onSeekTimed?.(performance.now() - running.askedAt);
     this.callbacks.onShown(running.frame, shown);
     // Asked for another frame meanwhile: go there.
     if (this.wanted !== running.frame) this.start();

@@ -1,5 +1,6 @@
 import React from "react";
 
+import { noteVideoSeek } from "./diagnostics";
 import { videoUrl, type VideoSpan } from "./frames";
 import { VideoSeeker } from "./videoSeeker";
 
@@ -40,6 +41,7 @@ export function VideoFrame({
       let seeker = seekers.get(video);
       const callbacks = {
         onShown: (wanted: number, shown: number): void => onShown(start + wanted, start + shown),
+        onSeekTimed: noteVideoSeek,
       };
       if (seeker) {
         seeker.callbacks = callbacks;

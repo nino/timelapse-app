@@ -73,6 +73,25 @@ function setup(withFrameCallback = true): {
 }
 
 describe("VideoSeeker", () => {
+  it("times each seek from when its frame was asked for, waiting included", () => {
+    const video = new FakeVideo();
+    const timed: Array<number> = [];
+    const seeker = new VideoSeeker(video, FPS, {
+      onShown: (): void => {},
+      onSeekTimed: (ms): void => void timed.push(ms),
+    });
+    seeker.want(10);
+    seeker.want(20);
+    video.land();
+    expect(timed).toHaveLength(1);
+    video.land();
+    expect(timed).toHaveLength(2);
+    expect(timed.every((ms) => ms >= 0)).toBe(true);
+    // The frame already shown costs no seek, so nothing is timed.
+    seeker.want(20);
+    expect(timed).toHaveLength(2);
+  });
+
   it("seeks exactly to the middle of a frame and reports what was shown", () => {
     const { video, seeker, shown } = setup();
     seeker.want(100);

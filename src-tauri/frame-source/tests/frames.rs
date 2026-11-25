@@ -489,6 +489,11 @@ fn reports_video_frames_that_are_not_decoded_yet() {
         source.pending("2026-10-04").unwrap().ranges,
         vec![range(0, CHUNK_FRAMES), range(2 * CHUNK_FRAMES, long)]
     );
+    // Without previews, undecoded and pending are the same.
+    assert_eq!(
+        source.pending("2026-10-04").unwrap().undecoded,
+        vec![range(0, CHUNK_FRAMES), range(2 * CHUNK_FRAMES, long)]
+    );
 
     // A chunk cleared from the cache behind the source's back is pending again.
     for video in fs::read_dir(lib.cache.path()).unwrap() {

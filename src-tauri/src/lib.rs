@@ -164,12 +164,16 @@ async fn get_frame_time(
 }
 
 /// How long frames took from the page asking for them to having them on
-/// screen, in milliseconds, for the scrub log (`scrub_log`).
+/// screen, in milliseconds, for the scrub log (`scrub_log`): `milliseconds`
+/// for `<img>` frames, `seeks` for the beta video player's seeks.
 #[tauri::command]
-fn report_frames_shown(milliseconds: Vec<f64>) {
-    for ms in milliseconds {
-        if ms.is_finite() && ms >= 0.0 {
-            scrub_log::step("shown", Duration::from_secs_f64(ms / 1000.0));
+fn report_frames_shown(milliseconds: Vec<f64>, seeks: Option<Vec<f64>>) {
+    let steps = [("shown", milliseconds), ("videoSeek", seeks.unwrap_or_default())];
+    for (step, samples) in steps {
+        for ms in samples {
+            if ms.is_finite() && ms >= 0.0 {
+                scrub_log::step(step, Duration::from_secs_f64(ms / 1000.0));
+            }
         }
     }
 }

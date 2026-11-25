@@ -24,8 +24,10 @@ export function logUncaughtErrors(): void {
 }
 
 // How long frames took from being asked for to being on screen, sent to the
-// scrub log (`scrub_log.rs`) in batches rather than one call per frame.
+// scrub log (`scrub_log.rs`) in batches rather than one call per frame:
+// `<img>` frames, and the beta video player's seeks.
 let framesShown: Array<number> = [];
+let videoSeeks: Array<number> = [];
 let framesShownTimer: ReturnType<typeof setTimeout> | null = null;
 
 /**
@@ -38,10 +40,21 @@ export function timestamp(): number {
 
 export function noteFrameShown(milliseconds: number): void {
   framesShown.push(milliseconds);
+  scheduleReport();
+}
+
+/** How long a seek of the beta video player took, from asking to showing its frame. */
+export function noteVideoSeek(milliseconds: number): void {
+  videoSeeks.push(milliseconds);
+  scheduleReport();
+}
+
+function scheduleReport(): void {
   framesShownTimer ??= setTimeout((): void => {
-    const batch = framesShown;
+    const batch = { milliseconds: framesShown, seeks: videoSeeks };
     framesShown = [];
+    videoSeeks = [];
     framesShownTimer = null;
-    void invoke("report_frames_shown", { milliseconds: batch }).catch((): void => {});
+    void invoke("report_frames_shown", batch).catch((): void => {});
   }, 1000);
 }

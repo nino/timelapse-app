@@ -5,8 +5,8 @@ import { stretchPositions } from './PendingStretches';
 describe('stretchPositions', () => {
   it('has nothing to draw when nothing is pending', () => {
     expect(stretchPositions(null)).toEqual([]);
-    expect(stretchPositions({ frameCount: 100, ranges: [] })).toEqual([]);
-    expect(stretchPositions({ frameCount: 0, ranges: [{ start: 0, end: 1 }] })).toEqual([]);
+    expect(stretchPositions({ frameCount: 100, ranges: [], undecoded: [] })).toEqual([]);
+    expect(stretchPositions({ frameCount: 0, ranges: [{ start: 0, end: 1 }], undecoded: [] })).toEqual([]);
   });
 
   it('places each stretch in proportion to the day it was measured against', () => {
@@ -17,6 +17,7 @@ describe('stretchPositions', () => {
           { start: 0, end: 50 },
           { start: 100, end: 250 },
         ],
+        undecoded: [],
       }),
     ).toEqual([
       { left: 0, width: 25 },
