@@ -22,3 +22,26 @@ export function logUncaughtErrors(): void {
     }).catch((): void => {});
   });
 }
+
+// How long frames took from being asked for to being on screen, sent to the
+// scrub log (`scrub_log.rs`) in batches rather than one call per frame.
+let framesShown: Array<number> = [];
+let framesShownTimer: ReturnType<typeof setTimeout> | null = null;
+
+/**
+ * `performance.now()`, for timing a frame load. Only the scrub log reads it,
+ * never what a component renders, so taking it while rendering is harmless.
+ */
+export function timestamp(): number {
+  return performance.now();
+}
+
+export function noteFrameShown(milliseconds: number): void {
+  framesShown.push(milliseconds);
+  framesShownTimer ??= setTimeout((): void => {
+    const batch = framesShown;
+    framesShown = [];
+    framesShownTimer = null;
+    void invoke("report_frames_shown", { milliseconds: batch }).catch((): void => {});
+  }, 1000);
+}

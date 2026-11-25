@@ -14,7 +14,9 @@
 //! exception with its source and message (home folder replaced by `~`,
 //! capped at `MAX_MESSAGE` characters), and once an hour a "backlog" event
 //! with how far behind OCR and video conversion are (`backlog.rs`: counts,
-//! ages and the power state). Nothing from the library leaves the
+//! ages and the power state), and after each stretch of scrubbing a "scrub"
+//! event with how long serving and showing frames took (`scrub_log.rs`:
+//! timings and counts). Nothing from the library leaves the
 //! machine: no frames, no OCR text, no window titles. Events carry a random id,
 //! made on the first send and kept in the config directory until reports are
 //! turned off, and create no person profile.
