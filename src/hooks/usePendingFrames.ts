@@ -1,7 +1,7 @@
 import React from "react";
 
 import { getPendingFrames, hasVideo as hasVideoFrames, type Day, type PendingFrames } from "../frames";
-import { useLatestLoad } from "./useDirectoryChanges";
+import { useLatestLoad } from "./useLatestLoad";
 import { useFramesDecoded } from "./useFramesDecoded";
 
 /**

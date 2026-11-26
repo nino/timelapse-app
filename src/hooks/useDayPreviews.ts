@@ -10,7 +10,7 @@ import {
   releasePack,
   type LoadedPack,
 } from "../previews";
-import { useLatestLoad } from "./useDirectoryChanges";
+import { useLatestLoad } from "./useLatestLoad";
 import { useFramesDecoded } from "./useFramesDecoded";
 
 /** Looks up the preview nearest a frame of the day. */

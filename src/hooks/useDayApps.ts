@@ -1,7 +1,7 @@
 import React from "react";
 
 import { getDayApps, type DayApps } from "../apps";
-import { useAnswer } from "./useOcrSearch";
+import { useAnswer } from "./useAnswer";
 import { useTimeout } from "./useTimeout";
 
 // While an app is picked, its stretches are re-asked at most this often, as
