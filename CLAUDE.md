@@ -6,6 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A Tauri 2 desktop app (macOS-focused) that runs a background "photographer" loop capturing one screenshot per second of the focused screen, stores them as PNGs under `~/Timelapse/YYYY-MM-DD/00001.png`, and serves a React frontend for scrubbing through any day, whether that day survives as screenshots or only as video. In the background, OCR reads every frame into a searchable index, and a converter encodes each finished hour into a `.mov` and then deletes its PNGs. The photographer starts automatically on app launch (see `src-tauri/src/lib.rs::run`).
 
+**Claude owns and maintains this code.** Nino sets what the app should do; how the code is organised is Claude's call. When a change would be cleaner after a refactor, a restructure, a rename or removing dead code, do it without asking first, either in the same PR or in a separate one, and say in the PR what changed and why. The product rules below still apply.
+
 ## Commands
 
 **The package manager is [Bun](https://bun.sh)** — `bun install`, `bun.lock`. Don't use yarn or npm; there is no `yarn.lock` and `package-lock.json` should never be committed.
