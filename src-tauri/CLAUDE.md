@@ -4,7 +4,10 @@ Each module's `//!` doc comment says how it works; this file is the map and the 
 
 ## Modules
 
-- `lib.rs` — the Tauri commands, the `frames://localhost/<YYYY-MM-DD>/<index>` URI scheme (`http://frames.localhost/…` on Windows), the menu, and `setup()`, which creates the library directory, evicts cache folders over 15 days old, and starts the photographer (after a 1 s delay), OCR and the converter. Commands with logic worth testing are thin shims over `*_impl` functions that take plain arguments, which is what the tests call.
+- `lib.rs` — the Tauri commands and `setup()`, which creates the library directory, evicts cache folders over 15 days old (`cache_eviction.rs`), and starts the photographer (after a 1 s delay), OCR and the converter. Commands with logic worth testing are thin shims over `*_impl` functions that take plain arguments, which is what the tests call.
+- `search.rs` — the find bar's commands (matches on a day's scrubber, counts per day, a frame's matching lines, the OCR version).
+- `windows.rs` — the main, Activity, Settings and About windows, where they open and which reopen at launch, and the menu.
+- `frame_scheme.rs` — the `frames://localhost/<YYYY-MM-DD>/<index>` URI scheme (`http://frames.localhost/…` on Windows) and the preview packs it serves.
 - `media.rs` — the `videos://localhost/<file name>` URI scheme for the beta video player: library videos (`FrameSource::video_path`) served in byte ranges, which WebKit's media loader needs.
 - `timelapse.rs` — the `Photographer` capture loop.
 - `database.rs` — `ScreenshotDatabase` over `<library>/screenshots.db`, and its migrations.

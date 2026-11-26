@@ -406,7 +406,7 @@ fn dialog_window(app: &AppHandle) -> Option<WebviewWindow> {
     windows
         .values()
         .find(|window| window.is_focused().unwrap_or(false))
-        .or_else(|| windows.get(crate::MAIN_WINDOW).filter(on_screen))
+        .or_else(|| windows.get(crate::windows::MAIN_WINDOW).filter(on_screen))
         .or_else(|| windows.values().find(on_screen))
         .cloned()
 }
