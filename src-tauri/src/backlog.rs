@@ -44,7 +44,7 @@ pub fn start(root: PathBuf, activity: Arc<Activity>, boost: Arc<Boost>) {
 }
 
 fn report(root: &Path, activity: &Activity, boost: &Boost) {
-    let db = ScreenshotDatabase::open_read_only(root.join("screenshots.db")).unwrap_or(None);
+    let db = ScreenshotDatabase::open_read_only(ScreenshotDatabase::path_in(root)).unwrap_or(None);
     let video_frames_left = activity.ocr_video_frames_left();
     let (work, oldest) = match remaining_work_and_oldest(root, db.as_ref(), video_frames_left.as_ref()) {
         Ok(found) => found,

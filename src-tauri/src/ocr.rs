@@ -206,7 +206,7 @@ pub fn ocr_covers(
 /// the library's database; if that cannot be opened, nothing is converted or
 /// deleted.
 pub fn ocr_check(root: &Path) -> OcrCheck {
-    let db = match ScreenshotDatabase::new(root.join("screenshots.db")) {
+    let db = match ScreenshotDatabase::new(ScreenshotDatabase::path_in(root)) {
         Ok(db) => Mutex::new(db),
         Err(error) => {
             crate::diagnostics::error("ocr", format!("Cannot open database for the delete check: {}", error)).record();
@@ -600,7 +600,7 @@ impl OcrWorker {
                 break;
             };
             self.timings.compare += started.elapsed();
-            if plan.last.as_ref().map_or(true, |last| thumbnail.differs_from(last)) {
+            if plan.last.as_ref().is_none_or(|last| thumbnail.differs_from(last)) {
                 pool.submit(path.clone());
                 plan.last = Some(thumbnail.clone());
             }
@@ -726,7 +726,7 @@ impl OcrWorker {
         let changed = self
             .last_read
             .get(day)
-            .map_or(true, |last| thumbnail.differs_from(last));
+            .is_none_or(|last| thumbnail.differs_from(last));
 
         if !changed {
             let started = Instant::now();
@@ -947,7 +947,7 @@ impl OcrWorker {
         let streamed = videos.source.stream_video_every(video, first, step, &mut |index, frame| {
             if summary.handled() >= max_frames
                 || summary.handled() > 0
-                    && summary.handled() % FRAMES_PER_POWER_CHECK == 0
+                    && summary.handled().is_multiple_of(FRAMES_PER_POWER_CHECK)
                     && !keep_going()
             {
                 stopped = true;
@@ -1112,7 +1112,7 @@ pub fn start_background_ocr(
 
             // A connection of its own, so OCR never waits on the capture
             // loop's lock.
-            let db = match ScreenshotDatabase::new(root.join("screenshots.db")) {
+            let db = match ScreenshotDatabase::new(ScreenshotDatabase::path_in(&root)) {
                 Ok(db) => db,
                 Err(error) => {
                     crate::diagnostics::error("ocr", format!("Cannot open database: {}", error)).record();
@@ -1567,14 +1567,14 @@ mod tests {
         ) -> Library {
             let temp_dir = TempDir::new().unwrap();
             let root = temp_dir.path().to_path_buf();
-            let db = ScreenshotDatabase::new(root.join("screenshots.db")).unwrap();
+            let db = ScreenshotDatabase::new(ScreenshotDatabase::path_in(&root)).unwrap();
             let worker = OcrWorker::new(root.clone(), db, recognizer);
             Library { _temp_dir: temp_dir, root, seen, worker }
         }
 
         /// Read ahead with `count` recognizers from `make`.
         fn reading_ahead(&mut self, count: usize, make: RecognizerMaker) {
-            let db = ScreenshotDatabase::new(self.root.join("screenshots.db")).unwrap();
+            let db = ScreenshotDatabase::new(ScreenshotDatabase::path_in(&self.root)).unwrap();
             let placeholder = OcrWorker::new(self.root.clone(), db, Box::new(FakeRecognizer { seen: Default::default() }));
             let worker = std::mem::replace(&mut self.worker, placeholder);
             self.worker = worker.reading_ahead_with(make);
@@ -1600,7 +1600,7 @@ mod tests {
     fn reports_progress_to_the_activity_window() {
         let mut library = Library::new();
         let activity = Arc::new(Activity::default());
-        let db = ScreenshotDatabase::new(library.root.join("screenshots.db")).unwrap();
+        let db = ScreenshotDatabase::new(ScreenshotDatabase::path_in(&library.root)).unwrap();
         library.worker = OcrWorker::new(library.root.clone(), db, Box::new(SameText))
             .reporting_to(Arc::clone(&activity));
         frame(&library.root, DAY_1, 1, 0, false);
@@ -1996,7 +1996,7 @@ mod tests {
     #[test]
     fn ocr_covers_only_frames_up_to_the_mark() {
         let temp_dir = TempDir::new().unwrap();
-        let db = ScreenshotDatabase::new(temp_dir.path().join("screenshots.db")).unwrap();
+        let db = ScreenshotDatabase::new(ScreenshotDatabase::path_in(temp_dir.path())).unwrap();
 
         assert!(!ocr_covers(&db, DAY_1, [1, 2]));
 
@@ -2029,7 +2029,7 @@ mod tests {
         assert!(!check(&batch(&[1, 2])));
 
         // OCR's own connection records progress; the check sees it.
-        let db = ScreenshotDatabase::new(root.join("screenshots.db")).unwrap();
+        let db = ScreenshotDatabase::new(ScreenshotDatabase::path_in(root)).unwrap();
         db.record_ocr_frame(DAY_1, 2, None).unwrap();
 
         assert!(check(&batch(&[1, 2])));
@@ -2373,7 +2373,7 @@ mod tests {
         let library = PathBuf::from(library);
         let frames = std::env::var("OCR_TEST_FRAMES").map_or(900, |n| n.parse().unwrap());
         let work = TempDir::new().unwrap();
-        let db = ScreenshotDatabase::new(work.path().join("screenshots.db")).unwrap();
+        let db = ScreenshotDatabase::new(ScreenshotDatabase::path_in(work.path())).unwrap();
         let source = FrameSource::new(
             library.clone(),
             work.path().join("chunks"),
@@ -2395,7 +2395,7 @@ mod tests {
         );
 
         let (day, frame, text): (String, u32, String) =
-            rusqlite::Connection::open(work.path().join("screenshots.db"))
+            rusqlite::Connection::open(ScreenshotDatabase::path_in(work.path()))
                 .unwrap()
                 .query_row(
                     "SELECT day, frame_number, text FROM ocr_frames

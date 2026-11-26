@@ -318,7 +318,7 @@ pub fn find_deletable_hours(
 /// are gone. With `only_missing`, a part that already has a record is left
 /// alone.
 pub fn record_frames(root: &Path, parts: &[HourBatch], only_missing: bool) -> rusqlite::Result<()> {
-    let db = ScreenshotDatabase::new(root.join("screenshots.db"))?;
+    let db = ScreenshotDatabase::new(ScreenshotDatabase::path_in(root))?;
     for batch in parts {
         let video = batch.video_name();
         if only_missing && db.has_video_frames(&video)? {
@@ -334,7 +334,7 @@ pub fn record_frames(root: &Path, parts: &[HourBatch], only_missing: bool) -> ru
 /// with. A frame that joined the hour after its video was made is in no
 /// video, so none of that hour's PNGs may go.
 pub fn matches_record(root: &Path, parts: &[HourBatch]) -> rusqlite::Result<bool> {
-    let db = ScreenshotDatabase::new(root.join("screenshots.db"))?;
+    let db = ScreenshotDatabase::new(ScreenshotDatabase::path_in(root))?;
     for batch in parts {
         let numbers: Vec<u32> = batch.frames.iter().map(|frame| frame.number).collect();
         if db.video_frame_numbers(&batch.video_name())? != numbers {
@@ -908,7 +908,7 @@ impl Converter {
             while running.load(Ordering::SeqCst) {
                 // At most once a minute: a boost can wake the loop every few
                 // seconds, and each time would scan the whole library.
-                if deleted_at.map_or(true, |at| at.elapsed() >= ON_BATTERY_POLL) {
+                if deleted_at.is_none_or(|at| at.elapsed() >= ON_BATTERY_POLL) {
                     deleted_at = Some(Instant::now());
                     delete_converted(&root, &ocr_done, &activity);
                 }
@@ -1382,7 +1382,7 @@ mod tests {
     /// The recorded (day, frame number, local time) of each frame of `video`,
     /// in video order.
     fn recorded(root: &Path, video: &str) -> Vec<(String, u32, String)> {
-        let conn = rusqlite::Connection::open(root.join("screenshots.db")).unwrap();
+        let conn = rusqlite::Connection::open(ScreenshotDatabase::path_in(root)).unwrap();
         let mut statement = conn
             .prepare("SELECT day, frame_number, local_time FROM video_frames WHERE video = ?1 ORDER BY frame_index")
             .unwrap();
@@ -1403,7 +1403,7 @@ mod tests {
         // Frame 1 has a database row, written a moment after its file; frame
         // 7 has none, so its file time stands in.
         let captured = at("2026-10-01", 9, 0) + chrono::Duration::milliseconds(300);
-        ScreenshotDatabase::new(root.join("screenshots.db"))
+        ScreenshotDatabase::new(ScreenshotDatabase::path_in(root))
             .unwrap()
             .insert_screenshot("2026-10-01", 1, captured.into(), captured)
             .unwrap();
@@ -1426,7 +1426,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let root = temp.path();
         frame(root, "2026-10-01", 1, at("2026-10-01", 9, 0));
-        fs::create_dir(root.join("screenshots.db")).unwrap();
+        fs::create_dir(ScreenshotDatabase::path_in(root)).unwrap();
         let batch = find_ready_batches(root, at("2026-10-02", 0, 0)).unwrap().remove(0);
 
         let mut seen = 0;
@@ -1449,7 +1449,7 @@ mod tests {
 
         let _ = convert_batch(root, &batch, None, |_, _| Err(ConvertError::Interrupted));
 
-        assert!(!root.join("screenshots.db").exists() || recorded(root, &batch.video_name()).is_empty());
+        assert!(!ScreenshotDatabase::path_in(root).exists() || recorded(root, &batch.video_name()).is_empty());
     }
 
     #[test]

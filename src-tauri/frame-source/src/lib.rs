@@ -512,7 +512,7 @@ impl FrameSource {
 
     fn note_viewer(&self, date: &str, index: usize) {
         let mut viewing = self.viewing.lock().unwrap();
-        let new_day = viewing.at.as_ref().map_or(true, |(day, _)| day != date);
+        let new_day = viewing.at.as_ref().is_none_or(|(day, _)| day != date);
         viewing.at = Some((date.to_owned(), index));
         if new_day {
             viewing.day_changes += 1;

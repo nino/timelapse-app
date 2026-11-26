@@ -95,7 +95,7 @@ fn get_timelapse_root_name() -> String {
 /// A read-only connection to the library database in `root`, or `None`
 /// before it exists.
 pub(crate) fn library_db(root: &Path) -> Result<Option<database::Reader>, String> {
-    ScreenshotDatabase::reader(root.join("screenshots.db")).map_err(|e| e.to_string())
+    ScreenshotDatabase::reader(ScreenshotDatabase::path_in(root)).map_err(|e| e.to_string())
 }
 
 /// Whether the photographer has been started.
@@ -661,7 +661,7 @@ pub fn run() {
 
             // Start timelapse automatically when app is ready
             let photographer_state = app.state::<PhotographerState>();
-            let state_clone = Arc::clone(&photographer_state.inner());
+            let state_clone = Arc::clone(photographer_state.inner());
             let activity = Arc::clone(app.state::<ActivityState>().inner());
             let boost = Arc::clone(app.state::<BoostState>().inner());
             let converter_previews = preview_store.clone();

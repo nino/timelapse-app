@@ -244,7 +244,7 @@ impl Activity {
         let stale = self
             .power_read_at
             .lock()
-            .map(|at| at.map_or(true, |at| at.elapsed() >= POWER_READING_TTL))
+            .map(|at| at.is_none_or(|at| at.elapsed() >= POWER_READING_TTL))
             .unwrap_or(true);
         if stale {
             let on_ac = read_power();

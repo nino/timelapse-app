@@ -245,7 +245,7 @@ mod tests {
         for n in frames {
             fs::write(day_dir.join(format!("{n:05}.png")), b"png").unwrap();
         }
-        let db = ScreenshotDatabase::new(library.path().join("screenshots.db")).unwrap();
+        let db = ScreenshotDatabase::new(ScreenshotDatabase::path_in(library.path())).unwrap();
         (library, db)
     }
 
