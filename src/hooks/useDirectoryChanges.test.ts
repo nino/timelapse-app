@@ -38,6 +38,40 @@ describe('useDirectoryChanges', () => {
     });
   });
 
+  it('shares one watcher among the hooks watching the same path', async () => {
+    let fire: () => void = () => {};
+    const unwatch = mock();
+    mocked(watch).mockImplementation(async (_path, callback) => {
+      fire = (): void => callback({ type: 'any', paths: [], attrs: null });
+      return unwatch;
+    });
+    const first = mock();
+    const second = mock();
+
+    const a = renderHook(() => useDirectoryChanges('Timelapse', first));
+    const b = renderHook(() => useDirectoryChanges('Timelapse', second));
+    await act(async () => {});
+    expect(watch).toHaveBeenCalledTimes(1);
+
+    fire();
+    expect(first).toHaveBeenCalledTimes(1);
+    expect(second).toHaveBeenCalledTimes(1);
+
+    // The watcher stays while anyone is listening, and stops after the last.
+    a.unmount();
+    fire();
+    expect(first).toHaveBeenCalledTimes(1);
+    expect(second).toHaveBeenCalledTimes(2);
+    expect(unwatch).not.toHaveBeenCalled();
+    b.unmount();
+    expect(unwatch).toHaveBeenCalledTimes(1);
+
+    // A later hook starts a watcher of its own.
+    renderHook(() => useDirectoryChanges('Timelapse', mock()));
+    await act(async () => {});
+    expect(watch).toHaveBeenCalledTimes(2);
+  });
+
   it('does not watch when there is no path', () => {
     renderHook(() => useDirectoryChanges(null, mock()));
     expect(watch).not.toHaveBeenCalled();

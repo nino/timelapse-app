@@ -41,6 +41,7 @@ play the filesystem:
 #### `src/hooks/useDirectoryChanges.test.ts`
 - ✓ Calls back when the watcher reports a change, with a 500 ms debounce
 - ✓ Stops watching on unmount, even if the watcher arrives late
+- ✓ Hooks watching the same path share one watcher, which stops after the last of them
 - ✓ Falls back to polling every 3 s when the watcher cannot be created
 
 #### `src/hooks/useLatestLoad.test.ts`
