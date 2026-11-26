@@ -308,7 +308,7 @@ mod tests {
     fn test_day_statuses() {
         let dir = TempDir::new().unwrap();
         let root = dir.path();
-        let db = ScreenshotDatabase::new(root.join("screenshots.db")).unwrap();
+        let db = ScreenshotDatabase::new(ScreenshotDatabase::path_in(root)).unwrap();
 
         // Old script's day, read from video to the end.
         touch(&root.join("2024-01-01--20-00-00.mov"));
@@ -362,7 +362,7 @@ mod tests {
     fn test_remaining_work() {
         let dir = TempDir::new().unwrap();
         let root = dir.path();
-        let db = ScreenshotDatabase::new(root.join("screenshots.db")).unwrap();
+        let db = ScreenshotDatabase::new(ScreenshotDatabase::path_in(root)).unwrap();
 
         // Old script's days: one read to the end, one part way (OCR counted
         // its frames), one OCR hasn't counted yet.
@@ -443,7 +443,7 @@ mod tests {
     fn test_marking_complete_leaves_screenshot_days_alone() {
         let dir = TempDir::new().unwrap();
         let root = dir.path();
-        let db = ScreenshotDatabase::new(root.join("screenshots.db")).unwrap();
+        let db = ScreenshotDatabase::new(ScreenshotDatabase::path_in(root)).unwrap();
         touch(&root.join("2026-10-03/00001.png"));
         touch(&root.join("2026-10-03/00002.png"));
         db.record_ocr_frame("2026-10-03", 1, None).unwrap();

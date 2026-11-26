@@ -205,7 +205,7 @@ mod tests {
         for n in [1, 2, 3, 5, 6, 7] {
             fs::write(day_dir.join(format!("{n:05}.png")), b"png").unwrap();
         }
-        let db = ScreenshotDatabase::new(library.path().join("screenshots.db")).unwrap();
+        let db = ScreenshotDatabase::new(ScreenshotDatabase::path_in(library.path())).unwrap();
         db.record_ocr_frame("2026-10-04", 2, Some(("cargo build", &[]))).unwrap();
         db.record_ocr_frame("2026-10-04", 3, None).unwrap();
         db.record_ocr_frame("2026-10-04", 4, Some(("cargo check", &[]))).unwrap();
@@ -245,7 +245,7 @@ mod tests {
             eprintln!("skipping: ffmpeg with libx264 is not available");
             return;
         }
-        let db = ScreenshotDatabase::new(library.path().join("screenshots.db")).unwrap();
+        let db = ScreenshotDatabase::new(ScreenshotDatabase::path_in(library.path())).unwrap();
         db.record_video_ocr_frame("2024-12-20", 1, Some(("cargo build", &[]))).unwrap();
         db.record_video_ocr_frame("2024-12-20", 3, Some(("bun test", &[]))).unwrap();
         db.record_video_ocr_frame("2024-12-20", 5, Some(("cargo test", &[]))).unwrap();
@@ -273,13 +273,13 @@ mod tests {
         assert!(count_ocr_matches_impl(library.path(), "cargo").unwrap().is_empty());
         assert!(match_lines_impl(library.path(), "2026-10-04", 1, "cargo").unwrap().is_empty());
         // Searching must not create the database either.
-        assert!(!library.path().join("screenshots.db").exists());
+        assert!(!ScreenshotDatabase::path_in(library.path()).exists());
     }
 
     #[test]
     fn test_match_lines_flips_vision_boxes() {
         let library = TempDir::new().unwrap();
-        let db = ScreenshotDatabase::new(library.path().join("screenshots.db")).unwrap();
+        let db = ScreenshotDatabase::new(ScreenshotDatabase::path_in(library.path())).unwrap();
         let boxes = [[0.125, 0.5, 0.5, 0.25], [0.0, 0.0, 1.0, 0.1]];
         db.record_ocr_frame("2026-10-04", 2, Some(("$ Cargo build\nFinished", &boxes))).unwrap();
 
@@ -296,7 +296,7 @@ mod tests {
     #[test]
     fn test_count_ocr_matches_reads_the_library_database() {
         let temp_dir = TempDir::new().unwrap();
-        let db = ScreenshotDatabase::new(temp_dir.path().join("screenshots.db")).unwrap();
+        let db = ScreenshotDatabase::new(ScreenshotDatabase::path_in(temp_dir.path())).unwrap();
         db.record_ocr_frame("2024-01-01", 4, Some(("cargo test", &[]))).unwrap();
 
         assert_eq!(

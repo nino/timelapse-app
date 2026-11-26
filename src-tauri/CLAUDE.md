@@ -10,7 +10,7 @@ Each module's `//!` doc comment says how it works; this file is the map and the 
 - `frame_scheme.rs` — the `frames://localhost/<YYYY-MM-DD>/<index>` URI scheme (`http://frames.localhost/…` on Windows) and the preview packs it serves.
 - `media.rs` — the `videos://localhost/<file name>` URI scheme for the beta video player: library videos (`FrameSource::video_path`) served in byte ranges, which WebKit's media loader needs.
 - `timelapse.rs` — the `Photographer` capture loop.
-- `database.rs` — `ScreenshotDatabase` over `<library>/screenshots.db`, and its migrations.
+- `database.rs` — `ScreenshotDatabase` over `<library>/screenshots.db` (always build that path with `ScreenshotDatabase::path_in(root)`), and its migrations.
 - `ocr.rs`, `ocr_helper.rs`, `ocr_tiles.rs`, `ocr_readahead.rs`, `menu_app.rs` — background OCR with Apple Vision (macOS only), run in a helper process because Vision can break for the rest of a process's life; during a boost, screenshots are read ahead by four helpers at once.
 - `converter.rs` — encodes each finished hour of PNGs into `<root>/YYYY-MM-DD--HH-MM-SS--hourly.mov` with ffmpeg, writing the hour's preview pack in the same run, then deletes the PNGs.
 - `frame-source/` — **a separate crate** (no Tauri dependency) that answers "frame N of day D" whether the frame is a PNG, an hourly video or one of the old script's whole-day videos, with a chunked LRU cache of decoded video frames and read-ahead. Its `previews` module keeps a preview pack per video (one 480-wide JPEG per 15 frames, or only the keyframes until that exists) in its own capped store, which the page loads once per day and shows while the scrubber is dragged; `frames://localhost/previews/<name>` serves them.

@@ -226,7 +226,7 @@ fn install_id(path: Option<&Path>) -> String {
         let written = path
             .parent()
             .map_or(Ok(()), std::fs::create_dir_all)
-            .and_then(|()| std::fs::write(&path, &id));
+            .and_then(|()| std::fs::write(path, &id));
         if let Err(e) = written {
             eprintln!("Could not save the analytics id: {}", e);
         }

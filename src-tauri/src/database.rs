@@ -34,7 +34,7 @@
 
 use rusqlite::{Connection, OptionalExtension, Result, Transaction, TransactionBehavior};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use chrono::{DateTime, Utc, Local};
@@ -269,7 +269,16 @@ pub struct FrontWindow {
     pub title: String,
 }
 
+/// The library database's file name, in the library root. The frame-source
+/// crate, which can't depend on this one, spells it out once more.
+pub const FILE_NAME: &str = "screenshots.db";
+
 impl ScreenshotDatabase {
+    /// Where the library database of the library at `root` is.
+    pub fn path_in(root: &Path) -> PathBuf {
+        root.join(FILE_NAME)
+    }
+
     /// Open an existing database for reading only: no schema set-up and no
     /// write lock, so searching never holds up the capture loop or OCR.
     /// `None` if the database does not exist yet.

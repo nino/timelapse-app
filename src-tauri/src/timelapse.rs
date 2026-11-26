@@ -27,7 +27,7 @@ use image::{ImageFormat, RgbImage};
 use screenshots::Screen;
 use std::{
     borrow::Cow,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::atomic::{AtomicBool, AtomicU32, Ordering},
     sync::{Arc, Mutex},
 };
@@ -83,7 +83,7 @@ impl Photographer {
         std::fs::create_dir_all(&timelapse_root_path)?;
 
         // Initialize the database
-        let db_path = timelapse_root_path.join("screenshots.db");
+        let db_path = ScreenshotDatabase::path_in(&timelapse_root_path);
         let db = ScreenshotDatabase::new(db_path)?;
 
         Ok(Photographer {
@@ -161,7 +161,7 @@ impl Photographer {
     }
 
     /// Create today's folder if needed, and return its name and path.
-    fn create_day_dir_if_needed(timelapse_root_path: &PathBuf) -> Result<(String, PathBuf), Error> {
+    fn create_day_dir_if_needed(timelapse_root_path: &Path) -> Result<(String, PathBuf), Error> {
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
         let day_dir = timelapse_root_path.join(&today);
         std::fs::create_dir_all(&day_dir)?;
@@ -169,7 +169,7 @@ impl Photographer {
     }
 
     async fn do_screenshot(
-        timelapse_root_path: &PathBuf,
+        timelapse_root_path: &Path,
         db: &Arc<Mutex<ScreenshotDatabase>>,
     ) -> Result<Captured, Error> {
         let (day, day_dir) = Self::create_day_dir_if_needed(timelapse_root_path)?;
@@ -649,7 +649,7 @@ fn fit_to_frame(capture: &Capture, file_path: &str) -> Result<RgbImage, Error> {
     }
     let row_len = orig_width as usize * 4;
     let bytes_per_row = capture.bytes_per_row;
-    if bytes_per_row < row_len || bytes_per_row % 4 != 0 {
+    if bytes_per_row < row_len || !bytes_per_row.is_multiple_of(4) {
         return Err(resize_error(format!("Rows of {} bytes can't hold {} pixels", bytes_per_row, orig_width)));
     }
     // Core Graphics pads each row (to 3040 pixels for a 3024-pixel screen), so
@@ -809,7 +809,7 @@ mod tests {
         let photographer = photographer.unwrap();
         assert!(!photographer.running.load(Ordering::SeqCst));
         // The database is created eagerly under the given root.
-        assert!(temp_dir.path().join("screenshots.db").exists());
+        assert!(ScreenshotDatabase::path_in(temp_dir.path()).exists());
     }
 
     // `start` calls `tokio::spawn`, which panics outside a runtime, so this
