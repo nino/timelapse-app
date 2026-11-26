@@ -1,5 +1,7 @@
-//! The Tauri app: commands, the `frames:` URI scheme, the menu, and `setup()`,
-//! which starts the photographer, OCR and the video converter.
+//! The Tauri app: its commands and `setup()`, which starts the photographer,
+//! OCR and the video converter. The find bar's commands are in `search`, the
+//! windows and menu in `windows`, and the `frames:` URI scheme in
+//! `frame_scheme`.
 //!
 //! Commands with logic worth testing are thin shims over `*_impl` functions
 //! that take plain arguments. `tauri::State` wraps a private reference with no
@@ -11,14 +13,15 @@ mod analytics;
 mod app_state;
 mod backlog;
 mod boost;
+mod cache_eviction;
 mod converter;
-mod day_status;
-mod timelapse;
 mod database;
 mod day_apps;
-mod menu_app;
+mod day_status;
 mod diagnostics;
+mod frame_scheme;
 mod media;
+mod menu_app;
 mod ocr;
 mod ocr_helper;
 mod ocr_readahead;
@@ -26,23 +29,24 @@ mod ocr_tiles;
 mod paths;
 mod previews;
 mod scrub_log;
+mod search;
 mod settings;
+mod timelapse;
 mod updater;
+mod windows;
 
 use frame_source::{
     DayPreviews, DaySummary, DayVideos, FrameSource, FrameTime, PendingFrames, PreviewStore, Tools,
 };
-use tauri::http::{header, Response, StatusCode};
+use tauri::http::header;
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tauri::menu::{Menu, MenuItem, MenuItemKind, PredefinedMenuItem, WINDOW_SUBMENU_ID};
-use tauri::{AppHandle, Emitter, Manager, Runtime, State, WebviewUrl, WebviewWindowBuilder};
+use tauri::{AppHandle, Emitter, Manager, Runtime, State};
 use activity::{Activity, Snapshot};
-use app_state::{AppStateStore, Rect, ViewerPosition};
-use database::{OcrProgress, ScreenshotDatabase};
-use serde::Serialize;
+use app_state::{AppStateStore, ViewerPosition};
+use database::ScreenshotDatabase;
 use settings::{Settings, SettingsStore};
 use timelapse::Photographer;
 use updater::UpdaterState;
@@ -52,24 +56,13 @@ type PhotographerState = Arc<Mutex<Option<Photographer>>>;
 
 /// Answers "frame N of day D" for the viewer. Managed once `setup` has
 /// resolved the cache directory.
-type FrameSourceState = Arc<FrameSource>;
+pub(crate) type FrameSourceState = Arc<FrameSource>;
 
 /// What capture, conversion and OCR are doing, for the Activity window.
 type ActivityState = Arc<Activity>;
 
 /// Whether conversion and OCR are boosted (`boost.rs`).
 type BoostState = Arc<boost::Boost>;
-
-/// Label of the main window, set in `tauri.conf.json`.
-const MAIN_WINDOW: &str = "main";
-/// Label of the Activity window, and id of the menu item that opens it.
-const ACTIVITY_WINDOW: &str = "activity";
-/// Label of the Settings window, and id of the menu item that opens it.
-const SETTINGS_WINDOW: &str = "settings";
-/// Label of the About window, and id of the menu item that opens it.
-const ABOUT_WINDOW: &str = "about";
-/// Id of the "Check for Updates…" menu item.
-const CHECK_FOR_UPDATES: &str = "check-for-updates";
 
 /// Decoded video frames are disposable, so the cache lives in the OS cache
 /// directory rather than in the (possibly synced) library.
@@ -99,6 +92,12 @@ fn get_timelapse_root_name() -> String {
     paths::TIMELAPSE_DIR_NAME.to_string()
 }
 
+/// A read-only connection to the library database in `root`, or `None`
+/// before it exists.
+pub(crate) fn library_db(root: &Path) -> Result<Option<database::Reader>, String> {
+    ScreenshotDatabase::reader(root.join("screenshots.db")).map_err(|e| e.to_string())
+}
+
 /// Whether the photographer has been started.
 fn is_capturing(state: &PhotographerState) -> Result<bool, String> {
     let photographer_guard = state.lock().map_err(|e| e.to_string())?;
@@ -106,7 +105,7 @@ fn is_capturing(state: &PhotographerState) -> Result<bool, String> {
 }
 
 /// Run blocking work (ffmpeg, SQLite) off the async runtime's worker threads.
-async fn run_blocking<T: Send + 'static>(
+pub(crate) async fn run_blocking<T: Send + 'static>(
     f: impl FnOnce() -> Result<T, String> + Send + 'static,
 ) -> Result<T, String> {
     tauri::async_runtime::spawn_blocking(f)
@@ -204,168 +203,6 @@ async fn get_day_previews(source: State<'_, FrameSourceState>, date: String) -> 
     with_frame_source(source.inner(), move |s| s.day_previews(&date)).await
 }
 
-/// The response for a `frames://localhost/<YYYY-MM-DD>/<index>` request, or
-/// for a preview pack at `frames://localhost/previews/<name>`.
-fn frame_response(source: Option<&FrameSource>, path: &str) -> Response<Vec<u8>> {
-    let reply = |status: StatusCode, message: String| {
-        Response::builder()
-            .status(status)
-            .header(header::CONTENT_TYPE, "text/plain")
-            .body(message.into_bytes())
-            .unwrap()
-    };
-    let Some(source) = source else {
-        return reply(StatusCode::SERVICE_UNAVAILABLE, "frame source not ready".into());
-    };
-    let mut parts = path.trim_start_matches('/').split('/');
-    let (Some(date), Some(index), None) = (parts.next(), parts.next(), parts.next()) else {
-        return reply(StatusCode::BAD_REQUEST, format!("expected /<day>/<index>, got {path}"));
-    };
-    if date == "previews" {
-        let (status, content_type, body) = match source.preview_pack(index) {
-            Ok(Some(bytes)) => (StatusCode::OK, "application/octet-stream", bytes),
-            Ok(None) => (StatusCode::NOT_FOUND, "text/plain", format!("no preview pack {index}").into_bytes()),
-            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, "text/plain", e.to_string().into_bytes()),
-        };
-        return Response::builder()
-            .status(status)
-            .header(header::CONTENT_TYPE, content_type)
-            // The page keeps the packs it loaded itself.
-            .header(header::CACHE_CONTROL, "no-store")
-            // The page `fetch`es packs from its own origin (tauri://),
-            // which is another origin to this scheme; an `<img>` needs no
-            // permission, but a fetch does, failures included, or the page
-            // sees a network error instead of the status.
-            .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-            .body(body)
-            .unwrap();
-    }
-    let Ok(index) = index.parse::<usize>() else {
-        return reply(StatusCode::BAD_REQUEST, format!("not a frame index: {index}"));
-    };
-    let started = Instant::now();
-    let frame = source.frame(date, index);
-    scrub_log::step("frameRequest", started.elapsed());
-    if let Ok(frame) = &frame {
-        scrub_log::count(if frame.mime == "image/png" { "pngFrames" } else { "videoFrames" }, 1);
-        scrub_log::count("bytes", frame.bytes.len() as u64);
-    }
-    if chrono::Local::now().format("%Y-%m-%d").to_string() == date {
-        scrub_log::count("todayFrames", 1);
-    }
-    match frame {
-        Ok(frame) => Response::builder()
-            .header(header::CONTENT_TYPE, frame.mime)
-            // The same URL can name a different file if a black frame is
-            // deleted mid-day; the frame source's own cache is what makes
-            // repeat requests cheap.
-            .header(header::CACHE_CONTROL, "no-store")
-            .body(frame.bytes)
-            .unwrap(),
-        Err(e @ (frame_source::Error::NotADay(_) | frame_source::Error::OutOfRange { .. })) => {
-            reply(StatusCode::NOT_FOUND, e.to_string())
-        }
-        Err(e) => reply(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-    }
-}
-
-/// Where one OCR match sits on a day's scrubber.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct DayMatch {
-    /// The OCR'd frame whose text matched.
-    index: usize,
-    /// One past the last frame that frame's text stands for (OCR skips frames
-    /// that look the same as the last one it read).
-    end_index: usize,
-    /// The OCR'd frame's number, to ask `get_match_lines` for its lines.
-    frame: u32,
-}
-
-/// A read-only connection to the library database in `root`, or `None`
-/// before it exists.
-fn library_db(root: &Path) -> Result<Option<database::Reader>, String> {
-    ScreenshotDatabase::reader(root.join("screenshots.db")).map_err(|e| e.to_string())
-}
-
-/// Every place on `date`'s scrubber where OCR read text matching `query`, in
-/// order. Matches whose frame the day no longer has are left out.
-fn search_ocr_day_impl(
-    root: &Path,
-    source: &FrameSource,
-    date: &str,
-    query: &str,
-) -> Result<Vec<DayMatch>, String> {
-    let Some(db) = library_db(root)? else {
-        return Ok(Vec::new());
-    };
-    let found = db.search_ocr_in_day(date, query).map_err(|e| e.to_string())?;
-    if found.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    // For each match: its own frame, then where its run ends. That is the next
-    // OCR'd frame (exclusive) or, if that one is gone, the frame just before
-    // it (inclusive); for the day's last OCR'd frame, the last frame OCR
-    // handled (inclusive).
-    let numbers: Vec<u32> = found
-        .iter()
-        .flat_map(|m| match m.next_frame {
-            Some(next) => [m.frame_number, next, next - 1],
-            None => {
-                let last = m.done_through.unwrap_or(m.frame_number);
-                [m.frame_number, last, last]
-            }
-        })
-        .collect();
-    // A day OCR read from video (see `ocr::OcrWorker::run_video_pass`)
-    // recorded 1-based positions in the day, so a position is an index plus
-    // one. A position past the day's end means its videos changed since.
-    let by_position = matches!(db.ocr_progress(date), Ok(Some(OcrProgress::VideoPosition(_))));
-    let indices = if by_position {
-        let count = source.day(date).map_err(|e| e.to_string())?.frame_count;
-        numbers
-            .iter()
-            .map(|&position| (position as usize).checked_sub(1).filter(|&index| index < count))
-            .collect()
-    } else {
-        source
-            .indices_of_frames(date, &numbers)
-            .map_err(|e| e.to_string())?
-    };
-
-    let mut matches: Vec<DayMatch> = found
-        .iter()
-        .zip(indices.chunks(3))
-        .filter_map(|(m, found)| {
-            let index = found[0]?;
-            let end_index = match (m.next_frame, found[1], found[2]) {
-                (Some(_), Some(next), _) => next,
-                (_, _, Some(last)) | (None, Some(last), _) => last + 1,
-                _ => index + 1,
-            };
-            Some(DayMatch {
-                index,
-                end_index: end_index.max(index + 1),
-                frame: m.frame_number,
-            })
-        })
-        .collect();
-    matches.sort_by_key(|m| m.index);
-    Ok(matches)
-}
-
-#[tauri::command]
-async fn search_ocr_day(
-    source: State<'_, FrameSourceState>,
-    date: String,
-    query: String,
-) -> Result<Vec<DayMatch>, String> {
-    let timelapse_root = paths::timelapse_root().ok_or("Unable to find home directory")?;
-    let source = Arc::clone(source.inner());
-    run_blocking(move || search_ocr_day_impl(&timelapse_root, &source, &date, &query)).await
-}
-
 /// Which app was in front across `date`, for the viewer's app filter.
 #[tauri::command]
 async fn get_day_apps(
@@ -379,136 +216,6 @@ async fn get_day_apps(
         day_apps::day_apps(db.as_deref(), &source, &date)
     })
     .await
-}
-
-/// A line of recognized text, normalized to the frame's size with the origin
-/// at the top-left corner, ready to draw over the image.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-struct LineBox {
-    x: f64,
-    y: f64,
-    width: f64,
-    height: f64,
-}
-
-/// The lines of OCR'd frame `frame` of `date` holding a word of `query`.
-fn match_lines_impl(root: &Path, date: &str, frame: u32, query: &str) -> Result<Vec<LineBox>, String> {
-    let Some(db) = library_db(root)? else {
-        return Ok(Vec::new());
-    };
-    let Some((text, boxes)) = db.ocr_lines(date, frame).map_err(|e| e.to_string())? else {
-        return Ok(Vec::new());
-    };
-    let texts: Vec<&str> = text.split('\n').collect();
-    // Line N of the text has box N; a row that lost its boxes has none.
-    if texts.len() != boxes.len() {
-        return Ok(Vec::new());
-    }
-    let matching = database::lines_matching(&texts, query).map_err(|e| e.to_string())?;
-    // Vision's boxes have their origin at the bottom-left.
-    Ok(matching
-        .into_iter()
-        .map(|i| boxes[i])
-        .map(|[x, y, width, height]| LineBox {
-            x,
-            y: 1.0 - y - height,
-            width,
-            height,
-        })
-        .collect())
-}
-
-#[tauri::command]
-async fn get_match_lines(date: String, frame: u32, query: String) -> Result<Vec<LineBox>, String> {
-    let timelapse_root = paths::timelapse_root().ok_or("Unable to find home directory")?;
-    run_blocking(move || match_lines_impl(&timelapse_root, &date, frame, &query)).await
-}
-
-/// How many times the searched text came onto the screen on one day.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-struct DayCount {
-    day: String,
-    count: u32,
-}
-
-fn count_ocr_matches_impl(root: &Path, query: &str) -> Result<Vec<DayCount>, String> {
-    let Some(db) = library_db(root)? else {
-        return Ok(Vec::new());
-    };
-    let counts = db.count_ocr_matches(query).map_err(|e| e.to_string())?;
-    Ok(counts
-        .into_iter()
-        .map(|(day, count)| DayCount { day, count })
-        .collect())
-}
-
-/// Days whose OCR text matches `query`, newest first.
-#[tauri::command]
-async fn count_ocr_matches(query: String) -> Result<Vec<DayCount>, String> {
-    let timelapse_root = paths::timelapse_root().ok_or("Unable to find home directory")?;
-    run_blocking(move || count_ocr_matches_impl(&timelapse_root, &query)).await
-}
-
-/// Changes whenever OCR has recorded something new; see
-/// `ScreenshotDatabase::ocr_version`.
-#[tauri::command]
-async fn get_ocr_version() -> Result<String, String> {
-    let timelapse_root = paths::timelapse_root().ok_or("Unable to find home directory")?;
-    run_blocking(move || match library_db(&timelapse_root)? {
-        Some(db) => db.ocr_version().map_err(|e| e.to_string()),
-        None => Ok(String::new()),
-    })
-    .await
-}
-
-/// Delete every directory directly under `<root>/.cache` whose mtime is more
-/// than 15 days old, and report how many went.
-///
-/// This is the only `remove_dir_all` in the app, so it takes the library root
-/// as an argument: that is what lets the tests exercise it against a `TempDir`
-/// instead of the real library.
-fn evict_old_cache_impl(root: &Path) -> Result<String, String> {
-    let cache_dir = root.join(".cache");
-
-    if !cache_dir.exists() {
-        return Ok("Cache directory does not exist".to_string());
-    }
-
-    let now = std::time::SystemTime::now();
-    let fifteen_days = std::time::Duration::from_secs(15 * 24 * 60 * 60);
-
-    let entries = std::fs::read_dir(&cache_dir)
-        .map_err(|e| format!("Failed to read cache directory: {}", e))?;
-
-    let mut removed_count = 0;
-
-    for entry in entries {
-        let entry = entry.map_err(|e| format!("Failed to read entry: {}", e))?;
-        let path = entry.path();
-
-        if !path.is_dir() {
-            continue;
-        }
-
-        // Get the modification time of the directory
-        let metadata = std::fs::metadata(&path)
-            .map_err(|e| format!("Failed to get metadata for {:?}: {}", path, e))?;
-
-        let modified = metadata.modified()
-            .map_err(|e| format!("Failed to get modified time for {:?}: {}", path, e))?;
-
-        // Check if older than 15 days
-        if let Ok(age) = now.duration_since(modified) {
-            if age > fifteen_days {
-                println!("Removing old cache folder: {:?} (age: {} days)", path, age.as_secs() / 86400);
-                std::fs::remove_dir_all(&path)
-                    .map_err(|e| format!("Failed to remove directory {:?}: {}", path, e))?;
-                removed_count += 1;
-            }
-        }
-    }
-
-    Ok(format!("Removed {} old cache folders", removed_count))
 }
 
 /// What capture, conversion and OCR are doing right now. It only reads
@@ -735,140 +442,6 @@ fn set_viewer_position(position: ViewerPosition, state: State<'_, AppStateStore>
     state.update(|s| s.viewer = position);
 }
 
-/// The usable area of each screen (without the menu bar and Dock), in
-/// logical pixels, with the primary screen first.
-fn screens<R: Runtime>(app: &AppHandle<R>) -> Vec<Rect> {
-    let primary = app.primary_monitor().ok().flatten().map(|m| m.name().cloned());
-    let mut monitors = app.available_monitors().unwrap_or_default();
-    if let Some(primary) = primary {
-        monitors.sort_by_key(|m| m.name() != primary.as_ref());
-    }
-    monitors
-        .iter()
-        .map(|m| {
-            let scale = m.scale_factor();
-            let area = m.work_area();
-            Rect {
-                x: area.position.x as f64 / scale,
-                y: area.position.y as f64 / scale,
-                width: area.size.width as f64 / scale,
-                height: area.size.height as f64 / scale,
-            }
-        })
-        .collect()
-}
-
-/// Where to open the window `label`: where it was last, moved onto a screen
-/// if that place is out of reach now. `None` the first time.
-fn saved_place<R: Runtime>(app: &AppHandle<R>, label: &str) -> Option<Rect> {
-    let saved = app.try_state::<AppStateStore>()?.window(label)?;
-    let rect = Rect {
-        x: saved.x,
-        y: saved.y,
-        width: saved.width,
-        height: saved.height,
-    };
-    Some(app_state::fit(rect, &screens(app)))
-}
-
-/// Records where `window` is and how big, and that it is open. A minimised
-/// or full-screen window keeps the place it had before.
-fn remember_place<R: Runtime>(window: &tauri::Window<R>) {
-    let Some(state) = window.try_state::<AppStateStore>() else { return };
-    let place = || -> tauri::Result<Option<Rect>> {
-        if window.is_minimized()? || window.is_fullscreen()? {
-            return Ok(None);
-        }
-        let scale = window.scale_factor()?;
-        let position = window.outer_position()?.to_logical::<f64>(scale);
-        let size = window.inner_size()?.to_logical::<f64>(scale);
-        if size.width <= 0.0 || size.height <= 0.0 {
-            return Ok(None);
-        }
-        Ok(Some(Rect {
-            x: position.x,
-            y: position.y,
-            width: size.width,
-            height: size.height,
-        }))
-    };
-    match place() {
-        Ok(Some(rect)) => state.set_window(window.label(), rect),
-        Ok(None) => {}
-        Err(e) => eprintln!("Could not read where the {} window is: {}", window.label(), e),
-    }
-}
-
-/// Keeps track of where the app's windows are and which are open.
-fn on_window_event<R: Runtime>(window: &tauri::Window<R>, event: &tauri::WindowEvent) {
-    if ![MAIN_WINDOW, ACTIVITY_WINDOW, SETTINGS_WINDOW, ABOUT_WINDOW].contains(&window.label()) {
-        return;
-    }
-    match event {
-        tauri::WindowEvent::Moved(_) | tauri::WindowEvent::Resized(_) => remember_place(window),
-        // Quitting closes no window this way, so whatever is open when the
-        // app quits stays marked open.
-        tauri::WindowEvent::CloseRequested { .. } => {
-            if let Some(state) = window.try_state::<AppStateStore>() {
-                state.set_open(window.label(), false);
-            }
-        }
-        _ => {}
-    }
-}
-
-/// Opens the main window, from its entry in `tauri.conf.json` (which has
-/// `create: false` so it can be placed before it appears).
-fn open_main_window<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
-    let config = app
-        .config()
-        .app
-        .windows
-        .iter()
-        .find(|w| w.label == MAIN_WINDOW)
-        .cloned()
-        .unwrap_or_default();
-    let mut builder = WebviewWindowBuilder::from_config(app, &config)?;
-    if let Some(place) = saved_place(app, MAIN_WINDOW) {
-        // A size saved before the window had a minimum may be below it.
-        builder = builder.position(place.x, place.y).inner_size(
-            place.width.max(config.min_width.unwrap_or(0.0)),
-            place.height.max(config.min_height.unwrap_or(0.0)),
-        );
-    }
-    let window = builder.build()?;
-    remember_place(&window.as_ref().window());
-    Ok(())
-}
-
-/// Puts the windows back the way they were when the app quit. The Activity
-/// and Settings windows open without taking focus, and before the main
-/// window, so the main window ends up in front and focused, as on a first
-/// launch.
-fn restore_windows<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
-    let saved = app.state::<AppStateStore>().get();
-    let was_open = |label: &str| saved.windows.get(label).is_some_and(|w| w.open);
-    if was_open(ACTIVITY_WINDOW) {
-        if let Err(e) = show_activity_window(app, Opening::Restored) {
-            eprintln!("Could not reopen the Activity window: {}", e);
-        }
-    }
-    if was_open(SETTINGS_WINDOW) {
-        if let Err(e) = show_settings_window(app, Opening::Restored) {
-            eprintln!("Could not reopen the Settings window: {}", e);
-        }
-    }
-    open_main_window(app)
-}
-
-/// Whether a window opens because someone asked for it, or because it was
-/// open when the app last quit.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Opening {
-    Asked,
-    Restored,
-}
-
 /// What has to happen before the app quits or relaunches, however it does:
 /// ffmpeg is a separate process and would outlive the app, and the window
 /// state is otherwise written a second after the last change.
@@ -880,181 +453,6 @@ pub(crate) fn before_quit<R: Runtime>(app: &AppHandle<R>) {
     }
     diagnostics::info("app", "Quit").record();
     diagnostics::flush(std::time::Duration::from_secs(1));
-}
-
-/// The standard menu bar, with "Check for Updates…" and "Settings…" (⌘,)
-/// under About in the app menu, and "Activity" (⌥⌘A) added to the Window
-/// menu. About opens the app's own About window, which has the change log,
-/// instead of the standard About panel.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn app_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
-    let menu = Menu::default(app)?;
-    // On macOS the first submenu is the app menu, which starts with About.
-    if let Some(MenuItemKind::Submenu(app_submenu)) = menu.items()?.first() {
-        app_submenu.remove_at(0)?;
-        let about = format!("About {}", app.package_info().name);
-        app_submenu.insert(&MenuItem::with_id(app, ABOUT_WINDOW, about, true, None::<&str>)?, 0)?;
-        app_submenu.insert(
-            &MenuItem::with_id(
-                app,
-                CHECK_FOR_UPDATES,
-                "Check for Updates…",
-                true,
-                None::<&str>,
-            )?,
-            1,
-        )?;
-        app_submenu.insert(&PredefinedMenuItem::separator(app)?, 2)?;
-        app_submenu.insert(
-            &MenuItem::with_id(app, SETTINGS_WINDOW, "Settings…", true, Some("CmdOrCtrl+,"))?,
-            3,
-        )?;
-    }
-    if let Some(MenuItemKind::Submenu(window)) = menu.get(WINDOW_SUBMENU_ID) {
-        window.append(&PredefinedMenuItem::separator(app)?)?;
-        window.append(&MenuItem::with_id(
-            app,
-            ACTIVITY_WINDOW,
-            "Activity",
-            true,
-            Some("CmdOrCtrl+Alt+A"),
-        )?)?;
-    }
-    Ok(menu)
-}
-
-/// Bring the Settings window to the front, opening it if it isn't open. Like
-/// a macOS settings window it has no Save button and doesn't resize.
-fn show_settings_window<R: Runtime>(app: &AppHandle<R>, opening: Opening) -> tauri::Result<()> {
-    if let Some(window) = app.get_webview_window(SETTINGS_WINDOW) {
-        window.unminimize()?;
-        window.show()?;
-        return window.set_focus();
-    }
-    // It opens where it was last, at the height it had then, which is the
-    // height its content needed then. Only the width is fixed.
-    let place = saved_place(app, SETTINGS_WINDOW);
-    let restored = opening == Opening::Restored;
-    // Asked for, it opens hidden, and `grow_settings_window` shows it once
-    // it is sized to its content, so it never visibly jumps. Shown anyway
-    // after a second in case the page never gets that far. Showing a window
-    // focuses it, so one reopened at launch is visible from the start
-    // instead, without focus.
-    let mut builder =
-        WebviewWindowBuilder::new(app, SETTINGS_WINDOW, WebviewUrl::App("index.html".into()))
-            .title("Settings")
-            .inner_size(SETTINGS_WIDTH, place.map_or(SETTINGS_HEIGHT, |p| p.height))
-            .resizable(false)
-            .minimizable(false)
-            .maximizable(false)
-            .visible(restored)
-            .focused(!restored);
-    if let Some(place) = place {
-        builder = builder.position(place.x, place.y);
-    }
-    let window = builder.build()?;
-    remember_place(&window.as_ref().window());
-    if !restored {
-        tauri::async_runtime::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            let _ = window.show();
-        });
-    }
-    Ok(())
-}
-
-/// Width of the Settings window, in logical pixels.
-const SETTINGS_WIDTH: f64 = 440.0;
-/// Its height the first time it opens, before it is fitted to its content.
-const SETTINGS_HEIGHT: f64 = 140.0;
-
-/// Makes the Settings window `by` logical pixels taller (shorter when
-/// negative) and shows it. The page asks for the difference between its
-/// content and its viewport rather than for a height, because what
-/// `set_size` sets on macOS is not the viewport's height (on Nino's Mac a
-/// 170pt window showed about 138pt of page), so only a change is reliable.
-/// The top-left corner stays where it is, so a window reopened where it was
-/// last stays there.
-#[tauri::command]
-fn grow_settings_window(by: f64, window: tauri::WebviewWindow) -> Result<(), String> {
-    let resize = || -> tauri::Result<()> {
-        if by.abs() >= 0.5 {
-            let corner = window.outer_position()?;
-            let size = window.inner_size()?.to_logical::<f64>(window.scale_factor()?);
-            window.set_size(tauri::LogicalSize::new(size.width, (size.height + by).round()))?;
-            window.set_position(corner)?;
-        }
-        // Already visible means it was reopened at launch, without focus;
-        // showing it again would take focus from the main window.
-        if !window.is_visible()? {
-            window.show()?;
-        }
-        Ok(())
-    };
-    resize().map_err(|e| e.to_string())
-}
-
-/// What the Activity menu item (⌥⌘A) does: closes the Activity window when
-/// it is the focused window, and otherwise brings it to the front, opening it
-/// if it isn't open.
-fn toggle_activity_window<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
-    if let Some(window) = app.get_webview_window(ACTIVITY_WINDOW) {
-        if window.is_focused()? {
-            return window.close();
-        }
-    }
-    show_activity_window(app, Opening::Asked)
-}
-
-/// Bring the Activity window to the front, opening it if it isn't open. It
-/// loads the same page as the main window, which picks the view by the
-/// window's label.
-fn show_activity_window<R: Runtime>(app: &AppHandle<R>, opening: Opening) -> tauri::Result<()> {
-    if let Some(window) = app.get_webview_window(ACTIVITY_WINDOW) {
-        window.unminimize()?;
-        window.show()?;
-        return window.set_focus();
-    }
-    let mut builder =
-        WebviewWindowBuilder::new(app, ACTIVITY_WINDOW, WebviewUrl::App("index.html".into()))
-            .title("Activity")
-            .inner_size(460.0, 700.0)
-            .min_inner_size(360.0, 360.0)
-            .focused(opening == Opening::Asked);
-    if let Some(place) = saved_place(app, ACTIVITY_WINDOW) {
-        builder = builder
-            .position(place.x, place.y)
-            .inner_size(place.width, place.height);
-    }
-    let window = builder.build()?;
-    remember_place(&window.as_ref().window());
-    Ok(())
-}
-
-/// Bring the About window to the front, opening it if it isn't open. It opens
-/// where it was last, but unlike the Activity and Settings windows it isn't
-/// reopened at launch.
-fn show_about_window<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
-    if let Some(window) = app.get_webview_window(ABOUT_WINDOW) {
-        window.unminimize()?;
-        window.show()?;
-        return window.set_focus();
-    }
-    let mut builder =
-        WebviewWindowBuilder::new(app, ABOUT_WINDOW, WebviewUrl::App("index.html".into()))
-            .title(format!("About {}", app.package_info().name))
-            .inner_size(420.0, 560.0)
-            .min_inner_size(320.0, 320.0)
-            .minimizable(false)
-            .maximizable(false);
-    if let Some(place) = saved_place(app, ABOUT_WINDOW) {
-        builder = builder
-            .position(place.x, place.y)
-            .inner_size(place.width, place.height);
-    }
-    let window = builder.build()?;
-    remember_place(&window.as_ref().window());
-    Ok(())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1101,7 +499,7 @@ pub fn run() {
     let builder = tauri::Builder::default();
     // Elsewhere a menu would add a menu bar to the main window.
     #[cfg(target_os = "macos")]
-    let builder = builder.menu(app_menu);
+    let builder = builder.menu(windows::app_menu);
 
     builder
         .plugin(tauri_plugin_fs::init())
@@ -1111,22 +509,8 @@ pub fn run() {
         .manage(activity)
         .manage(BoostState::default())
         .manage(UpdaterState::default())
-        .on_menu_event(|app, event| {
-            let opened = match event.id().as_ref() {
-                ACTIVITY_WINDOW => toggle_activity_window(app),
-                SETTINGS_WINDOW => show_settings_window(app, Opening::Asked),
-                ABOUT_WINDOW => show_about_window(app),
-                CHECK_FOR_UPDATES => {
-                    updater::check_from_menu(app.clone());
-                    Ok(())
-                }
-                _ => Ok(()),
-            };
-            if let Err(e) = opened {
-                eprintln!("Could not open the {} window: {}", event.id().as_ref(), e);
-            }
-        })
-        .on_window_event(on_window_event)
+        .on_menu_event(windows::on_menu_event)
+        .on_window_event(windows::on_window_event)
         .register_asynchronous_uri_scheme_protocol("frames", |ctx, request, responder| {
             let source = ctx
                 .app_handle()
@@ -1136,7 +520,7 @@ pub fn run() {
             // Decoding a chunk of video can take a moment; keep it off the
             // webview's thread.
             tauri::async_runtime::spawn_blocking(move || {
-                responder.respond(frame_response(source.as_deref(), &path));
+                responder.respond(frame_scheme::frame_response(source.as_deref(), &path));
             });
         })
         .register_asynchronous_uri_scheme_protocol("videos", |ctx, request, responder| {
@@ -1168,7 +552,7 @@ pub fn run() {
                     .ok()
                     .map(|dir| dir.join(paths::TIMELAPSE_DIR_NAME)),
             ));
-            restore_windows(app.handle())?;
+            windows::restore_windows(app.handle())?;
             let version = app.package_info().version.to_string();
             let reports = app.state::<SettingsStore>().get().send_error_reports;
             analytics::init(app.path().app_config_dir().ok().as_deref(), &version, reports);
@@ -1287,7 +671,7 @@ pub fn run() {
 
                 // Evict old cache entries on startup
                 if let Some(root) = paths::timelapse_root() {
-                    match evict_old_cache_impl(&root) {
+                    match cache_eviction::evict_old_cache_impl(&root) {
                         Ok(msg) => println!("Cache eviction: {}", msg),
                         Err(e) => eprintln!("Failed to evict old cache: {}", e),
                     }
@@ -1345,11 +729,11 @@ pub fn run() {
             get_pending_frames,
             get_day_videos,
             get_day_previews,
-            search_ocr_day,
+            search::search_ocr_day,
             get_day_apps,
-            get_match_lines,
-            count_ocr_matches,
-            get_ocr_version,
+            search::get_match_lines,
+            search::count_ocr_matches,
+            search::get_ocr_version,
             get_activity,
             get_remaining_work,
             dismiss_error,
@@ -1368,7 +752,7 @@ pub fn run() {
             set_video_player_beta,
             get_viewer_position,
             set_viewer_position,
-            grow_settings_window
+            windows::grow_settings_window
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -1379,319 +763,3 @@ pub fn run() {
         });
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::fs::{self, File, FileTimes};
-    use std::path::PathBuf;
-    use std::time::{Duration, SystemTime};
-    use tempfile::TempDir;
-
-    const DAY: Duration = Duration::from_secs(24 * 60 * 60);
-
-    /// A temp library root with an empty `.cache` inside it. The `TempDir` is
-    /// returned so the caller keeps it alive for the duration of the test.
-    fn temp_library() -> (TempDir, PathBuf) {
-        let temp_dir = TempDir::new().unwrap();
-        let cache_dir = temp_dir.path().join(".cache");
-        fs::create_dir_all(&cache_dir).unwrap();
-        (temp_dir, cache_dir)
-    }
-
-    /// A cache folder holding one file, aged to `mtime_age`.
-    ///
-    /// Order matters: writing the file bumps the directory's mtime, so the
-    /// backdating has to come last.
-    fn cache_folder(cache_dir: &Path, name: &str, mtime_age: Duration) -> PathBuf {
-        let path = cache_dir.join(name);
-        fs::create_dir_all(&path).unwrap();
-        fs::write(path.join("frame000001.jpg"), b"not really a jpeg").unwrap();
-        set_age(&path, mtime_age);
-        path
-    }
-
-    /// Backdate `path`'s mtime by `age`. Eviction compares mtime against the
-    /// clock, so stamping it explicitly is what keeps these tests off the
-    /// wall-clock — no sleeping, and no dependence on when they run.
-    fn set_age(path: &Path, age: Duration) {
-        let when = SystemTime::now() - age;
-        File::open(path)
-            .unwrap()
-            .set_times(FileTimes::new().set_modified(when))
-            .unwrap();
-    }
-
-    #[test]
-    fn test_evict_old_cache_removes_stale_folder() {
-        let (temp_dir, cache_dir) = temp_library();
-        let stale = cache_folder(&cache_dir, "2020-01-01", 30 * DAY);
-
-        let result = evict_old_cache_impl(temp_dir.path());
-
-        assert_eq!(result.unwrap(), "Removed 1 old cache folders");
-        assert!(!stale.exists(), "a 30-day-old cache folder should be gone");
-    }
-
-    #[test]
-    fn test_evict_old_cache_keeps_recent_folder() {
-        let (temp_dir, cache_dir) = temp_library();
-        let recent = cache_folder(&cache_dir, "2026-08-01", 14 * DAY);
-
-        let result = evict_old_cache_impl(temp_dir.path());
-
-        assert_eq!(result.unwrap(), "Removed 0 old cache folders");
-        assert!(recent.exists(), "a 14-day-old cache folder should survive");
-        assert!(recent.join("frame000001.jpg").exists());
-    }
-
-    // The cutoff is `age > 15 days`. Both folders here sit an hour away from it
-    // so the outcome cannot hinge on how long the test itself takes to run.
-    #[test]
-    fn test_evict_old_cache_cutoff_is_fifteen_days() {
-        let (temp_dir, cache_dir) = temp_library();
-        let just_inside = cache_folder(&cache_dir, "inside", 15 * DAY - Duration::from_secs(3600));
-        let just_outside = cache_folder(&cache_dir, "outside", 15 * DAY + Duration::from_secs(3600));
-
-        let result = evict_old_cache_impl(temp_dir.path());
-
-        assert_eq!(result.unwrap(), "Removed 1 old cache folders");
-        assert!(just_inside.exists(), "14d23h is inside the window");
-        assert!(!just_outside.exists(), "15d1h is outside the window");
-    }
-
-    #[test]
-    fn test_evict_old_cache_skips_plain_files() {
-        let (temp_dir, cache_dir) = temp_library();
-        let loose_file = cache_dir.join("stale-note.txt");
-        fs::write(&loose_file, b"old, but not a directory").unwrap();
-        set_age(&loose_file, 30 * DAY);
-
-        let result = evict_old_cache_impl(temp_dir.path());
-
-        assert_eq!(result.unwrap(), "Removed 0 old cache folders");
-        assert!(loose_file.exists(), "eviction only ever removes directories");
-    }
-
-    #[test]
-    fn test_evict_old_cache_counts_only_what_it_removed() {
-        let (temp_dir, cache_dir) = temp_library();
-        let stale_a = cache_folder(&cache_dir, "stale-a", 20 * DAY);
-        let stale_b = cache_folder(&cache_dir, "stale-b", 90 * DAY);
-        let fresh = cache_folder(&cache_dir, "fresh", Duration::from_secs(60));
-        let loose_file = cache_dir.join("stale-note.txt");
-        fs::write(&loose_file, b"old, but not a directory").unwrap();
-        set_age(&loose_file, 30 * DAY);
-
-        let result = evict_old_cache_impl(temp_dir.path());
-
-        assert_eq!(result.unwrap(), "Removed 2 old cache folders");
-        assert!(!stale_a.exists());
-        assert!(!stale_b.exists());
-        assert!(fresh.exists());
-        assert!(loose_file.exists());
-    }
-
-    #[test]
-    fn test_evict_old_cache_without_cache_dir() {
-        // A library that has never had frames extracted from it.
-        let temp_dir = TempDir::new().unwrap();
-
-        let result = evict_old_cache_impl(temp_dir.path());
-
-        assert_eq!(result.unwrap(), "Cache directory does not exist");
-    }
-
-    #[test]
-    fn test_evict_old_cache_leaves_the_rest_of_the_library_alone() {
-        let (temp_dir, cache_dir) = temp_library();
-        cache_folder(&cache_dir, "stale", 30 * DAY);
-
-        // A day of screenshots, as old as the cache folder next to it.
-        let day_dir = temp_dir.path().join("2020-01-01");
-        fs::create_dir_all(&day_dir).unwrap();
-        fs::write(day_dir.join("00001.png"), b"screenshot").unwrap();
-        set_age(&day_dir, 30 * DAY);
-
-        evict_old_cache_impl(temp_dir.path()).unwrap();
-
-        assert!(
-            day_dir.join("00001.png").exists(),
-            "eviction must never reach outside .cache"
-        );
-    }
-
-    fn frame_source_in(root: &Path) -> (TempDir, FrameSource) {
-        let cache = TempDir::new().unwrap();
-        let source =
-            FrameSource::new(root.to_path_buf(), cache.path().to_path_buf(), u64::MAX, Tools::new(paths::ffmpeg()))
-                .unwrap();
-        (cache, source)
-    }
-
-    #[test]
-    fn test_frame_response_serves_a_screenshot() {
-        let library = TempDir::new().unwrap();
-        fs::create_dir(library.path().join("2026-10-04")).unwrap();
-        fs::write(library.path().join("2026-10-04/00001.png"), b"png bytes").unwrap();
-        let (_cache, source) = frame_source_in(library.path());
-
-        let response = frame_response(Some(&source), "/2026-10-04/0");
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(response.headers()[header::CONTENT_TYPE], "image/png");
-        assert_eq!(response.body(), b"png bytes");
-    }
-
-    #[test]
-    fn test_frame_response_serves_preview_packs() {
-        let library = TempDir::new().unwrap();
-        let (_cache, source) = frame_source_in(library.path());
-        let (_none, without) = frame_source_in(library.path());
-        let previews = TempDir::new().unwrap();
-        let store = PreviewStore::open(previews.path().to_path_buf(), u64::MAX).unwrap();
-        store.write("v-9", frame_source::PackKind::Full, &[(0, b"jpeg".to_vec())]).unwrap();
-        let source = source.with_previews(Arc::new(store));
-
-        let response = frame_response(Some(&source), "/previews/v-9.full.pack");
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(response.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN], "*");
-        let pack = frame_source::previews::decode_pack(response.body()).unwrap();
-        assert_eq!(pack, vec![(0, b"jpeg".to_vec())]);
-
-        for path in ["/previews/v-8.full.pack", "/previews/..%2Fv-9.full.pack", "/previews/v-9.full"] {
-            assert_eq!(frame_response(Some(&source), path).status(), StatusCode::NOT_FOUND, "{path}");
-        }
-        assert_eq!(
-            frame_response(Some(&without), "/previews/v-9.full.pack").status(),
-            StatusCode::NOT_FOUND
-        );
-    }
-
-    #[test]
-    fn test_frame_response_rejects_bad_requests() {
-        let library = TempDir::new().unwrap();
-        let (_cache, source) = frame_source_in(library.path());
-
-        assert_eq!(
-            frame_response(None, "/2026-10-04/0").status(),
-            StatusCode::SERVICE_UNAVAILABLE
-        );
-        for (path, status) in [
-            ("/2026-10-04", StatusCode::BAD_REQUEST),
-            ("/2026-10-04/abc", StatusCode::BAD_REQUEST),
-            ("/2026-10-04/0/extra", StatusCode::BAD_REQUEST),
-            ("/..%2Fetc/0", StatusCode::NOT_FOUND),
-            ("/2026-10-04/0", StatusCode::NOT_FOUND),
-        ] {
-            assert_eq!(frame_response(Some(&source), path).status(), status, "{path}");
-        }
-    }
-
-    #[test]
-    fn test_search_ocr_day_places_matches_on_the_scrubber() {
-        let library = TempDir::new().unwrap();
-        let day_dir = library.path().join("2026-10-04");
-        fs::create_dir(&day_dir).unwrap();
-        // Frame 4 was removed by hand, so frames 1-7 are indices 0-5.
-        for n in [1, 2, 3, 5, 6, 7] {
-            fs::write(day_dir.join(format!("{n:05}.png")), b"png").unwrap();
-        }
-        let db = ScreenshotDatabase::new(library.path().join("screenshots.db")).unwrap();
-        db.record_ocr_frame("2026-10-04", 2, Some(("cargo build", &[]))).unwrap();
-        db.record_ocr_frame("2026-10-04", 3, None).unwrap();
-        db.record_ocr_frame("2026-10-04", 4, Some(("cargo check", &[]))).unwrap();
-        db.record_ocr_frame("2026-10-04", 5, Some(("bun test", &[]))).unwrap();
-        db.record_ocr_frame("2026-10-04", 6, Some(("cargo test", &[]))).unwrap();
-        db.record_ocr_frame("2026-10-04", 7, None).unwrap();
-        let (_cache, source) = frame_source_in(library.path());
-
-        let matches = search_ocr_day_impl(library.path(), &source, "2026-10-04", "cargo").unwrap();
-        assert_eq!(
-            matches,
-            vec![
-                // Its run would end at frame 4, which is gone, so it runs
-                // through frame 3, the last one before it.
-                DayMatch { index: 1, end_index: 3, frame: 2 },
-                // Frame 4 is left out; frame 6 runs to the last frame OCR handled.
-                DayMatch { index: 4, end_index: 6, frame: 6 },
-            ]
-        );
-        assert!(search_ocr_day_impl(library.path(), &source, "2026-10-04", "")
-            .unwrap()
-            .is_empty());
-    }
-
-    #[test]
-    fn test_search_ocr_day_places_video_positions_on_the_scrubber() {
-        let library = TempDir::new().unwrap();
-        // A day that only exists as one of the old script's videos, 6 frames.
-        let made = std::process::Command::new("ffmpeg")
-            .args(["-v", "error", "-f", "lavfi", "-i", "color=c=gray:s=32x32:r=15"])
-            .args(["-frames:v", "6", "-c:v", "libx264", "-pix_fmt", "yuv420p"])
-            .arg(library.path().join("2024-12-20--23-00-00.mov"))
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false);
-        if !made {
-            eprintln!("skipping: ffmpeg with libx264 is not available");
-            return;
-        }
-        let db = ScreenshotDatabase::new(library.path().join("screenshots.db")).unwrap();
-        db.record_video_ocr_frame("2024-12-20", 1, Some(("cargo build", &[]))).unwrap();
-        db.record_video_ocr_frame("2024-12-20", 3, Some(("bun test", &[]))).unwrap();
-        db.record_video_ocr_frame("2024-12-20", 5, Some(("cargo test", &[]))).unwrap();
-        db.record_video_ocr_frame("2024-12-20", 6, None).unwrap();
-        let (_cache, source) = frame_source_in(library.path());
-
-        let matches = search_ocr_day_impl(library.path(), &source, "2024-12-20", "cargo").unwrap();
-        assert_eq!(
-            matches,
-            vec![
-                DayMatch { index: 0, end_index: 2, frame: 1 },
-                // Runs to the last frame OCR handled, the day's last.
-                DayMatch { index: 4, end_index: 6, frame: 5 },
-            ]
-        );
-    }
-
-    #[test]
-    fn test_search_without_a_database_finds_nothing() {
-        let library = TempDir::new().unwrap();
-        let (_cache, source) = frame_source_in(library.path());
-        assert!(search_ocr_day_impl(library.path(), &source, "2026-10-04", "cargo")
-            .unwrap()
-            .is_empty());
-        assert!(count_ocr_matches_impl(library.path(), "cargo").unwrap().is_empty());
-        assert!(match_lines_impl(library.path(), "2026-10-04", 1, "cargo").unwrap().is_empty());
-        // Searching must not create the database either.
-        assert!(!library.path().join("screenshots.db").exists());
-    }
-
-    #[test]
-    fn test_match_lines_flips_vision_boxes() {
-        let library = TempDir::new().unwrap();
-        let db = ScreenshotDatabase::new(library.path().join("screenshots.db")).unwrap();
-        let boxes = [[0.125, 0.5, 0.5, 0.25], [0.0, 0.0, 1.0, 0.1]];
-        db.record_ocr_frame("2026-10-04", 2, Some(("$ Cargo build\nFinished", &boxes))).unwrap();
-
-        let found = match_lines_impl(library.path(), "2026-10-04", 2, "cargo").unwrap();
-        assert_eq!(found.len(), 1);
-        // Stored to a 65535th, so compare to well under a pixel.
-        let LineBox { x, y, width, height } = found[0];
-        for (got, want) in [(x, 0.125), (y, 0.25), (width, 0.5), (height, 0.25)] {
-            assert!((got - want).abs() < 1e-4, "{got} vs {want}");
-        }
-        assert!(match_lines_impl(library.path(), "2026-10-04", 3, "cargo").unwrap().is_empty());
-    }
-
-    #[test]
-    fn test_count_ocr_matches_reads_the_library_database() {
-        let temp_dir = TempDir::new().unwrap();
-        let db = ScreenshotDatabase::new(temp_dir.path().join("screenshots.db")).unwrap();
-        db.record_ocr_frame("2024-01-01", 4, Some(("cargo test", &[]))).unwrap();
-
-        assert_eq!(
-            count_ocr_matches_impl(temp_dir.path(), "cargo").unwrap(),
-            vec![DayCount { day: "2024-01-01".to_string(), count: 1 }]
-        );
-    }
-}
