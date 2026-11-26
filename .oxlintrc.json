@@ -52,6 +52,7 @@
         "src/hooks/useInterval.ts",
         "src/hooks/useTimeout.ts",
         "src/hooks/useDirectoryChanges.ts",
+        "src/hooks/useLatestLoad.ts",
         "src/hooks/usePolling.ts",
         "src/hooks/useTauriEvent.ts"
       ],

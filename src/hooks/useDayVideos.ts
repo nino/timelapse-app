@@ -1,7 +1,7 @@
 import React from "react";
 
 import { getDayVideos, hasVideo as hasVideoFrames, type Day, type DayVideos } from "../frames";
-import { useLatestLoad } from "./useDirectoryChanges";
+import { useLatestLoad } from "./useLatestLoad";
 
 /**
  * The stretches of `day` served from video, for the beta video player, or

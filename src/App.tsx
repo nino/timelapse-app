@@ -1,18 +1,18 @@
-import { Popover, PopoverButton, PopoverPanel } from "@headlessui/react";
 import React from "react";
 
 import "./App.css";
 import { AppPicker } from "./AppPicker";
-import { mergeCloseRanges, nextInRanges } from "./apps";
+import { nextInRanges } from "./apps";
 import { DayPicker } from "./DayPicker";
-import { noteFrameShown, timestamp } from "./diagnostics";
 import { frameUrl, getFrameTime, type FrameRange, type FrameTime, type VideoSpan } from "./frames";
 import { useDayApps } from "./hooks/useDayApps";
 import { useDayVideos } from "./hooks/useDayVideos";
 import { useDayPreviews } from "./hooks/useDayPreviews";
-import { useLatestLoad } from "./hooks/useDirectoryChanges";
+import { useDebounced } from "./hooks/useDebounced";
 import { useEventListener } from "./hooks/useEventListener";
+import { useGatedImage } from "./hooks/useGatedImage";
 import { useInstalledUpdate } from "./hooks/useInstalledUpdate";
+import { useLatestLoad } from "./hooks/useLatestLoad";
 import { useDay, useDays } from "./hooks/useLibrary";
 import {
   useDayMatches,
@@ -21,18 +21,19 @@ import {
   useOcrVersion,
 } from "./hooks/useOcrSearch";
 import { inRanges, usePendingFrames } from "./hooks/usePendingFrames";
+import { usePlayback } from "./hooks/usePlayback";
 import { useSettings } from "./hooks/useSettings";
 import { useTimeout } from "./hooks/useTimeout";
+import { OtherDays } from "./OtherDays";
 import { PendingStretches } from "./PendingStretches";
+import { AppMarks, MatchMarks } from "./ScrubberMarks";
 import { nextStop, previousStop, rangeAt, toStops, type DayMatch, type Stop } from "./search";
 import { savedPlaybackSpeed, savePlaybackSpeed, SpeedPicker, type PlaybackSpeed } from "./SpeedPicker";
-import { fieldFrame, focusRing, menuItem, menuPanel, segmentButton } from "./ui";
+import { fieldFrame, focusRing, segmentButton } from "./ui";
 import { relaunchIntoUpdate } from "./updates";
 import { VideoFrame } from "./VideoFrame";
 import { setViewerPosition, type ViewerPosition } from "./viewerPosition";
 
-// How many other days the find bar names before folding the rest away.
-const OTHER_DAYS_SHOWN = 4;
 // Frames are captured at this size; used until the first one has loaded.
 const DEFAULT_FRAME_SIZE = { width: 1800, height: 1124 };
 // How long the viewer must stay on a frame before it is remembered for the
@@ -653,331 +654,6 @@ function matchLabel(
   const current = rangeAt(stops, currentIndex);
   if (current !== -1) return `${current + 1} of ${stops.length}`;
   return stops.length === 1 ? "1 match" : `${stops.length} matches`;
-}
-
-/** Where the slider puts its thumb's centre for frame `index`, as a percentage of its range. */
-function playheadPercent(index: number, frameCount: number): number {
-  return (Math.min(index, frameCount - 1) / Math.max(frameCount - 1, 1)) * 100;
-}
-
-/** Where the searched text was on screen, drawn just above the scrubber. */
-function MatchMarks({
-  stops,
-  frameCount,
-  currentIndex,
-}: {
-  stops: Array<Stop>;
-  frameCount: number;
-  currentIndex: number;
-}): React.ReactNode {
-  if (stops.length === 0 || frameCount === 0) return null;
-  const current = rangeAt(stops, currentIndex);
-  const at = (index: number): number => playheadPercent(index, frameCount);
-  return (
-    <div
-      data-testid="match-marks"
-      // Inset by the track's padding (4px) plus half the 6px playhead, the
-      // range the playhead's centre moves over.
-      className="absolute left-[7px] right-[7px] -top-3 h-3 pointer-events-none"
-      aria-hidden="true"
-    >
-      {stops.map((stop, i) => (
-        <span
-          key={stop.index}
-          className={`absolute bottom-0 h-3 min-w-[3px] -ml-px rounded-sm ${
-            i === current ? "bg-yellow-600" : "bg-yellow-400"
-          }`}
-          style={{
-            left: `${at(stop.index)}%`,
-            width: `${at(stop.endIndex - 1) - at(stop.index)}%`,
-          }}
-        />
-      ))}
-    </div>
-  );
-}
-
-/**
- * Where the filtered app was in front, drawn as a strip just under the
- * scrubber. Memoised, and gaps under a pixel or so closed up, so a day of
- * app switching neither re-renders nor draws thousands of bars per frame of
- * a scrub.
- */
-const AppMarks = React.memo(function AppMarks({
-  ranges,
-  frameCount,
-}: {
-  ranges: Array<FrameRange>;
-  frameCount: number;
-}): React.ReactNode {
-  const merged = React.useMemo(
-    (): Array<FrameRange> => mergeCloseRanges(ranges, Math.ceil(frameCount / 1000)),
-    [ranges, frameCount],
-  );
-  if (merged.length === 0 || frameCount === 0) return null;
-  const at = (index: number): number => playheadPercent(index, frameCount);
-  return (
-    <div
-      data-testid="app-marks"
-      className="absolute left-[7px] right-[7px] -bottom-2 h-1 pointer-events-none"
-      aria-hidden="true"
-    >
-      {merged.map((range) => (
-        <span
-          key={range.start}
-          className="absolute inset-y-0 min-w-[2px] rounded-full bg-primary"
-          style={{
-            left: `${at(range.start)}%`,
-            width: `${at(range.end - 1) - at(range.start)}%`,
-          }}
-        />
-      ))}
-    </div>
-  );
-});
-
-/**
- * The other days the searched text appears on, as links to them. The first
- * few are chips in a row; the rest sit in a scrollable list behind "N more
- * days", so a word found on hundreds of days never pushes the frame away.
- */
-function OtherDays({
-  counts,
-  today,
-  onPick,
-}: {
-  counts: Array<{ day: string; count: number }>;
-  today: string;
-  onPick: (date: string) => void;
-}): React.ReactNode {
-  if (counts.length === 0) return null;
-  const shown = counts.slice(0, OTHER_DAYS_SHOWN);
-  const hidden = counts.slice(OTHER_DAYS_SHOWN);
-  const label = (day: string): string => (day === today ? "Today" : day);
-  return (
-    <nav aria-label="Other days with matches" className="flex flex-wrap items-center gap-2 mt-2 text-sm">
-      <span className="text-muted-fg">Also on</span>
-      {shown.map(({ day, count }) => (
-        <button
-          key={day}
-          type="button"
-          onClick={() => onPick(day)}
-          className={`flex items-center gap-1.5 px-2.5 py-0.5 bg-card border border-border rounded-full transition-colors hover:bg-muted ${focusRing}`}
-        >
-          {label(day)}
-          <span className="text-muted-fg tabular-nums">{count}</span>
-        </button>
-      ))}
-      {hidden.length > 0 && (
-        <Popover>
-          <PopoverButton
-            className={`flex items-center gap-1.5 rounded-full px-2.5 py-0.5 font-medium text-fg transition-colors hover:bg-muted data-open:bg-muted ${focusRing}`}
-          >
-            {hidden.length === 1 ? "1 more day" : `${hidden.length} more days`}
-            <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
-              <path d="m2.5 4 2.5 2.5L7.5 4" />
-            </svg>
-          </PopoverButton>
-          {/* Styled like the dropdowns' lists. The `!` beats the max-height
-              Headless UI sets inline, which runs to the window's edge. */}
-          <PopoverPanel
-            anchor={{ to: "bottom start", gap: 4 }}
-            className={`${menuPanel} max-h-[min(24rem,var(--anchor-max-height,100vh))]! min-w-44`}
-          >
-            {({ close }): React.ReactElement => (
-              <>
-                {hidden.map(({ day, count }) => (
-                  <button
-                    key={day}
-                    type="button"
-                    onClick={() => {
-                      onPick(day);
-                      close();
-                    }}
-                    className={`${menuItem} w-full justify-between px-2.5 outline-none hover:bg-muted focus-visible:bg-muted`}
-                  >
-                    {label(day)}
-                    <span className="text-muted-fg">{count}</span>
-                  </button>
-                ))}
-              </>
-            )}
-          </PopoverPanel>
-        </Popover>
-      )}
-    </nav>
-  );
-}
-
-/** `value`, once it has stopped changing for `delayMs`. */
-function useDebounced(value: string, delayMs: number): string {
-  const [settled, setSettled] = React.useState(value);
-  useTimeout(() => setSettled(value), value === settled ? null : delayMs, value);
-  return settled;
-}
-
-/**
- * Play the selected day forward at `frameMs` a frame, one frame
- * after the other, until its last frame. Space toggles it too. Switching
- * days or hiding the window pauses; scrubbing while playing carries on from
- * wherever the scrubber was moved to. With `ranges`, only the frames in them
- * play: playback jumps over the gaps and stops after the last range.
- */
-function usePlayback({
-  frameMs,
-  selectedDay,
-  frameCount,
-  currentIndex,
-  ranges,
-  frameShown,
-  goTo,
-}: {
-  frameMs: number;
-  selectedDay: string | null;
-  frameCount: number;
-  currentIndex: number;
-  /** The only frames to play, in order, end exclusive; null for all of them. */
-  ranges: Array<FrameRange> | null;
-  /** Whether the frame at `currentIndex` has finished loading. */
-  frameShown: boolean;
-  goTo: (index: number) => void;
-}): { playing: boolean; togglePlaying: () => void } {
-  // The day being played, so that opening another day stops playback.
-  const [playingDay, setPlayingDay] = React.useState<string | null>(null);
-  // The frame playback shows after `index`, or null at the end.
-  const nextFrame = React.useCallback(
-    (index: number): number | null => {
-      const next = ranges === null ? index + 1 : nextInRanges(ranges, index + 1);
-      return next !== null && next < frameCount ? next : null;
-    },
-    [ranges, frameCount],
-  );
-  const next = nextFrame(currentIndex);
-  const atEnd = next === null;
-  const playing = playingDay !== null && playingDay === selectedDay && !atEnd;
-  // Each step waits for `frameMs` to pass since the last one (`due`) and for
-  // its frame to be on screen, whichever comes last, so slow loads use up the
-  // wait instead of adding to it.
-  const [steps, setSteps] = React.useState(0);
-  const [due, setDue] = React.useState(false);
-  const step = (to: number): void => {
-    setDue(false);
-    setSteps((n) => n + 1);
-    goTo(to);
-    if (nextFrame(to) === null) setPlayingDay(null);
-  };
-  useTimeout(
-    () => {
-      if (frameShown && next !== null) step(next);
-      else setDue(true);
-    },
-    playing && !due ? frameMs : null,
-    steps,
-  );
-  // Scrubbed past the end (or the filter's last stretch): stop for good, so
-  // nothing starts playing by itself if the end moves later on. Set during
-  // render, as React allows for state derived from earlier renders.
-  if (playingDay !== null && atEnd) setPlayingDay(null);
-  // The wait is over and the frame has just arrived.
-  if (playing && due && frameShown && next !== null) step(next);
-
-  const togglePlaying = (): void => {
-    if (playing) {
-      setPlayingDay(null);
-      return;
-    }
-    if (selectedDay === null || frameCount === 0) return;
-    // Playing from the end starts the day (or the app's first stretch) over.
-    if (atEnd) {
-      const first = ranges === null ? 0 : ranges[0]?.start;
-      if (first === undefined || first >= frameCount) return;
-      goTo(first);
-    }
-    // The first frame shows as soon as it has loaded.
-    setDue(true);
-    setPlayingDay(selectedDay);
-  };
-
-  // Nobody is watching a hidden or minimised window: stop rather than keep
-  // loading frames.
-  useEventListener(
-    "visibilitychange",
-    () => {
-      if (document.hidden) setPlayingDay(null);
-    },
-    "document",
-  );
-
-  // Space plays and pauses, except where it types or presses a button.
-  useEventListener("keydown", (e) => {
-    if (e.key !== " " || e.metaKey || e.ctrlKey || e.altKey) return;
-    if (e.target instanceof Element) {
-      if (e.target.closest('button, [role="listbox"], [aria-haspopup="listbox"], textarea')) return;
-      if (e.target instanceof HTMLInputElement && e.target.type !== "range") return;
-    }
-    e.preventDefault();
-    togglePlaying();
-  });
-
-  return { playing, togglePlaying };
-}
-
-/**
- * Show `wanted` in an `<img>` (`undefined` to keep what it shows), but never
- * start loading a frame while another
- * is still loading. Dragging the scrubber across a video day would otherwise
- * queue a decode for every chunk it passes; this way each load that finishes
- * jumps straight to wherever the scrubber is now. While `hold` is set, no new
- * load starts at all (a preview is standing in).
- */
-function useGatedImage(wanted: string | null | undefined, hold: boolean): {
-  src: string | null;
-  frameFailed: boolean;
-  /** The last frame that finished loading successfully. */
-  loaded: string | null;
-  /** The last frame that finished loading, successfully or not. */
-  settled: string | null;
-  onLoad: () => void;
-  onError: () => void;
-} {
-  const [state, setState] = React.useState<{
-    src: string | null;
-    /** Whether `src` is still loading. */
-    inFlight: boolean;
-    frameFailed: boolean;
-    loaded: string | null;
-    settled: string | null;
-    /** When `src` was asked for (`performance.now()`), for the scrub log. */
-    requestedAt: number;
-  }>({ src: null, inFlight: false, frameFailed: false, loaded: null, settled: null, requestedAt: 0 });
-
-  // Nothing loading: show the wanted frame. Otherwise the load that finishes
-  // brings this round again. `undefined` keeps the frame shown.
-  if (wanted !== undefined && !state.inFlight && !hold && wanted !== state.src) {
-    setState({ ...state, src: wanted, inFlight: wanted !== null, requestedAt: timestamp() });
-  }
-
-  const settle = React.useCallback((failed: boolean): void => {
-    setState((s) => ({
-      ...s,
-      inFlight: false,
-      frameFailed: failed,
-      settled: s.src,
-      loaded: failed ? s.loaded : s.src,
-    }));
-  }, []);
-
-  return {
-    src: state.src,
-    frameFailed: state.frameFailed,
-    loaded: state.loaded,
-    settled: state.settled,
-    onLoad: React.useCallback((): void => {
-      noteFrameShown(performance.now() - state.requestedAt);
-      settle(false);
-    }, [settle, state.requestedAt]),
-    onError: React.useCallback((): void => settle(true), [settle]),
-  };
 }
 
 function formatFrameTime(time: FrameTime | null): string {

@@ -1,16 +1,11 @@
 import React from "react";
 
+import { ensureError } from "../errors";
 import { getDay, getDayStatuses, listDays, type Day, type DayStatus } from "../frames";
 import { timelapseRoot } from "../timelapseRoot";
-import { useDirectoryChanges, useLatestLoad } from "./useDirectoryChanges";
+import { useDirectoryChanges } from "./useDirectoryChanges";
 import { useInterval } from "./useInterval";
-
-export function ensureError(val: unknown): Error {
-  if (val instanceof Error) {
-    return val;
-  }
-  return new Error(String(val));
-}
+import { useLatestLoad } from "./useLatestLoad";
 
 /**
  * How often a failed load is tried again. Library changes reload too, but

@@ -42,7 +42,9 @@ play the filesystem:
 - ✓ Calls back when the watcher reports a change, with a 500 ms debounce
 - ✓ Stops watching on unmount, even if the watcher arrives late
 - ✓ Falls back to polling every 3 s when the watcher cannot be created
-- ✓ `useLatestLoad` only lets the most recent call publish
+
+#### `src/hooks/useLatestLoad.test.ts`
+- ✓ Only lets the most recent call publish
 
 #### `src/frames.test.ts`
 - ✓ `frameUrl` uses `frames://localhost/…` on macOS and `http://frames.localhost/…` on Windows
